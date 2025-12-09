@@ -1295,6 +1295,7 @@ int smp_resolve_args(struct proxy *p, char **err)
 		ctx = "sample fetch keyword";
 		switch (cur->ctx) {
 		case ARGC_STK:   where = "in stick rule in"; break;
+		case ARGC_HON:   where = "in hash-on rule in"; break;
 		case ARGC_TRK:   where = "in tracking rule in"; break;
 		case ARGC_LOG:   where = "in log-format string in"; break;
 		case ARGC_LOGSD: where = "in log-format-sd string in"; break;

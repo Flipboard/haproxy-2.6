@@ -77,6 +77,7 @@ enum {
 	ARGC_UIF,      /* unique-id-format */
 	ARGC_RDR,      /* redirect */
 	ARGC_CAP,      /* capture rule */
+	ARGC_HON,      /* hashon rule */
 	ARGC_SRV,      /* server line */
 	ARGC_SPOE,     /* spoe message args */
 	ARGC_UBK,      /* use_backend message */

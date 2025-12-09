@@ -317,7 +317,7 @@
  * disable the feature.
  */
 #ifndef STATS_VERSION_STRING
-#define STATS_VERSION_STRING " version " HAPROXY_VERSION ", released " HAPROXY_DATE
+#define STATS_VERSION_STRING " version " HAPROXY_VERSION "-flipboard, released " HAPROXY_DATE
 #endif
 
 /* This is the default statistics URI */

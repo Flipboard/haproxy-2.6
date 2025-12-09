@@ -129,6 +129,18 @@ const struct cfg_opt cfg_opts2[] =
 	{ NULL, 0, 0, 0 }
 };
 
+static void free_hash_rules(struct list *rules)
+{
+  struct hash_rule *rule, *ruleb;
+
+  list_for_each_entry_safe(rule, ruleb, rules, list) {
+    LIST_DELETE(&rule->list);
+    free_acl_cond(rule->cond);
+    release_sample_expr(rule->expr);
+    free(rule);
+  }
+}
+
 static void free_stick_rules(struct list *rules)
 {
 	struct sticking_rule *rule, *ruleb;
@@ -291,6 +303,7 @@ void free_proxy(struct proxy *p)
 
 	free_stick_rules(&p->storersp_rules);
 	free_stick_rules(&p->sticking_rules);
+	free_hash_rules(&p->hash_rules);
 
 	h = p->req_cap;
 	while (h) {
@@ -1348,6 +1361,7 @@ void init_new_proxy(struct proxy *p)
 	LIST_INIT(&p->switching_rules);
 	LIST_INIT(&p->server_rules);
 	LIST_INIT(&p->persist_rules);
+	LIST_INIT(&p->hash_rules);
 	LIST_INIT(&p->sticking_rules);
 	LIST_INIT(&p->storersp_rules);
 	LIST_INIT(&p->tcp_req.inspect_rules);

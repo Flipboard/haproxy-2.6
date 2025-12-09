@@ -478,6 +478,81 @@ static struct server *get_server_hh(struct stream *s, const struct server *avoid
 		return map_get_server_hash(px, hash);
 }
 
+/*
+ * This function tries to find a running server for the proxy <px> following
+ * the hash on method. It looks in a variety of locations to hash on
+ * based on the packet itself to compute the server ID. This is useful to optimize
+ * performance by avoiding bounces between servers in contexts where sessions
+ * are shared but cookies are not usable. If the parameter is not found, NULL
+ * is returned. If any server is found, it will be returned. If no valid server
+ * is found, NULL is returned.
+ */
+static struct server *get_server_hashon(struct stream *s, const struct server *avoid)
+{
+    struct proxy *px   = s->be;
+    struct server *srv = NULL;
+    struct hash_rule *hash_rule;
+    struct hash_rule *matched_rule = NULL;
+    int rewind;
+    struct sample * key = NULL;
+    struct session *sess = strm_sess(s);
+
+    /* tot_weight appears to mean srv_count */
+    if (px->lbprm.tot_weight == 0)
+        return NULL;
+
+    rewind = co_data(&s->req);
+    c_rew(&s->req, rewind);
+
+    /* Check every rule until one passes */
+    list_for_each_entry(hash_rule, &px->hash_rules, list) {
+        int ret = 1;
+
+        matched_rule = hash_rule;
+        if (hash_rule->cond) {
+            ret = acl_exec_cond(hash_rule->cond, px, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL);
+            ret = acl_pass(ret);
+            if (hash_rule->cond->pol == ACL_COND_UNLESS)
+                ret = !ret;
+        }
+
+        if (ret) {
+            /* no rule, or the rule matches */
+            break;
+        } else {
+            matched_rule = NULL;
+        }
+    }
+
+
+    /* If our rule matched, fetch the sample */
+    if (matched_rule) {
+        key = sample_fetch_as_type(px, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL, matched_rule->expr, SMP_T_STR);
+    }
+
+    c_adv(&s->req, rewind);
+
+    /* Got our sample, get the server */
+    if (key) {
+        unsigned int hash = gen_hash(px, key->data.u.str.area, key->data.u.str.data);
+        if ((px->lbprm.algo & BE_LB_HASH_MOD) == BE_LB_HMOD_AVAL)
+            hash = full_hash(hash);
+        if (px->lbprm.algo & BE_LB_LKUP_CHTREE)
+            srv = chash_get_server_hash(px, hash, avoid);
+        else
+            srv = map_get_server_hash(px, hash);
+    }   
+
+    /*
+    if (srv != NULL) {
+        fprintf(stderr, "GREG: SERVER SELECTED: %s.\n", srv->id);
+    } else {
+        fprintf(stderr, "GREG: NO SERVER SELECTED.\n");
+    }
+    */
+    return srv;
+}
+
 /* RDP Cookie HASH.  */
 static struct server *get_server_rch(struct stream *s, const struct server *avoid)
 {
@@ -774,6 +849,12 @@ int assign_server(struct stream *s)
 						srv = get_server_ph_post(s, prev_srv);
 				}
 				break;
+
+			case BE_LB_HASH_ON:
+                if (IS_HTX_STRM(s) && (!s->txn || s->txn->req.msg_state < HTTP_MSG_BODY))
+                    break;
+                srv = get_server_hashon(s, prev_srv);
+                break;
 
 			case BE_LB_HASH_HDR:
 				/* Header Parameter hashing */
@@ -2643,6 +2724,8 @@ const char *backend_lb_algo_str(int algo) {
 		return "first";
 	else if (algo == BE_LB_ALGO_LC)
 		return "leastconn";
+	else if (algo == BE_LB_ALGO_HASH)
+		return "hash";
 	else if (algo == BE_LB_ALGO_SH)
 		return "source";
 	else if (algo == BE_LB_ALGO_UH)
@@ -2719,6 +2802,10 @@ int backend_parse_balance(const char **args, char **err, struct proxy *curproxy)
 			}
 		}
 	}
+	else if (!strcmp(args[0], "hash")) {
+		curproxy->lbprm.algo &= ~BE_LB_ALGO;
+		curproxy->lbprm.algo |= BE_LB_ALGO_HASH;
+	}
 	else if (strcmp(args[0], "source") == 0) {
 		curproxy->lbprm.algo &= ~BE_LB_ALGO;
 		curproxy->lbprm.algo |= BE_LB_ALGO_SH;
@@ -2784,7 +2871,7 @@ int backend_parse_balance(const char **args, char **err, struct proxy *curproxy)
 			}
 		}
 	}
-	else if (strcmp(args[0], "hash") == 0) {
+	else if (strcmp(args[0], "hash_haproxy") == 0) {
 		if (!*args[1]) {
 			memprintf(err, "%s requires a sample expression.", args[0]);
 			return -1;
@@ -2858,7 +2945,7 @@ int backend_parse_balance(const char **args, char **err, struct proxy *curproxy)
 		}
 	}
 	else {
-		memprintf(err, "only supports 'roundrobin', 'static-rr', 'leastconn', 'source', 'uri', 'url_param', 'hdr(name)' and 'rdp-cookie(name)' options.");
+		memprintf(err, "only supports 'roundrobin', 'static-rr', 'hash', 'leastconn', 'source', 'uri', 'url_param', 'hdr(name)' and 'rdp-cookie(name)' options.");
 		return -1;
 	}
 	return 0;
