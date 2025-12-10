@@ -32,6 +32,57 @@ Areas covered in this document
 1) Quick build & install
 ========================
 
+## Using the script build-deb.sh (Recommended)
+
+**Note: This require docker to be running**
+
+On the root of this project, run `./build-deb.sh`
+
+Once complete, it should output something like this:
+```
+HAProxy build complete
+Binary copied to package directory
+Building Debian package...
+dpkg-deb: building package 'haproxy' in 'haproxy_2.6.23-flipboard_arm64.deb'.
+ new Debian package, version 2.0.
+ size 5596038 bytes: control archive=522 bytes.
+     657 bytes,    15 lines      control
+ Package: haproxy
+ Version: 2.6.23-flipboard
+ Section: net
+ Priority: optional
+ Architecture: arm64
+ Depends: libc6, libpcre3, libssl3 | libssl1.1, zlib1g, libsystemd0, liblua5.3-0
+ Maintainer: Flipboard OPS <ops@flipboard.com>
+ Description: Fast and reliable load balancing reverse proxy
+  HAProxy is a TCP/HTTP reverse proxy which is particularly suited for high
+  availability environments. It features connection persistence through HTTP
+  cookies, load balancing, header addition, modification, deletion both ways.
+  It has request blocking capabilities and provides interface to display server
+  status.
+  .
+  This is a Flipboard customized build of HAProxy 2.6.23.
+
+Package contents:
+drwxr-xr-x root/root         0 2025-12-10 19:52 ./
+drwxr-xr-x root/root         0 2025-12-10 19:52 ./usr/
+drwxr-xr-x root/root         0 2025-12-10 19:53 ./usr/sbin/
+-rwxr-xr-x root/root  15660624 2025-12-10 19:53 ./usr/sbin/haproxy
+
+Package built successfully: haproxy_2.6.23-flipboard_arm64.deb
+
+To upload to S3, run:
+aws s3 cp haproxy_2.6.23-flipboard_arm64.deb s3://flipboard.prod.external/haproxy/jammy/haproxy_2.6.23-flipboard_arm64.deb
+aws s3 cp haproxy_2.6.23-flipboard_arm64.deb s3://flipboard.prod.external/haproxy/noble/haproxy_2.6.23-flipboard_arm64.deb
+```
+
+Then, upload it to S3 running the command shown in the output.
+
+Eventually, you will want to update puppet to point to the new haproxy package:
+https://github.com/Flipboard/puppet_repo/blob/master/code/modules/haproxy/manifests/package.pp
+
+## Manual build (linux)
+
 If you've already built HAProxy and are just looking for a quick reminder, here
 are a few build examples :
 

@@ -3,7 +3,6 @@ builds/
 dev/flags/
 haproxy-build/
 *.deb
-.build_opts
 
 # HAProxy compiled binary
 haproxy
