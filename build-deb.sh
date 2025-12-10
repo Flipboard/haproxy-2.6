@@ -101,7 +101,9 @@ echo "Moved to ${OUTPUT_DIR}/${PACKAGE_NAME}"
 
 echo ""
 echo "To upload to S3, run:"
-# loop for jammy and noble to echo both paths
+
+GIT_COMMIT_HASH=$(git rev-parse --short HEAD)
+
 for release in jammy noble; do
-  echo "aws s3 cp ${OUTPUT_DIR}/${PACKAGE_NAME} s3://flipboard.prod.external/haproxy/${release}/${PACKAGE_NAME}"
+  echo "aws s3 cp ${OUTPUT_DIR}/${PACKAGE_NAME} s3://flipboard.prod.external/haproxy/${release}/${GIT_COMMIT_HASH}/${PACKAGE_NAME}"
 done
