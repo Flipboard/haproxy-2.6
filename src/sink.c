@@ -168,10 +168,13 @@ struct sink *sink_new_buf(const char *name, const char *desc, enum log_fmt fmt, 
  * array <msg> to sink <sink>. Formatting according to the sink's preference is
  * done here. Lost messages are NOT accounted for. It is preferable to call
  * sink_write() instead which will also try to emit the number of dropped
- * messages when there are any. It returns >0 if it could write anything,
- * <=0 otherwise.
+ * messages when there are any. It will stop writing at <maxlen> instead of
+ * sink->maxlen if <maxlen> is positive and inferior to sink->maxlen.
+ *
+ * It returns >0 if it could write anything, <=0 otherwise.
  */
- ssize_t __sink_write(struct sink *sink, const struct ist msg[], size_t nmsg,
+ ssize_t __sink_write(struct sink *sink, size_t maxlen,
+	             const struct ist msg[], size_t nmsg,
 	             int level, int facility, struct ist *metadata)
  {
 	struct ist *pfx = NULL;
@@ -183,11 +186,13 @@ struct sink *sink_new_buf(const char *name, const char *desc, enum log_fmt fmt, 
 	pfx = build_log_header(sink->fmt, level, facility, metadata, &npfx);
 
 send:
+	if (!maxlen)
+		maxlen = ~0;
 	if (sink->type == SINK_TYPE_FD) {
-		return fd_write_frag_line(sink->ctx.fd, sink->maxlen, pfx, npfx, msg, nmsg, 1);
+		return fd_write_frag_line(sink->ctx.fd, MIN(maxlen, sink->maxlen), pfx, npfx, msg, nmsg, 1);
 	}
 	else if (sink->type == SINK_TYPE_BUFFER) {
-		return ring_write(sink->ctx.ring, sink->maxlen, pfx, npfx, msg, nmsg);
+		return ring_write(sink->ctx.ring, MIN(maxlen, sink->maxlen), pfx, npfx, msg, nmsg);
 	}
 	return 0;
 }
@@ -229,7 +234,7 @@ int sink_announce_dropped(struct sink *sink, int facility)
 			metadata[LOG_META_PID] = ist2(pidstr, strlen(pidstr));
 		}
 
-		if (__sink_write(sink, msgvec, 1, LOG_NOTICE, facility, metadata) <= 0)
+		if (__sink_write(sink, 0, msgvec, 1, LOG_NOTICE, facility, metadata) <= 0)
 			return 0;
 		/* success! */
 		HA_ATOMIC_SUB(&sink->ctx.dropped, dropped);
@@ -618,6 +623,8 @@ static int sink_forward_session_init(struct appctx *appctx)
 
 	if (!sockaddr_alloc(&addr, &sft->srv->addr, sizeof(sft->srv->addr)))
 		goto out_error;
+	/* srv port should be learned from srv->svc_port not from srv->addr */
+	set_host_port(addr, sft->srv->svc_port);
 
 	if (appctx_finalize_startup(appctx, sft->sink->forward_px, &BUF_NULL) == -1)
 		goto out_free_addr;
@@ -697,6 +704,7 @@ static struct appctx *sink_forward_session_create(struct sink *sink, struct sink
 	if (appctx_init(appctx) == -1)
 		goto out_free_appctx;
 
+	sft->last_conn = now_ms;
 	return appctx;
 
 	/* Error unrolling */
@@ -719,9 +727,21 @@ static struct task *process_sink_forward(struct task * task, void *context, unsi
 	if (!stopping) {
 		while (sft) {
 			HA_SPIN_LOCK(SFT_LOCK, &sft->lock);
-			/* if appctx is NULL, start a new session */
-			if (!sft->appctx)
-				sft->appctx = sink_forward_session_create(sink, sft);
+			/* if appctx is NULL, start a new session
+			 *
+			 * We enforce a tempo to ensure we don't perform more than 1 session
+			 * establishment attempt per second.
+			 */
+			if (!sft->appctx) {
+				uint tempo = sft->last_conn + MS_TO_TICKS(1000);
+
+				if (sft->last_conn == TICK_ETERNITY || tick_is_expired(tempo, now_ms))
+					sft->appctx = sink_forward_session_create(sink, sft);
+				else if (task->expire == TICK_ETERNITY)
+					task->expire = tempo;
+				else
+					task->expire = tick_first(task->expire, tempo);
+			}
 			HA_SPIN_UNLOCK(SFT_LOCK, &sft->lock);
 			sft = sft->next;
 		}
@@ -883,7 +903,7 @@ int cfg_parse_ring(const char *file, int linenum, char **args, int kwm)
 		if (size < cfg_sink->ctx.ring->buf.size) {
 			ha_warning("parsing [%s:%d] : ignoring new size '%llu' that is smaller than current size '%llu' for ring '%s'.\n",
 				   file, linenum, (ullong)size, (ullong)cfg_sink->ctx.ring->buf.size, cfg_sink->name);
-			err_code |= ERR_ALERT | ERR_FATAL;
+			err_code |= ERR_WARN;
 			goto err;
 		}
 
@@ -962,6 +982,19 @@ int cfg_parse_ring(const char *file, int linenum, char **args, int kwm)
 
 		err_code |= parse_server(file, linenum, args, cfg_sink->forward_px, NULL,
 		                         SRV_PARSE_PARSE_ADDR|SRV_PARSE_INITIAL_RESOLVE);
+
+		if (err_code & ERR_CODE)
+			goto err;
+
+		/* FIXME: ideally this check should be performed during server postparsing
+		 * for all proxies where this option is unsupported, but for now we lack
+		 * server postparsing rules for sinks so let's put that here
+		 */
+		if (cfg_sink->forward_px->srv && cfg_sink->forward_px->srv->pp_opts) {
+			cfg_sink->forward_px->srv->pp_opts = 0;
+			ha_warning("parsing [%s:%d] : 'send-proxy*' server option is unsupported there, ignoring it\n", file, linenum);
+			err_code |= ERR_WARN;
+		}
 	}
 	else if (strcmp(args[0],"timeout") == 0) {
 		if (!cfg_sink || !cfg_sink->forward_px) {
@@ -1127,8 +1160,8 @@ struct sink *sink_new_from_logsrv(struct logsrv *logsrv)
 	/* the servers are linked backwards
 	 * first into proxy
 	 */
-	p->srv = srv;
 	srv->next = p->srv;
+	p->srv = srv;
 
 	/* allocate sink_forward_target descriptor */
 	sft = calloc(1, sizeof(*sft));
@@ -1179,6 +1212,9 @@ struct sink *sink_new_from_logsrv(struct logsrv *logsrv)
 
 	return sink;
 error:
+	if (srv)
+		srv_drop(srv);
+
 	if (p) {
 		if (p->id)
 			free(p->id);
@@ -1186,16 +1222,6 @@ error:
 			free(p->conf.file);
 
 		free(p);
-	}
-
-	if (srv) {
-		if (srv->id)
-			free(srv->id);
-		if (srv->conf.file)
-			free((void *)srv->conf.file);
-		if (srv->per_thr)
-		       free(srv->per_thr);
-		free(srv);
 	}
 
 	if (sft)
@@ -1230,7 +1256,7 @@ int cfg_post_parse_ring()
 			ha_warning("ring '%s' event max length '%u' exceeds size, forced to size '%lu'.\n",
 			           cfg_sink->name, cfg_sink->maxlen, (unsigned long)b_size(&cfg_sink->ctx.ring->buf));
 			cfg_sink->maxlen = b_size(&cfg_sink->ctx.ring->buf);
-			err_code |= ERR_ALERT;
+			err_code |= ERR_WARN;
 		}
 
 		/* prepare forward server descriptors */
@@ -1257,11 +1283,16 @@ int cfg_post_parse_ring()
 				if (!ring_attach(cfg_sink->ctx.ring)) {
 					ha_alert("server '%s' sets too many watchers > 255 on ring '%s'.\n", srv->id, cfg_sink->name);
 					err_code |= ERR_ALERT | ERR_FATAL;
+					ha_free(&sft);
+					break;
 				}
 				cfg_sink->sft = sft;
 				srv = srv->next;
 			}
-			sink_init_forward(cfg_sink);
+			if (sink_init_forward(cfg_sink) == 0) {
+				ha_alert("error when trying to initialize sink buffer forwarding.\n");
+				err_code |= ERR_ALERT | ERR_FATAL;
+			}
 		}
 	}
 	cfg_sink = NULL;
@@ -1390,17 +1421,31 @@ static void sink_init()
 static void sink_deinit()
 {
 	struct sink *sink, *sb;
+	struct sink_forward_target *sft_next;
 
 	list_for_each_entry_safe(sink, sb, &sink_list, sink_list) {
 		if (sink->type == SINK_TYPE_BUFFER) {
-			if (sink->store)
-				munmap(sink->ctx.ring->buf.area, sink->ctx.ring->buf.size);
+			if (sink->store) {
+				size_t size = (sink->ctx.ring->buf.size + 4095UL) & -4096UL;
+				void *area = (sink->ctx.ring->buf.area - sizeof(*sink->ctx.ring));
+
+				msync(area, size, MS_SYNC);
+				munmap(area, size);
+				ha_free(&sink->store);
+			}
 			else
 				ring_free(sink->ctx.ring);
 		}
 		LIST_DELETE(&sink->sink_list);
+		task_destroy(sink->forward_task);
+		free_proxy(sink->forward_px);
 		free(sink->name);
 		free(sink->desc);
+		while (sink->sft) {
+			sft_next = sink->sft->next;
+			free(sink->sft);
+			sink->sft = sft_next;
+		}
 		free(sink);
 	}
 }

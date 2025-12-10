@@ -668,30 +668,35 @@ read:
 			struct dns_query *query;
 
 			if (!ds->rx_msg.len) {
-				/* next message len is not fully available into the channel */
-				if (co_data(sc_oc(sc)) < 2)
-					break;
-
 				/* retrieve message len */
-				co_getblk(sc_oc(sc), (char *)&msg_len, 2, 0);
+				ret = co_getblk(sc_oc(sc), (char *)&msg_len, 2, 0);
+				if (ret <= 0) {
+					if (ret == -1)
+						goto close;
+					applet_need_more_data(appctx);
+					break;
+				}
 
 				/* mark as consumed */
 				co_skip(sc_oc(sc), 2);
 
 				/* store message len */
 				ds->rx_msg.len = ntohs(msg_len);
-			}
-
-			if (!co_data(sc_oc(sc))) {
-				/* we need more data but nothing is available */
-				break;
+				if (!ds->rx_msg.len)
+					continue;
 			}
 
 			if (co_data(sc_oc(sc)) + ds->rx_msg.offset < ds->rx_msg.len) {
 				/* message only partially available */
 
 				/* read available data */
-				co_getblk(sc_oc(sc), ds->rx_msg.area + ds->rx_msg.offset, co_data(sc_oc(sc)), 0);
+				ret = co_getblk(sc_oc(sc), ds->rx_msg.area + ds->rx_msg.offset, co_data(sc_oc(sc)), 0);
+				if (ret <= 0) {
+					if (ret == -1)
+						goto close;
+					applet_need_more_data(appctx);
+					break;
+				}
 
 				/* update message offset */
 				ds->rx_msg.offset += co_data(sc_oc(sc));
@@ -700,13 +705,20 @@ read:
 				co_skip(sc_oc(sc), co_data(sc_oc(sc)));
 
 				/* we need to wait for more data */
+				applet_need_more_data(appctx);
 				break;
 			}
 
 			/* enough data is available into the channel to read the message until the end */
 
 			/* read from the channel until the end of the message */
-			co_getblk(sc_oc(sc), ds->rx_msg.area + ds->rx_msg.offset, ds->rx_msg.len - ds->rx_msg.offset, 0);
+			ret = co_getblk(sc_oc(sc), ds->rx_msg.area + ds->rx_msg.offset, ds->rx_msg.len - ds->rx_msg.offset, 0);
+			if (ret <= 0) {
+				if (ret == -1)
+					goto close;
+				applet_need_more_data(appctx);
+				break;
+			}
 
 			/* consume all data until the end of the message from the channel */
 			co_skip(sc_oc(sc), ds->rx_msg.len - ds->rx_msg.offset);
@@ -812,7 +824,7 @@ void dns_session_free(struct dns_session *ds)
 	pool_free(dns_session_pool, ds);
 }
 
-static struct appctx *dns_session_create(struct dns_session *ds);
+static struct appctx *dns_session_create(struct dns_session *ds, int tempo);
 
 static int dns_session_init(struct appctx *appctx)
 {
@@ -924,7 +936,7 @@ static void dns_session_release(struct appctx *appctx)
 
 	/* Create a new appctx, We hope we can
 	 * create from the release callback! */
-	ds->appctx = dns_session_create(ds);
+	ds->appctx = dns_session_create(ds, 1);
 	if (!ds->appctx) {
 		dns_session_free(ds);
 		HA_SPIN_UNLOCK(DNS_LOCK, &dss->lock);
@@ -949,8 +961,10 @@ static struct applet dns_session_applet = {
 /*
  * Function used to create an appctx for a DNS session
  * It sets its context into appctx->svcctx.
+ * if <tempo> is set, then the session startup will be delayed by 1
+ * second
  */
-static struct appctx *dns_session_create(struct dns_session *ds)
+static struct appctx *dns_session_create(struct dns_session *ds, int tempo)
 {
 	struct appctx *appctx;
 
@@ -959,10 +973,14 @@ static struct appctx *dns_session_create(struct dns_session *ds)
 		goto out_close;
 	appctx->svcctx = (void *)ds;
 
-	if (appctx_init(appctx) == -1) {
-		ha_alert("out of memory in dns_session_create().\n");
-		goto out_free_appctx;
+	if (!tempo) {
+		if (appctx_init(appctx) == -1) {
+			ha_alert("out of memory in dns_session_create().\n");
+			goto out_free_appctx;
+		}
 	}
+	else
+		appctx_schedule(appctx, tick_add(now_ms, MS_TO_TICKS(1000)));
 
 	return appctx;
 
@@ -1016,7 +1034,7 @@ static struct task *dns_process_idle_exp(struct task *t, void *context, unsigned
 
 	target = (dss->max_active_conns - cur_active_conns) / 2;
 	list_for_each_entry_safe(ds, dsb, &dss->idle_sess, list) {
-		if (!target)
+		if (!stopping && !target)
 			break;
 
 		/* remove conn to pending list to ensure it won't be reused */
@@ -1084,7 +1102,7 @@ struct dns_session *dns_session_new(struct dns_stream_server *dss)
 	ds->task_exp->process = dns_process_query_exp;
 	ds->task_exp->context = ds;
 
-	ds->appctx = dns_session_create(ds);
+	ds->appctx = dns_session_create(ds, 0);
 	if (!ds->appctx)
 		goto error;
 

@@ -43,6 +43,8 @@ static inline const char *quic_cc_state_str(enum quic_cc_algo_state_type state)
 		return "ss";
 	case QUIC_CC_ST_CA:
 		return "ca";
+	case QUIC_CC_ST_RP:
+		return "rp";
 	default:
 		return "unknown";
 	}
@@ -70,6 +72,8 @@ static inline void *quic_cc_priv(const struct quic_cc *cc)
 {
 	return (void *)cc->priv;
 }
+
+int quic_cwnd_may_increase(const struct quic_path *path);
 
 #endif /* USE_QUIC */
 #endif /* _PROTO_QUIC_CC_H */

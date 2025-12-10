@@ -226,7 +226,7 @@ struct htx *smp_prefetch_htx(struct sample *smp, struct channel *chn, struct che
 	if (IS_HTX_STRM(s)) {
 		htx = htxbuf(&chn->buf);
 
-		if (msg->msg_state == HTTP_MSG_ERROR || (htx->flags & HTX_FL_PARSING_ERROR))
+		if (htx->flags & HTX_FL_PARSING_ERROR)
 			return NULL;
 
 		if (msg->msg_state < HTTP_MSG_BODY) {
@@ -311,7 +311,7 @@ struct htx *smp_prefetch_htx(struct sample *smp, struct channel *chn, struct che
 			if (txn->meth == HTTP_METH_GET || txn->meth == HTTP_METH_HEAD)
 				s->flags |= SF_REDIRECTABLE;
 		}
-		else
+		else if (txn->status == -1)
 			txn->status = sl->info.res.status;
 		if (sl->flags & HTX_SL_F_VER_11)
 			msg->flags |= HTTP_MSGF_VER_11;
@@ -1069,6 +1069,59 @@ static int smp_fetch_path(const struct arg *args, struct sample *smp, const char
 	smp->data.u.str.data = path.len;
 	smp->flags = SMP_F_VOL_1ST | SMP_F_CONST;
 	return 1;
+}
+
+/* Check on URI PATH END. A pointer to the PATH is stored. The path starts at
+ * the first '/' after the possible hostname, and ends before the possible '?'.
+*/
+
+static int
+smp_fetch_path_end(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct channel *chn = SMP_REQ_CHN(smp);
+	struct htx *htx = smp_prefetch_htx(smp, chn, NULL, 1);
+	struct htx_sl *sl;
+	struct ist path;
+	struct http_uri_parser parser;
+  char *ptr, *end, *sptr;
+
+  if (!htx)
+    return 0;
+
+  sl = http_get_stline(htx);
+  parser = http_uri_parser_init(htx_sl_req_uri(sl));
+
+  if (kw[4] == 'q' && (kw[0] == 'p' || kw[0] == 'b')) // pathq or baseq
+    path = http_parse_path(&parser);
+  else
+    path = iststop(http_parse_path(&parser), '?');
+
+  if (!isttest(path))
+    return 0;
+
+  /* OK, we got the '/' ! */
+  smp->data.type = SMP_T_STR;
+  smp->flags = SMP_F_VOL_1ST | SMP_F_CONST;
+  ptr = path.ptr;
+  end = path.ptr + path.len;
+
+    sptr = ptr;
+    while (ptr < end && *ptr != '?') {
+        if (*ptr == '/') {
+            ptr++;
+            if (ptr == end || *ptr == '?') {
+                ptr--;
+                break;
+            }
+            sptr = ptr;
+        } else {
+            ptr++;
+        }
+    }
+
+  smp->data.u.str.area = sptr;
+  smp->data.u.str.data = ptr - smp->data.u.str.area;
+  return 1;
 }
 
 /* This produces a concatenation of the first occurrence of the Host header
@@ -2158,6 +2211,7 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ "method",             smp_fetch_meth,               0,                NULL,    SMP_T_METH, SMP_USE_HRQHP },
 	{ "path",               smp_fetch_path,               0,                NULL,    SMP_T_STR,  SMP_USE_HRQHV },
 	{ "pathq",              smp_fetch_path,               0,                NULL,    SMP_T_STR,  SMP_USE_HRQHV },
+	{ "path.end",           smp_fetch_path_end,           0,                NULL,    SMP_T_STR,  SMP_USE_HRQHV },
 	{ "query",              smp_fetch_query,              0,                NULL,    SMP_T_STR,  SMP_USE_HRQHV },
 
 	/* HTTP protocol on the request path */

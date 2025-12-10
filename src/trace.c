@@ -26,6 +26,7 @@
 #include <haproxy/istbuf.h>
 #include <haproxy/list.h>
 #include <haproxy/log.h>
+#include <haproxy/quic_conn-t.h>
 #include <haproxy/sink.h>
 #include <haproxy/trace.h>
 
@@ -69,14 +70,24 @@ static inline const void *trace_pick_arg(uint32_t arg_def, const void *a1, const
 	return NULL;
 }
 
-/* write a message for the given trace source */
-void __trace(enum trace_level level, uint64_t mask, struct trace_source *src,
-             const struct ist where, const char *func,
-             const void *a1, const void *a2, const void *a3, const void *a4,
-             void (*cb)(enum trace_level level, uint64_t mask, const struct trace_source *src,
-                        const struct ist where, const struct ist func,
-                        const void *a1, const void *a2, const void *a3, const void *a4),
-             const struct ist msg)
+/* Reports whether the trace is enabled for the specified arguments, needs to enable
+ * or disable tracking. It gets the same API as __trace() except for <cb> and <msg>
+ * which are not used and were dropped, and plockptr which is an optional pointer to
+ * the lockptr to be updated (or NULL) for tracking. The function returns:
+ *   0 if the trace is not enabled for the module or these values
+ *  <0 if the trace matches some locking criteria but don't have the proper level.
+ *     In this case the interested caller might have to consider disabling tracking.
+ *  >0 if the trace is enabled for the given criteria.
+ * In all cases, <plockptr> will only be set if non-null and if a locking criterion
+ * matched. It will be up to the caller to enable tracking if desired. A casual
+ * tester not interested in adjusting tracking (i.e. calling the function before
+ * deciding so prepare a buffer to be dumped) will only need to pass 0 for plockptr
+ * and check if the result is >0.
+ */
+int __trace_enabled(enum trace_level level, uint64_t mask, struct trace_source *src,
+		    const struct ist where, const char *func,
+		    const void *a1, const void *a2, const void *a3, const void *a4,
+		    const void **plockptr)
 {
 	const struct listener *li = NULL;
 	const struct proxy *fe = NULL;
@@ -86,21 +97,15 @@ void __trace(enum trace_level level, uint64_t mask, struct trace_source *src,
 	const struct stream *strm = NULL;
 	const struct connection *conn = NULL;
 	const struct check *check = NULL;
-#ifdef USE_QUIC
 	const struct quic_conn *qc = NULL;
-#endif
 	const void *lockon_ptr = NULL;
-	struct ist ist_func = ist(func);
-	char tnum[4];
-	struct ist line[12];
-	int words = 0;
 
 	if (likely(src->state == TRACE_STATE_STOPPED))
-		return;
+		return 0;
 
 	/* check that at least one action is interested by this event */
 	if (((src->report_events | src->start_events | src->pause_events | src->stop_events) & mask) == 0)
-		return;
+		return 0;
 
 	/* retrieve available information from the caller's arguments */
 	if (src->arg_def & TRC_ARGS_CONN)
@@ -115,14 +120,16 @@ void __trace(enum trace_level level, uint64_t mask, struct trace_source *src,
 	if (src->arg_def & TRC_ARGS_CHK)
 		check = trace_pick_arg(src->arg_def & TRC_ARGS_CHK, a1, a2, a3, a4);
 
-#ifdef USE_QUIC
 	if (src->arg_def & TRC_ARGS_QCON)
 		qc = trace_pick_arg(src->arg_def & TRC_ARGS_QCON, a1, a2, a3, a4);
-#endif
 
+#ifdef USE_QUIC
+	if (qc && !conn)
+		conn = qc->conn;
+#endif
 	if (!sess && strm)
 		sess = strm->sess;
-	else if (!sess && conn && LIST_INLIST(&conn->session_list))
+	else if (!sess && conn && LIST_INLIST(&conn->sess_el))
 		sess = conn->owner;
 	else if (!sess && check)
 		sess = check->sess;
@@ -161,7 +168,7 @@ void __trace(enum trace_level level, uint64_t mask, struct trace_source *src,
 	/* check if we need to start the trace now */
 	if (src->state == TRACE_STATE_WAITING) {
 		if ((src->start_events & mask) == 0)
-			return;
+			return 0;
 
 		/* TODO: add update of lockon+lockon_ptr here */
 		HA_ATOMIC_STORE(&src->state, TRACE_STATE_RUNNING);
@@ -179,9 +186,7 @@ void __trace(enum trace_level level, uint64_t mask, struct trace_source *src,
 		case TRACE_LOCKON_STREAM:     lockon_ptr = strm; break;
 		case TRACE_LOCKON_CHECK:      lockon_ptr = check; break;
 		case TRACE_LOCKON_THREAD:     lockon_ptr = ti;   break;
-#ifdef USE_QUIC
 		case TRACE_LOCKON_QCON:       lockon_ptr = qc;   break;
-#endif
 		case TRACE_LOCKON_ARG1:       lockon_ptr = a1;   break;
 		case TRACE_LOCKON_ARG2:       lockon_ptr = a2;   break;
 		case TRACE_LOCKON_ARG3:       lockon_ptr = a3;   break;
@@ -190,16 +195,48 @@ void __trace(enum trace_level level, uint64_t mask, struct trace_source *src,
 		}
 
 		if (src->lockon_ptr && src->lockon_ptr != lockon_ptr)
-			return;
+			return 0;
 
-		if (!src->lockon_ptr && lockon_ptr && src->state == TRACE_STATE_RUNNING)
-			HA_ATOMIC_STORE(&src->lockon_ptr, lockon_ptr);
+		if (*plockptr && !src->lockon_ptr && lockon_ptr && src->state == TRACE_STATE_RUNNING)
+			*plockptr = lockon_ptr;
 	}
 
 	/* here the trace is running and is tracking a desired item */
+	if ((src->report_events & mask) == 0 || level > src->level) {
+		/* tracking did match, and might have to be disabled */
+		return -1;
+	}
 
-	if ((src->report_events & mask) == 0 || level > src->level)
-		goto end;
+	/* OK trace still enabled */
+	return 1;
+}
+
+/* write a message for the given trace source */
+void __trace(enum trace_level level, uint64_t mask, struct trace_source *src,
+             const struct ist where, const char *func,
+             const void *a1, const void *a2, const void *a3, const void *a4,
+             void (*cb)(enum trace_level level, uint64_t mask, const struct trace_source *src,
+                        const struct ist where, const struct ist func,
+                        const void *a1, const void *a2, const void *a3, const void *a4),
+             const struct ist msg)
+{
+	const void *lockon_ptr;
+	struct ist ist_func = ist(func);
+	char tnum[4];
+	struct ist line[12];
+	int words = 0;
+	int ret;
+
+	lockon_ptr = NULL;
+	ret = __trace_enabled(level, mask, src, where, func, a1, a2, a3, a4, &lockon_ptr);
+	if (lockon_ptr)
+		HA_ATOMIC_STORE(&src->lockon_ptr, lockon_ptr);
+
+	if (ret <= 0) {
+		if (ret < 0) // may have to disable tracking
+			goto end;
+		return;
+	}
 
 	/* log the logging location truncated to 10 chars from the right so that
 	 * the line number and the end of the file name are there.
@@ -251,7 +288,7 @@ void __trace(enum trace_level level, uint64_t mask, struct trace_source *src,
 	}
 
 	if (src->sink)
-		sink_write(src->sink, line, words, 0, 0, NULL);
+		sink_write(src->sink, 0, line, words, 0, 0, NULL);
 
  end:
 	/* check if we need to stop the trace now */
@@ -263,6 +300,14 @@ void __trace(enum trace_level level, uint64_t mask, struct trace_source *src,
 		HA_ATOMIC_STORE(&src->lockon_ptr, NULL);
 		HA_ATOMIC_STORE(&src->state, TRACE_STATE_WAITING);
 	}
+}
+
+/* this callback may be used when no output modification is desired */
+void trace_no_cb(enum trace_level level, uint64_t mask, const struct trace_source *src,
+		 const struct ist where, const struct ist func,
+		 const void *a1, const void *a2, const void *a3, const void *a4)
+{
+	/* do nothing */
 }
 
 /* registers trace source <source>. Modifies the list element!
@@ -382,6 +427,13 @@ static int cli_parse_trace(char **args, char *payload, struct appctx *appctx, vo
 			return cli_msg(appctx, LOG_WARNING, trash.area);
 		}
 
+		/* state transitions:
+		 *   - "start now" => TRACE_STATE_RUNNING
+		 *   - "stop now"  => TRACE_STATE_STOPPED
+		 *   - "pause now" => TRACE_STATE_WAITING
+		 *   - "start <evt>" && STATE_STOPPED => TRACE_STATE_WAITING
+		 */
+
 		if (strcmp(name, "now") == 0 && ev_ptr != &src->report_events) {
 			HA_ATOMIC_STORE(ev_ptr, 0);
 			if (ev_ptr == &src->pause_events) {
@@ -400,9 +452,16 @@ static int cli_parse_trace(char **args, char *payload, struct appctx *appctx, vo
 
 		if (strcmp(name, "none") == 0)
 			HA_ATOMIC_STORE(ev_ptr, 0);
-		else if (strcmp(name, "any") == 0)
+		else if (strcmp(name, "any") == 0) {
+			enum trace_state old = TRACE_STATE_STOPPED;
+
 			HA_ATOMIC_STORE(ev_ptr, ~0);
+			if (ev_ptr == &src->start_events)
+				HA_ATOMIC_CAS(&src->state, &old, TRACE_STATE_WAITING);
+		}
 		else {
+			enum trace_state old = TRACE_STATE_STOPPED;
+
 			ev = trace_find_event(src->known_events, name);
 			if (!ev)
 				return cli_err(appctx, "No such trace event");
@@ -411,6 +470,9 @@ static int cli_parse_trace(char **args, char *payload, struct appctx *appctx, vo
 				HA_ATOMIC_OR(ev_ptr, ev->mask);
 			else
 				HA_ATOMIC_AND(ev_ptr, ~ev->mask);
+
+			if (ev_ptr == &src->start_events && HA_ATOMIC_LOAD(ev_ptr) != 0)
+				HA_ATOMIC_CAS(&src->state, &old, TRACE_STATE_WAITING);
 		}
 	}
 	else if (strcmp(args[2], "sink") == 0) {
@@ -488,15 +550,15 @@ static int cli_parse_trace(char **args, char *payload, struct appctx *appctx, vo
 				chunk_appendf(&trash, "  %c check      : lock on the check that started the trace\n",
 				              src->lockon == TRACE_LOCKON_CHECK ? '*' : ' ');
 
-			if (src->arg_def & TRC_ARGS_CONN)
+			if (src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_QCON))
 				chunk_appendf(&trash, "  %c connection : lock on the connection that started the trace\n",
 				              src->lockon == TRACE_LOCKON_CONNECTION ? '*' : ' ');
 
-			if (src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_SESS|TRC_ARGS_STRM))
+			if (src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_QCON|TRC_ARGS_SESS|TRC_ARGS_STRM))
 				chunk_appendf(&trash, "  %c frontend   : lock on the frontend that started the trace\n",
 				              src->lockon == TRACE_LOCKON_FRONTEND ? '*' : ' ');
 
-			if (src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_SESS|TRC_ARGS_STRM))
+			if (src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_QCON|TRC_ARGS_SESS|TRC_ARGS_STRM))
 				chunk_appendf(&trash, "  %c listener   : lock on the listener that started the trace\n",
 				              src->lockon == TRACE_LOCKON_LISTENER ? '*' : ' ');
 
@@ -506,8 +568,12 @@ static int cli_parse_trace(char **args, char *payload, struct appctx *appctx, vo
 			if (src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_STRM))
 				chunk_appendf(&trash, "  %c server     : lock on the server that started the trace\n",
 				              src->lockon == TRACE_LOCKON_SERVER ? '*' : ' ');
-
-			if (src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_SESS|TRC_ARGS_STRM))
+#ifdef USE_QUIC
+			if (src->arg_def & TRC_ARGS_QCON)
+				chunk_appendf(&trash, "  %c qconn      : lock on the QUIC connection that started the trace\n",
+				              src->lockon == TRACE_LOCKON_QCON ? '*' : ' ');
+#endif
+			if (src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_QCON|TRC_ARGS_SESS|TRC_ARGS_STRM))
 				chunk_appendf(&trash, "  %c session    : lock on the session that started the trace\n",
 				              src->lockon == TRACE_LOCKON_SESSION ? '*' : ' ');
 
@@ -549,15 +615,15 @@ static int cli_parse_trace(char **args, char *payload, struct appctx *appctx, vo
 			HA_ATOMIC_STORE(&src->lockon, TRACE_LOCKON_CHECK);
 			HA_ATOMIC_STORE(&src->lockon_ptr, NULL);
 		}
-		else if ((src->arg_def & TRC_ARGS_CONN) && strcmp(name, "connection") == 0) {
+		else if ((src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_QCON)) && strcmp(name, "connection") == 0) {
 			HA_ATOMIC_STORE(&src->lockon, TRACE_LOCKON_CONNECTION);
 			HA_ATOMIC_STORE(&src->lockon_ptr, NULL);
 		}
-		else if ((src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_SESS|TRC_ARGS_STRM)) && strcmp(name, "frontend") == 0) {
+		else if ((src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_QCON|TRC_ARGS_SESS|TRC_ARGS_STRM)) && strcmp(name, "frontend") == 0) {
 			HA_ATOMIC_STORE(&src->lockon, TRACE_LOCKON_FRONTEND);
 			HA_ATOMIC_STORE(&src->lockon_ptr, NULL);
 		}
-		else if ((src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_SESS|TRC_ARGS_STRM)) && strcmp(name, "listener") == 0) {
+		else if ((src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_QCON|TRC_ARGS_SESS|TRC_ARGS_STRM)) && strcmp(name, "listener") == 0) {
 			HA_ATOMIC_STORE(&src->lockon, TRACE_LOCKON_LISTENER);
 			HA_ATOMIC_STORE(&src->lockon_ptr, NULL);
 		}
@@ -569,8 +635,12 @@ static int cli_parse_trace(char **args, char *payload, struct appctx *appctx, vo
 			HA_ATOMIC_STORE(&src->lockon, TRACE_LOCKON_SERVER);
 			HA_ATOMIC_STORE(&src->lockon_ptr, NULL);
 		}
-		else if ((src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_SESS|TRC_ARGS_STRM)) && strcmp(name, "session") == 0) {
+		else if ((src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_QCON|TRC_ARGS_SESS|TRC_ARGS_STRM)) && strcmp(name, "session") == 0) {
 			HA_ATOMIC_STORE(&src->lockon, TRACE_LOCKON_SESSION);
+			HA_ATOMIC_STORE(&src->lockon_ptr, NULL);
+		}
+		else if ((src->arg_def & TRC_ARGS_QCON) && strcmp(name, "qconn") == 0) {
+			HA_ATOMIC_STORE(&src->lockon, TRACE_LOCKON_QCON);
 			HA_ATOMIC_STORE(&src->lockon_ptr, NULL);
 		}
 		else if ((src->arg_def & TRC_ARGS_STRM) && strcmp(name, "stream") == 0) {

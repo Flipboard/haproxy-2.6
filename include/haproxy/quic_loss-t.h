@@ -44,16 +44,18 @@
  */
 
 struct quic_loss {
-	/* The most recent RTT measurement. */
+	/* The most recent RTT measurement (ms) */
 	unsigned int latest_rtt;
-	/* Smoothed RTT << 3 */
+	/* Smoothed RTT (ms) */
 	unsigned int srtt;
-	/* RTT variation << 2 */
+	/* RTT variation (ms) */
 	unsigned int rtt_var;
-	/* Minimum RTT. */
+	/* Minimum RTT (ms) */
 	unsigned int rtt_min;
 	/* Number of NACKed sent PTO. */
 	unsigned int pto_count;
+	unsigned long nb_lost_pkt;
+	unsigned long nb_reordered_pkt;
 };
 
 #endif /* USE_QUIC */

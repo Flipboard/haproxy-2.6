@@ -49,7 +49,7 @@ static const char *common_kw_list[] = {
 	"use-server", "force-persist", "ignore-persist", "force-persist",
 	"stick-table", "stick", "stats", "option", "default_backend",
 	"http-reuse", "monitor", "transparent", "maxconn", "backlog",
-	"fullconn", "dispatch", "balance", "hash-type",
+	"fullconn", "dispatch", "balance", "hash-type", "hash-on",
 	"hash-balance-factor", "unique-id-format", "unique-id-header",
 	"log-format", "log-format-sd", "log-tag", "log", "source", "usesrc",
 	"error-log-format",
@@ -213,7 +213,6 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 	if (!last_defproxy) {
 		/* we need a default proxy and none was created yet */
 		last_defproxy = alloc_new_proxy("", PR_CAP_DEF|PR_CAP_LISTEN, &errmsg);
-		proxy_preset_defaults(last_defproxy);
 
 		curr_defproxy = last_defproxy;
 		if (!last_defproxy) {
@@ -322,9 +321,9 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			curr_defproxy->flags |= PR_FL_IMPLICIT_REF;
 
 		if (curr_defproxy && (curr_defproxy->flags & (PR_FL_EXPLICIT_REF|PR_FL_IMPLICIT_REF)) == (PR_FL_EXPLICIT_REF|PR_FL_IMPLICIT_REF)) {
-			ha_alert("parsing [%s:%d] : defaults section '%s' (declared at %s:%d) is explicitly referenced by another proxy and implicitly used here."
-				 " To avoid any ambiguity don't mix both usage. Add a last defaults section not explicitly used or always use explicit references.\n",
-				 file, linenum, curr_defproxy->id, curr_defproxy->conf.file, curr_defproxy->conf.line);
+			ha_warning("parsing [%s:%d] : defaults section '%s' (declared at %s:%d) is explicitly referenced by another proxy and implicitly used here."
+				   " To avoid any ambiguity don't mix both usage. Add a last defaults section not explicitly used or always use explicit references.\n",
+				   file, linenum, curr_defproxy->id, curr_defproxy->conf.file, curr_defproxy->conf.line);
 			err_code |= ERR_WARN;
 		}
 
@@ -2065,8 +2064,10 @@ stats_error_parsing:
 			case KWM_STD:
 				curproxy->options |= PR_O_REDISP;
 				curproxy->redispatch_after = -1;
-				if(*args[2]) {
+				if (*args[2]) {
 					curproxy->redispatch_after = atol(args[2]);
+					if (!curproxy->redispatch_after)
+						curproxy->options &= ~PR_O_REDISP;
 				}
 				break;
 			case KWM_NO:
@@ -2194,7 +2195,7 @@ stats_error_parsing:
 					oldlogformat = "option httplog clf";
 				else if (curproxy->conf.logformat_string == default_https_log_format)
 					oldlogformat = "option httpslog";
-				ha_warning("parsing [%s:%d]: 'option httplog' overrides previous '%s' in 'defaults' section.\n",
+				ha_warning("parsing [%s:%d]: 'option httpslog' overrides previous '%s' in 'defaults' section.\n",
 					   file, linenum, oldlogformat);
 			}
 			if (curproxy->conf.logformat_string != default_http_log_format &&
@@ -2699,6 +2700,76 @@ stats_error_parsing:
 			}
 		}
 	}
+	else if (!strcmp(args[0], "hash-on")) { /* add a hash-on type to check */
+        /** hash-on <pattern> [{if | unless} <condition>]
+         *
+         * For example, to hash on userid request param if it exists and is greater than 0:
+         *   acl hash_userid urlp_val(userid) gt 0
+         *   hash-on urlp_val(userid) if hash_userid
+         */
+
+        int myidx = 0;
+        struct hash_rule *hrule;
+        struct sample_expr *expr;
+
+        if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[0], NULL))
+            err_code |= ERR_WARN;
+
+        myidx++;
+
+        if (*(args[myidx]) == 0) {
+            ha_alert("parsing [%s:%d] : '%s' expects a pattern to hash on.\n", file, linenum, args[0]);
+            err_code |= ERR_ALERT | ERR_FATAL;
+            goto out;
+        }
+
+        curproxy->conf.args.ctx = ARGC_HON;
+        expr = sample_parse_expr(args, &myidx, file, linenum, &errmsg, &curproxy->conf.args, NULL);
+
+        if (!expr) {
+            ha_alert("parsing [%s:%d] : '%s': %s\n", file, linenum, args[0], errmsg);
+            err_code |= ERR_ALERT | ERR_FATAL;
+            goto out;
+        }
+
+        if (!(expr->fetch->val & SMP_VAL_BE_SET_SRV)) {
+            ha_alert("parsing [%s:%d] : '%s': fetch method '%s' extracts information from '%s', none of which is available during request.\n",
+                file, linenum, args[0], expr->fetch->kw, sample_src_names(expr->fetch->use));
+            err_code |= ERR_ALERT | ERR_FATAL;
+            free(expr);
+            goto out;
+        }
+
+        /* check if we need to allocate an hdr_idx struct for HTTP parsing */
+        curproxy->http_needed |= !!(expr->fetch->use & SMP_USE_HTTP_ANY);
+
+        /* condition is optional, but if it exists, must start with if or unless */
+        if (*(args[myidx]) != 0) {
+            if (strcmp(args[myidx], "if") == 0 || strcmp(args[myidx], "unless") == 0) {
+                if ((cond = build_acl_cond(file, linenum, &curproxy->acl, curproxy, (const char **)args + myidx, &errmsg)) == NULL) {
+                    ha_alert("parsing [%s:%d] : '%s': error detected while parsing hash-on condition : %s.\n",
+                        file, linenum, args[0], errmsg);
+                    err_code |= ERR_ALERT | ERR_FATAL;
+                    free(expr);
+                    goto out;
+                }
+            }
+            else {
+                ha_alert("parsing [%s:%d] : '%s': unknown keyword '%s',expected if | unless.\n",
+                    file, linenum, args[0], args[myidx]);
+                err_code |= ERR_ALERT | ERR_FATAL;
+                free(expr);
+                goto out;
+            }
+            err_code |= warnif_cond_conflicts(cond, SMP_VAL_BE_SET_SRV, file, linenum);
+        }
+
+        hrule = (struct hash_rule *)calloc(1, sizeof(*hrule));
+        hrule->cond = cond;
+        hrule->expr = expr;
+        LIST_INIT(&hrule->list);
+        LIST_APPEND(&curproxy->hash_rules, &hrule->list);
+    }
 	else if (strcmp(args[0], "hash-balance-factor") == 0) {
 		if (*(args[1]) == 0) {
 			ha_alert("parsing [%s:%d] : '%s' expects an integer argument.\n", file, linenum, args[0]);

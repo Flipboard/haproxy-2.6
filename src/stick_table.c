@@ -224,7 +224,18 @@ int __stktable_trash_oldest(struct stktable *t, int to_batch)
 			ts->exp.key = ts->expire;
 			eb32_insert(&t->exps, &ts->exp);
 
-			if (!eb || eb->key > ts->exp.key)
+			/* the update might have jumped beyond the next element,
+			 * possibly causing a wrapping. We need to check whether
+			 * the next element should be used instead. If the next
+			 * element doesn't exist it means we're on the right
+			 * side and have to check the first one then. If it
+			 * exists and is closer, we must use it, otherwise we
+			 * use the current one.
+			 */
+			if (!eb)
+				eb = eb32_first(&t->exps);
+
+			if (!eb || tick_is_lt(ts->exp.key, eb->key))
 				eb = &ts->exp;
 
 			continue;
@@ -607,7 +618,18 @@ struct task *process_table_expire(struct task *task, void *context, unsigned int
 			ts->exp.key = ts->expire;
 			eb32_insert(&t->exps, &ts->exp);
 
-			if (!eb || eb->key > ts->exp.key)
+			/* the update might have jumped beyond the next element,
+			 * possibly causing a wrapping. We need to check whether
+			 * the next element should be used instead. If the next
+			 * element doesn't exist it means we're on the right
+			 * side and have to check the first one then. If it
+			 * exists and is closer, we must use it, otherwise we
+			 * use the current one.
+			 */
+			if (!eb)
+				eb = eb32_first(&t->exps);
+
+			if (!eb || tick_is_lt(ts->exp.key, eb->key))
 				eb = &ts->exp;
 			continue;
 		}
@@ -655,6 +677,20 @@ int stktable_init(struct stktable *t)
 	return 1;
 }
 
+/* Performs stick table cleanup: it's meant to be called after the table
+ * has been initialized ith stktable_init(), else it will lead to undefined
+ * behavior.
+ *
+ * However it does not free the table pointer itself
+ */
+void stktable_deinit(struct stktable *t)
+{
+	if (!t)
+		return;
+	task_destroy(t->exp_task);
+	pool_destroy(t->pool);
+}
+
 /*
  * Configuration keywords of known table types
  */
@@ -671,7 +707,7 @@ struct stktable_type stktable_types[SMP_TYPES] = {
  * Returns 0 on successful parsing, else 1.
  * <myidx> is set at next configuration <args> index.
  */
-int stktable_parse_type(char **args, int *myidx, unsigned long *type, size_t *key_size)
+int stktable_parse_type(char **args, int *myidx, unsigned long *type, size_t *key_size, const char *file, int linenum)
 {
 	for (*type = 0; *type < SMP_TYPES; (*type)++) {
 		if (!stktable_types[*type].kw)
@@ -684,10 +720,14 @@ int stktable_parse_type(char **args, int *myidx, unsigned long *type, size_t *ke
 
 		if (stktable_types[*type].flags & STK_F_CUSTOM_KEYSIZE) {
 			if (strcmp("len", args[*myidx]) == 0) {
+				char *stop;
+
 				(*myidx)++;
-				*key_size = atol(args[*myidx]);
-				if (!*key_size)
-					break;
+				*key_size = strtol(args[*myidx], &stop, 10);
+				if (*stop != '\0' || !*key_size) {
+					ha_alert("parsing [%s:%d] : 'len' expects a positive integer argument.\n", file, linenum);
+					return 1;
+				}
 				if (*type == SMP_T_STR) {
 					/* null terminated string needs +1 for '\0'. */
 					(*key_size)++;
@@ -697,6 +737,7 @@ int stktable_parse_type(char **args, int *myidx, unsigned long *type, size_t *ke
 		}
 		return 0;
 	}
+	ha_alert("parsing [%s:%d] : %s: unknown type '%s'.\n", file, linenum, args[0], args[*myidx]);
 	return 1;
 }
 
@@ -819,6 +860,7 @@ int parse_stick_table(const char *file, int linenum, char **args,
 				err_code |= ERR_ALERT | ERR_FATAL;
 				goto out;
 			}
+			ha_free(&t->peers.name);
 			t->peers.name = strdup(args[idx++]);
 		}
 		else if (strcmp(args[idx], "expire") == 0) {
@@ -857,9 +899,7 @@ int parse_stick_table(const char *file, int linenum, char **args,
 		}
 		else if (strcmp(args[idx], "type") == 0) {
 			idx++;
-			if (stktable_parse_type(args, &idx, &t->type, &t->key_size) != 0) {
-				ha_alert("parsing [%s:%d] : %s: unknown type '%s'.\n",
-					 file, linenum, args[0], args[idx]);
+			if (stktable_parse_type(args, &idx, &t->type, &t->key_size, file, linenum) != 0) {
 				err_code |= ERR_ALERT | ERR_FATAL;
 				goto out;
 			}
@@ -1032,13 +1072,17 @@ struct stktable_key *smp_to_stkey(struct sample *smp, struct stktable *t)
 		break;
 
 	case SMP_T_SINT:
+	{
+		uint *_sint = (uint *)&smp->data.u.sint;
+
 		/* The stick table require a 32bit unsigned int, "sint" is a
 		 * signed 64 it, so we can convert it inplace.
 		 */
-		smp->data.u.sint = (unsigned int)smp->data.u.sint;
-		static_table_key.key = &smp->data.u.sint;
+		*_sint = smp->data.u.sint;
+		static_table_key.key = _sint;
 		static_table_key.key_len = 4;
 		break;
+	}
 
 	case SMP_T_STR:
 		if (!smp_make_safe(smp))
@@ -1265,9 +1309,14 @@ static int sample_conv_table_bytes_in_rate(const struct arg *arg_p, struct sampl
 		return 1;
 
 	ptr = stktable_data_ptr(t, ts, STKTABLE_DT_BYTES_IN_RATE);
-	if (ptr)
+	if (ptr) {
+		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+
 		smp->data.u.sint = read_freq_ctr_period(&stktable_data_cast(ptr, std_t_frqp),
                                                        t->data_arg[STKTABLE_DT_BYTES_IN_RATE].u);
+
+		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+	}
 
 	stktable_release(t, ts);
 	return !!ptr;
@@ -1302,8 +1351,13 @@ static int sample_conv_table_conn_cnt(const struct arg *arg_p, struct sample *sm
 		return 1;
 
 	ptr = stktable_data_ptr(t, ts, STKTABLE_DT_CONN_CNT);
-	if (ptr)
+	if (ptr) {
+		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+
 		smp->data.u.sint = stktable_data_cast(ptr, std_t_uint);
+
+		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+	}
 
 	stktable_release(t, ts);
 	return !!ptr;
@@ -1338,8 +1392,13 @@ static int sample_conv_table_conn_cur(const struct arg *arg_p, struct sample *sm
 		return 1;
 
 	ptr = stktable_data_ptr(t, ts, STKTABLE_DT_CONN_CUR);
-	if (ptr)
+	if (ptr) {
+		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+
 		smp->data.u.sint = stktable_data_cast(ptr, std_t_uint);
+
+		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+	}
 
 	stktable_release(t, ts);
 	return !!ptr;
@@ -1374,9 +1433,14 @@ static int sample_conv_table_conn_rate(const struct arg *arg_p, struct sample *s
 		return 1;
 
 	ptr = stktable_data_ptr(t, ts, STKTABLE_DT_CONN_RATE);
-	if (ptr)
+	if (ptr) {
+		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+
 		smp->data.u.sint = read_freq_ctr_period(&stktable_data_cast(ptr, std_t_frqp),
                                                        t->data_arg[STKTABLE_DT_CONN_RATE].u);
+
+		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+	}
 
 	stktable_release(t, ts);
 	return !!ptr;
@@ -1487,9 +1551,14 @@ static int sample_conv_table_bytes_out_rate(const struct arg *arg_p, struct samp
 		return 1;
 
 	ptr = stktable_data_ptr(t, ts, STKTABLE_DT_BYTES_OUT_RATE);
-	if (ptr)
+	if (ptr) {
+		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+
 		smp->data.u.sint = read_freq_ctr_period(&stktable_data_cast(ptr, std_t_frqp),
                                                        t->data_arg[STKTABLE_DT_BYTES_OUT_RATE].u);
+
+		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+	}
 
 	stktable_release(t, ts);
 	return !!ptr;
@@ -1527,8 +1596,13 @@ static int sample_conv_table_gpt(const struct arg *arg_p, struct sample *smp, vo
 		return 1;
 
 	ptr = stktable_data_ptr_idx(t, ts, STKTABLE_DT_GPT, idx);
-	if (ptr)
+	if (ptr) {
+		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+
 		smp->data.u.sint = stktable_data_cast(ptr, std_t_uint);
+
+		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+	}
 
 	stktable_release(t, ts);
 	return !!ptr;
@@ -1566,8 +1640,13 @@ static int sample_conv_table_gpt0(const struct arg *arg_p, struct sample *smp, v
 	if (!ptr)
 		ptr = stktable_data_ptr_idx(t, ts, STKTABLE_DT_GPT, 0);
 
-	if (ptr)
+	if (ptr) {
+		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+
 		smp->data.u.sint = stktable_data_cast(ptr, std_t_uint);
+
+		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+	}
 
 	stktable_release(t, ts);
 	return !!ptr;
@@ -1605,8 +1684,13 @@ static int sample_conv_table_gpc(const struct arg *arg_p, struct sample *smp, vo
 		return 1;
 
 	ptr = stktable_data_ptr_idx(t, ts, STKTABLE_DT_GPC, idx);
-	if (ptr)
+	if (ptr) {
+		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+
 		smp->data.u.sint = stktable_data_cast(ptr, std_t_uint);
+
+		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+	}
 
 	stktable_release(t, ts);
 	return !!ptr;
@@ -1644,9 +1728,14 @@ static int sample_conv_table_gpc_rate(const struct arg *arg_p, struct sample *sm
 		return 1;
 
 	ptr = stktable_data_ptr_idx(t, ts, STKTABLE_DT_GPC_RATE, idx);
-	if (ptr)
+	if (ptr) {
+		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+
 		smp->data.u.sint = read_freq_ctr_period(&stktable_data_cast(ptr, std_t_frqp),
 		                                        t->data_arg[STKTABLE_DT_GPC_RATE].u);
+
+		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+	}
 
 	stktable_release(t, ts);
 	return !!ptr;
@@ -1686,8 +1775,13 @@ static int sample_conv_table_gpc0(const struct arg *arg_p, struct sample *smp, v
 		ptr = stktable_data_ptr_idx(t, ts, STKTABLE_DT_GPC, 0);
 	}
 
-	if (ptr)
+	if (ptr) {
+		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+
 		smp->data.u.sint = stktable_data_cast(ptr, std_t_uint);
+
+		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+	}
 
 	stktable_release(t, ts);
 	return !!ptr;
@@ -1722,15 +1816,25 @@ static int sample_conv_table_gpc0_rate(const struct arg *arg_p, struct sample *s
 		return 1;
 
 	ptr = stktable_data_ptr(t, ts, STKTABLE_DT_GPC0_RATE);
-	if (ptr)
+	if (ptr) {
+		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+
 		smp->data.u.sint = read_freq_ctr_period(&stktable_data_cast(ptr, std_t_frqp),
                                                        t->data_arg[STKTABLE_DT_GPC0_RATE].u);
+
+		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+	}
 	else {
 		/* fallback on the gpc array */
 		ptr = stktable_data_ptr_idx(t, ts, STKTABLE_DT_GPC_RATE, 0);
-		if (ptr)
+		if (ptr) {
+			HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+
 			smp->data.u.sint = read_freq_ctr_period(&stktable_data_cast(ptr, std_t_frqp),
 			                                        t->data_arg[STKTABLE_DT_GPC_RATE].u);
+
+			HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+		}
 	}
 
 	stktable_release(t, ts);
@@ -1771,8 +1875,13 @@ static int sample_conv_table_gpc1(const struct arg *arg_p, struct sample *smp, v
 		ptr = stktable_data_ptr_idx(t, ts, STKTABLE_DT_GPC, 1);
 	}
 
-	if (ptr)
+	if (ptr) {
+		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+
 		smp->data.u.sint = stktable_data_cast(ptr, std_t_uint);
+
+		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+	}
 
 	stktable_release(t, ts);
 	return !!ptr;
@@ -1807,15 +1916,25 @@ static int sample_conv_table_gpc1_rate(const struct arg *arg_p, struct sample *s
 		return 1;
 
 	ptr = stktable_data_ptr(t, ts, STKTABLE_DT_GPC1_RATE);
-	if (ptr)
+	if (ptr) {
+		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+
 		smp->data.u.sint = read_freq_ctr_period(&stktable_data_cast(ptr, std_t_frqp),
                                                        t->data_arg[STKTABLE_DT_GPC1_RATE].u);
+
+		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+	}
 	else {
 		/* fallback on the gpc array */
 		ptr = stktable_data_ptr_idx(t, ts, STKTABLE_DT_GPC_RATE, 1);
-		if (ptr)
+		if (ptr) {
+			HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+
 			smp->data.u.sint = read_freq_ctr_period(&stktable_data_cast(ptr, std_t_frqp),
 			                                        t->data_arg[STKTABLE_DT_GPC_RATE].u);
+
+			HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+		}
 	}
 
 	stktable_release(t, ts);
@@ -1851,8 +1970,13 @@ static int sample_conv_table_http_err_cnt(const struct arg *arg_p, struct sample
 		return 1;
 
 	ptr = stktable_data_ptr(t, ts, STKTABLE_DT_HTTP_ERR_CNT);
-	if (ptr)
+	if (ptr) {
+		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+
 		smp->data.u.sint = stktable_data_cast(ptr, std_t_uint);
+
+		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+	}
 
 	stktable_release(t, ts);
 	return !!ptr;
@@ -1887,9 +2011,14 @@ static int sample_conv_table_http_err_rate(const struct arg *arg_p, struct sampl
 		return 1;
 
 	ptr = stktable_data_ptr(t, ts, STKTABLE_DT_HTTP_ERR_RATE);
-	if (ptr)
+	if (ptr) {
+		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+
 		smp->data.u.sint = read_freq_ctr_period(&stktable_data_cast(ptr, std_t_frqp),
                                                        t->data_arg[STKTABLE_DT_HTTP_ERR_RATE].u);
+
+		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+	}
 
 	stktable_release(t, ts);
 	return !!ptr;
@@ -1924,8 +2053,13 @@ static int sample_conv_table_http_fail_cnt(const struct arg *arg_p, struct sampl
 		return 1;
 
 	ptr = stktable_data_ptr(t, ts, STKTABLE_DT_HTTP_FAIL_CNT);
-	if (ptr)
+	if (ptr) {
+		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+
 		smp->data.u.sint = stktable_data_cast(ptr, std_t_uint);
+
+		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+	}
 
 	stktable_release(t, ts);
 	return !!ptr;
@@ -1960,9 +2094,14 @@ static int sample_conv_table_http_fail_rate(const struct arg *arg_p, struct samp
 		return 1;
 
 	ptr = stktable_data_ptr(t, ts, STKTABLE_DT_HTTP_FAIL_RATE);
-	if (ptr)
+	if (ptr) {
+		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+
 		smp->data.u.sint = read_freq_ctr_period(&stktable_data_cast(ptr, std_t_frqp),
                                                        t->data_arg[STKTABLE_DT_HTTP_FAIL_RATE].u);
+
+		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+	}
 
 	stktable_release(t, ts);
 	return !!ptr;
@@ -1997,8 +2136,13 @@ static int sample_conv_table_http_req_cnt(const struct arg *arg_p, struct sample
 		return 1;
 
 	ptr = stktable_data_ptr(t, ts, STKTABLE_DT_HTTP_REQ_CNT);
-	if (ptr)
+	if (ptr) {
+		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+
 		smp->data.u.sint = stktable_data_cast(ptr, std_t_uint);
+
+		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+	}
 
 	stktable_release(t, ts);
 	return !!ptr;
@@ -2033,9 +2177,14 @@ static int sample_conv_table_http_req_rate(const struct arg *arg_p, struct sampl
 		return 1;
 
 	ptr = stktable_data_ptr(t, ts, STKTABLE_DT_HTTP_REQ_RATE);
-	if (ptr)
+	if (ptr) {
+		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+
 		smp->data.u.sint = read_freq_ctr_period(&stktable_data_cast(ptr, std_t_frqp),
                                                        t->data_arg[STKTABLE_DT_HTTP_REQ_RATE].u);
+
+		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+	}
 
 	stktable_release(t, ts);
 	return !!ptr;
@@ -2070,8 +2219,13 @@ static int sample_conv_table_kbytes_in(const struct arg *arg_p, struct sample *s
 		return 1;
 
 	ptr = stktable_data_ptr(t, ts, STKTABLE_DT_BYTES_IN_CNT);
-	if (ptr)
+	if (ptr) {
+		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+
 		smp->data.u.sint = stktable_data_cast(ptr, std_t_ull) >> 10;
+
+		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+	}
 
 	stktable_release(t, ts);
 	return !!ptr;
@@ -2106,8 +2260,13 @@ static int sample_conv_table_kbytes_out(const struct arg *arg_p, struct sample *
 		return 1;
 
 	ptr = stktable_data_ptr(t, ts, STKTABLE_DT_BYTES_OUT_CNT);
-	if (ptr)
+	if (ptr) {
+		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+
 		smp->data.u.sint = stktable_data_cast(ptr, std_t_ull) >> 10;
+
+		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+	}
 
 	stktable_release(t, ts);
 	return !!ptr;
@@ -2142,8 +2301,13 @@ static int sample_conv_table_server_id(const struct arg *arg_p, struct sample *s
 		return 1;
 
 	ptr = stktable_data_ptr(t, ts, STKTABLE_DT_SERVER_ID);
-	if (ptr)
+	if (ptr) {
+		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+
 		smp->data.u.sint = stktable_data_cast(ptr, std_t_sint);
+
+		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+	}
 
 	stktable_release(t, ts);
 	return !!ptr;
@@ -2178,8 +2342,13 @@ static int sample_conv_table_sess_cnt(const struct arg *arg_p, struct sample *sm
 		return 1;
 
 	ptr = stktable_data_ptr(t, ts, STKTABLE_DT_SESS_CNT);
-	if (ptr)
+	if (ptr) {
+		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+
 		smp->data.u.sint = stktable_data_cast(ptr, std_t_uint);
+
+		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+	}
 
 	stktable_release(t, ts);
 	return !!ptr;
@@ -2214,9 +2383,14 @@ static int sample_conv_table_sess_rate(const struct arg *arg_p, struct sample *s
 		return 1;
 
 	ptr = stktable_data_ptr(t, ts, STKTABLE_DT_SESS_RATE);
-	if (ptr)
+	if (ptr) {
+		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
+
 		smp->data.u.sint = read_freq_ctr_period(&stktable_data_cast(ptr, std_t_frqp),
                                                        t->data_arg[STKTABLE_DT_SESS_RATE].u);
+
+		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+	}
 
 	stktable_release(t, ts);
 	return !!ptr;
@@ -2483,7 +2657,7 @@ static enum act_parse_ret parse_inc_gpc(const char **args, int *arg, struct prox
 	}
 	else {
 		/* default stick table id. */
-		memprintf(err, "invalid gpc ID '%s'. Expects sc-set-gpc(<GPC ID>,<Track ID>)", args[*arg-1]);
+		memprintf(err, "invalid gpc ID '%s'. Expects sc-inc-gpc(<GPC ID>,<Track ID>)", args[*arg-1]);
 		return ACT_RET_PRS_ERR;
 	}
 	rule->action = ACT_CUSTOM;
@@ -2526,6 +2700,7 @@ static enum act_return action_set_gpt(struct act_rule *rule, struct proxy *px,
 			value = (unsigned int)(rule->arg.gpt.value);
 		else {
 			switch (rule->from) {
+			case ACT_F_TCP_REQ_CON: smp_opt_dir = SMP_OPT_DIR_REQ; break;
 			case ACT_F_TCP_REQ_SES: smp_opt_dir = SMP_OPT_DIR_REQ; break;
 			case ACT_F_TCP_REQ_CNT: smp_opt_dir = SMP_OPT_DIR_REQ; break;
 			case ACT_F_TCP_RES_CNT: smp_opt_dir = SMP_OPT_DIR_RES; break;
@@ -2592,6 +2767,7 @@ static enum act_return action_set_gpt0(struct act_rule *rule, struct proxy *px,
 			value = (unsigned int)(rule->arg.gpt.value);
 		else {
 			switch (rule->from) {
+			case ACT_F_TCP_REQ_CON: smp_opt_dir = SMP_OPT_DIR_REQ; break;
 			case ACT_F_TCP_REQ_SES: smp_opt_dir = SMP_OPT_DIR_REQ; break;
 			case ACT_F_TCP_REQ_CNT: smp_opt_dir = SMP_OPT_DIR_REQ; break;
 			case ACT_F_TCP_RES_CNT: smp_opt_dir = SMP_OPT_DIR_RES; break;
@@ -2714,6 +2890,7 @@ static enum act_parse_ret parse_set_gpt(const char **args, int *arg, struct prox
 			return ACT_RET_PRS_ERR;
 
 		switch (rule->from) {
+		case ACT_F_TCP_REQ_CON: smp_val = SMP_VAL_FE_CON_ACC; break;
 		case ACT_F_TCP_REQ_SES: smp_val = SMP_VAL_FE_SES_ACC; break;
 		case ACT_F_TCP_REQ_CNT: smp_val = SMP_VAL_FE_REQ_CNT; break;
 		case ACT_F_TCP_RES_CNT: smp_val = SMP_VAL_BE_RES_CNT; break;
@@ -3297,7 +3474,7 @@ smp_fetch_sc_inc_gpc(const struct arg *args, struct sample *smp, const char *kw,
 	smp->data.u.sint = 0;
 
 	if (!stkctr_entry(stkctr))
-		stkctr = smp_create_src_stkctr(smp->sess, smp->strm, args, kw, &tmpstkctr);
+		stkctr = smp_create_src_stkctr(smp->sess, smp->strm, args + 1, kw, &tmpstkctr);
 
 	if (stkctr && stkctr_entry(stkctr)) {
 		void *ptr1,*ptr2;
@@ -4486,7 +4663,8 @@ static int table_process_entry_per_key(struct appctx *appctx, char **args)
 
 	switch (t->type) {
 	case SMP_T_IPV4:
-		uint32_key = htonl(inetaddr_host(args[4]));
+		if (inet_pton(AF_INET, args[4], &uint32_key) <= 0)
+			return cli_err(appctx, "Invalid key\n");
 		static_table_key.key = &uint32_key;
 		break;
 	case SMP_T_IPV6:
@@ -4980,6 +5158,17 @@ static struct action_kw_list http_res_kws = { { }, {
 }};
 
 INITCALL1(STG_REGISTER, http_res_keywords_register, &http_res_kws);
+
+static struct action_kw_list http_after_res_kws = { { }, {
+	{ "sc-inc-gpc",  parse_inc_gpc,  KWF_MATCH_PREFIX },
+	{ "sc-inc-gpc0", parse_inc_gpc,  KWF_MATCH_PREFIX },
+	{ "sc-inc-gpc1", parse_inc_gpc,  KWF_MATCH_PREFIX },
+	{ "sc-set-gpt",  parse_set_gpt,  KWF_MATCH_PREFIX },
+	{ "sc-set-gpt0", parse_set_gpt,  KWF_MATCH_PREFIX },
+	{ /* END */ }
+}};
+
+INITCALL1(STG_REGISTER, http_after_res_keywords_register, &http_after_res_kws);
 
 /* Note: must not be declared <const> as its list will be overwritten.
  * Please take care of keeping this list alphabetically sorted.

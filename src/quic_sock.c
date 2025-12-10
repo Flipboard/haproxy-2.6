@@ -23,11 +23,11 @@
 #include <haproxy/buf.h>
 #include <haproxy/connection.h>
 #include <haproxy/fd.h>
-#include <haproxy/freq_ctr.h>
 #include <haproxy/global-t.h>
 #include <haproxy/list.h>
 #include <haproxy/listener.h>
 #include <haproxy/pool.h>
+#include <haproxy/protocol-t.h>
 #include <haproxy/proto_quic.h>
 #include <haproxy/proxy-t.h>
 #include <haproxy/quic_conn.h>
@@ -295,6 +295,11 @@ static ssize_t quic_recv(int fd, void *out, size_t len,
 	if (ret < 0)
 		goto end;
 
+	if (unlikely(port_is_restricted((struct sockaddr_storage *)from, HA_PROTO_QUIC))) {
+		ret = -1;
+		goto end;
+	}
+
 	for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
 		switch (cmsg->cmsg_level) {
 		case IPPROTO_IP:
@@ -458,7 +463,7 @@ int qc_snd_buf(struct quic_conn *qc, const struct buffer *buf, size_t sz,
 		             (struct sockaddr *)&qc->peer_addr, get_addr_len(&qc->peer_addr));
 	} while (ret < 0 && errno == EINTR);
 
-	if (ret < 0 || ret != sz) {
+	if (ret < 0) {
 		struct proxy *prx = qc->li->bind_conf->frontend;
 		struct quic_counters *prx_counters =
 		  EXTRA_COUNTERS_GET(prx->extra_counters_fe,
@@ -480,12 +485,8 @@ int qc_snd_buf(struct quic_conn *qc, const struct buffer *buf, size_t sz,
 		return 1;
 	}
 
-	/* we count the total bytes sent, and the send rate for 32-byte blocks.
-	 * The reason for the latter is that freq_ctr are limited to 4GB and
-	 * that it's not enough per second.
-	 */
-	_HA_ATOMIC_ADD(&global.out_bytes, ret);
-	update_freq_ctr(&global.out_32bps, (ret + 16) / 32);
+	if (ret != sz)
+		return 1;
 
 	return 0;
 }
@@ -496,18 +497,15 @@ int qc_snd_buf(struct quic_conn *qc, const struct buffer *buf, size_t sz,
 struct quic_accept_queue *quic_accept_queues;
 
 /* Install <qc> on the queue ready to be accepted. The queue task is then woken
- * up. If <qc> accept is already scheduled or done, nothing is done.
+ * up.
  */
 void quic_accept_push_qc(struct quic_conn *qc)
 {
 	struct quic_accept_queue *queue = &quic_accept_queues[qc->tid];
 	struct li_per_thread *lthr = &qc->li->per_thr[qc->tid];
 
-	/* early return if accept is already in progress/done for this
-	 * connection
-	 */
-	if (qc->flags & QUIC_FL_CONN_ACCEPT_REGISTERED)
-		return;
+	/* A connection must only be accepted once per instance. */
+	BUG_ON(qc->flags & QUIC_FL_CONN_ACCEPT_REGISTERED);
 
 	BUG_ON(MT_LIST_INLIST(&qc->accept_list));
 
@@ -539,7 +537,10 @@ static struct task *quic_accept_run(struct task *t, void *ctx, unsigned int i)
 
 	mt_list_for_each_entry_safe(lthr, &queue->listeners, quic_accept.list, elt1, elt2) {
 		listener_accept(lthr->li);
-		MT_LIST_DELETE_SAFE(elt1);
+		if (!MT_LIST_ISEMPTY(&lthr->quic_accept.conns))
+			tasklet_wakeup((struct tasklet*)t);
+		else
+			MT_LIST_DELETE_SAFE(elt1);
 	}
 
 	return NULL;

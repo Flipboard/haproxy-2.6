@@ -25,8 +25,8 @@
 
 
 DECLARE_POOL(pool_head_session, "session", sizeof(struct session));
-DECLARE_POOL(pool_head_sess_srv_list, "session server list",
-		sizeof(struct sess_srv_list));
+DECLARE_POOL(pool_head_sess_priv_conns, "session priv conns list",
+             sizeof(struct sess_priv_conns));
 
 int conn_complete_session(struct connection *conn);
 
@@ -53,7 +53,7 @@ struct session *session_new(struct proxy *fe, struct listener *li, enum obj_type
 		sess->t_idle = -1;
 		_HA_ATOMIC_INC(&totalconn);
 		_HA_ATOMIC_INC(&jobs);
-		LIST_INIT(&sess->srv_list);
+		LIST_INIT(&sess->priv_conns);
 		sess->idle_conns = 0;
 		sess->flags = SESS_FL_NONE;
 		sess->src = NULL;
@@ -65,7 +65,7 @@ struct session *session_new(struct proxy *fe, struct listener *li, enum obj_type
 void session_free(struct session *sess)
 {
 	struct connection *conn, *conn_back;
-	struct sess_srv_list *srv_list, *srv_list_back;
+	struct sess_priv_conns *pconns, *pconns_back;
 
 	if (sess->listener)
 		listener_release(sess->listener);
@@ -74,9 +74,9 @@ void session_free(struct session *sess)
 	conn = objt_conn(sess->origin);
 	if (conn != NULL && conn->mux)
 		conn->mux->destroy(conn->ctx);
-	list_for_each_entry_safe(srv_list, srv_list_back, &sess->srv_list, srv_list) {
-		list_for_each_entry_safe(conn, conn_back, &srv_list->conn_list, session_list) {
-			LIST_DEL_INIT(&conn->session_list);
+	list_for_each_entry_safe(pconns, pconns_back, &sess->priv_conns, sess_el) {
+		list_for_each_entry_safe(conn, conn_back, &pconns->conn_list, sess_el) {
+			LIST_DEL_INIT(&conn->sess_el);
 			if (conn->mux) {
 				conn->owner = NULL;
 				conn->flags &= ~CO_FL_SESS_IDLE;
@@ -90,7 +90,8 @@ void session_free(struct session *sess)
 				conn_free(conn);
 			}
 		}
-		pool_free(pool_head_sess_srv_list, srv_list);
+		MT_LIST_DELETE(&pconns->srv_el);
+		pool_free(pool_head_sess_priv_conns, pconns);
 	}
 	sockaddr_free(&sess->src);
 	sockaddr_free(&sess->dst);
@@ -182,13 +183,20 @@ int session_accept_fd(struct connection *cli_conn)
 	 */
 	if ((l->options & LI_O_TCP_L4_RULES) && !tcp_exec_l4_rules(sess)) {
 		/* let's do a no-linger now to close with a single RST. */
-		setsockopt(cfd, SOL_SOCKET, SO_LINGER, (struct linger *) &nolinger, sizeof(struct linger));
+		if (!(cli_conn->flags & CO_FL_FDLESS))
+			setsockopt(cfd, SOL_SOCKET, SO_LINGER, (struct linger *) &nolinger, sizeof(struct linger));
 		ret = 0; /* successful termination */
 		goto out_free_sess;
 	}
 	/* TCP rules may flag the connection as needing proxy protocol, now that it's done we can start ourxprt */
 	if (conn_xprt_start(cli_conn) < 0)
 		goto out_free_sess;
+
+	/* FIXME/WTA: we should implement the setsockopt() calls at the proto
+	 * level instead and let non-inet protocols implement their own equivalent.
+	 */
+	if (cli_conn->flags & CO_FL_FDLESS)
+		goto skip_fd_setup;
 
 	/* Adjust some socket options */
 	if (l->rx.addr.ss_family == AF_INET || l->rx.addr.ss_family == AF_INET6) {
@@ -235,6 +243,7 @@ int session_accept_fd(struct connection *cli_conn)
 	if (global.tune.client_rcvbuf)
 		setsockopt(cfd, SOL_SOCKET, SO_RCVBUF, &global.tune.client_rcvbuf, sizeof(global.tune.client_rcvbuf));
 
+ skip_fd_setup:
 	/* OK, now either we have a pending handshake to execute with and then
 	 * we must return to the I/O layer, or we can proceed with the end of
 	 * the stream initialization. In case of handshake, we also set the I/O
@@ -282,7 +291,8 @@ int session_accept_fd(struct connection *cli_conn)
 
  out_free_conn:
 	if (ret < 0 && l->bind_conf->xprt == xprt_get(XPRT_RAW) &&
-	    p->mode == PR_MODE_HTTP && l->bind_conf->mux_proto == NULL) {
+	    p->mode == PR_MODE_HTTP && l->bind_conf->mux_proto == NULL &&
+	    !(cli_conn->flags & CO_FL_FDLESS)) {
 		/* critical error, no more memory, try to emit a 500 response */
 		send(cfd, http_err_msgs[HTTP_ERR_500], strlen(http_err_msgs[HTTP_ERR_500]),
 		     MSG_DONTWAIT|MSG_NOSIGNAL);

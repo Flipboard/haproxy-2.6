@@ -23,8 +23,8 @@
 #   USE_PCRE2_JIT        : enable JIT for faster regex on libpcre2
 #   USE_POLL             : enable poll(). Automatic.
 #   USE_THREAD           : enable threads support.
-#   USE_STATIC_PCRE      : enable static libpcre. Recommended.
-#   USE_STATIC_PCRE2     : enable static libpcre2.
+#   USE_STATIC_PCRE      : enable static libpcre.
+#   USE_STATIC_PCRE2     : enable static libpcre2. Recommended.
 #   USE_TPROXY           : enable transparent proxy. Automatic.
 #   USE_LINUX_TPROXY     : enable full transparent proxy. Automatic.
 #   USE_LINUX_SPLICE     : enable kernel 2.6 splicing. Automatic.
@@ -32,6 +32,7 @@
 #   USE_CRYPT_H          : set it if your system requires including crypt.h
 #   USE_GETADDRINFO      : use getaddrinfo() to resolve IPv6 host names.
 #   USE_OPENSSL          : enable use of OpenSSL. Recommended, but see below.
+#   USE_QUIC             : enable use of QUIC with the quictls API (quictls, libressl, boringssl)
 #   USE_ENGINE           : enable use of OpenSSL Engine.
 #   USE_LUA              : enable Lua support.
 #   USE_ACCEPT4          : enable use of accept4() on linux. Automatic.
@@ -553,7 +554,11 @@ ignore_implicit = $(if $(subst environment,,$(origin $(1))),         \
 # is used to report a list of all flags which were used to build this version.
 # Do not assign anything to it.
 BUILD_OPTIONS  := $(foreach opt,$(use_opts),$(call ignore_implicit,$(opt)))
-BUILD_FEATURES := $(foreach opt,$(patsubst USE_%,%,$(use_opts)),$(if $(USE_$(opt)),+$(opt),-$(opt)))
+
+# Make a list of all known features with +/- prepended depending on their
+# activation status. Must be a macro so that dynamically enabled ones are
+# evaluated with their current status.
+BUILD_FEATURES  = $(foreach opt,$(patsubst USE_%,%,$(sort $(use_opts))),$(if $(USE_$(opt)),+$(opt),-$(opt)))
 
 # All USE_* options have their equivalent macro defined in the code (some might
 # possibly be unused though)
@@ -710,7 +715,7 @@ OPTIONS_OBJS	+= $(DEVICEATLAS_LIB)/json.o
 OPTIONS_OBJS	+= $(DEVICEATLAS_LIB)/dac.o
 endif
 OPTIONS_OBJS	+= addons/deviceatlas/da.o
-OPTIONS_CFLAGS += $(if $(DEVICEATLAS_INC),-I$(DEVICEATLAS_INC))
+OPTIONS_CFLAGS += $(if $(DEVICEATLAS_INC),-I$(DEVICEATLAS_INC)) $(if $(DEVICEATLAS_SRC),-DDATLAS_DA_NOCACHE)
 endif
 
 ifneq ($(USE_51DEGREES),)
@@ -1092,6 +1097,7 @@ clean:
 	$(Q)rm -f addons/promex/*.[oas]
 	$(Q)rm -f addons/51degrees/*.[oas] addons/51degrees/dummy/*.[oas] addons/51degrees/dummy/*/*.[oas]
 	$(Q)rm -f addons/deviceatlas/*.[oas] addons/deviceatlas/dummy/*.[oas] addons/deviceatlas/dummy/*.o
+	$(Q)rm -f addons/deviceatlas/dummy/Os/*.o
 	$(Q)rm -f addons/ot/src/*.[oas]
 	$(Q)rm -f addons/wurfl/*.[oas] addons/wurfl/dummy/*.[oas]
 	$(Q)rm -f admin/*/*.[oas] admin/*/*/*.[oas]
@@ -1201,3 +1207,38 @@ reg-tests-help:
 	@echo "(see --help option of this script for more information)."
 
 .PHONY: reg-tests reg-tests-help
+
+# "make range" iteratively builds using "make all" and the exact same build
+# options for all commits within RANGE. RANGE may be either a git range
+# such as ref1..ref2 or a single commit, in which case all commits from
+# the master branch to this one will be tested.
+
+range:
+	$(Q)[ -d .git/. ] || { echo "## Fatal: \"make $@\" may only be used inside a Git repository."; exit 1; }
+
+	$(Q)if git diff-index --name-only HEAD 2>/dev/null | grep -q ^; then \
+		echo "Fatal: \"make $@\" requires a clean working tree."; exit 1; fi
+
+	$(Q)[ -n "$(RANGE)" ] || { echo "## Fatal: \"make $@\" requires a git commit range in RANGE."; exit 1; }
+	$(Q)[ -n "$(TARGET)" ] || { echo "## Fatal: \"make $@\" needs the same variables as \"all\" (TARGET etc)."; exit 1; }
+
+	$(Q) (  die() { echo;echo "## Stopped in error at index [ $$index/$$count ] commit $$commit";\
+			echo "Previous branch was $$BRANCH"; exit $$1; }; \
+		BRANCH=$$(git branch --show-current HEAD 2>/dev/null); \
+		[ -n "$$BRANCH" ] || { echo "Fatal: \"make $@\" may only be used inside a checked out branch."; exit 1; }; \
+		[ -z "$${RANGE##*..*}" ] || RANGE="master..$${RANGE}"; \
+		COMMITS=$$(git rev-list --abbrev-commit --reverse "$${RANGE}"); \
+		index=1; count=$$(echo $$COMMITS | wc -w); \
+		[ "$${count}" -gt 0 ] || { echo "## Fatal: no commit(s) found in range $${RANGE}."; exit 1; }; \
+		echo "Found $${count} commit(s) in range $${RANGE}." ; \
+		echo "Current branch is $$BRANCH"; \
+		echo "Starting to building now..."; \
+		for commit in $$COMMITS; do \
+			echo "[ $$index/$$count ]   $$commit #############################"; \
+			git checkout -q $$commit || die 1; \
+			$(MAKE) all || die 1; \
+			index=$$((index + 1)); \
+		done; \
+		echo;echo "Done! $${count} commit(s) built successfully for RANGE $${RANGE}" ; \
+		git checkout -q "$$BRANCH"; \
+	)

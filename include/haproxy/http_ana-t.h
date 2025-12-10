@@ -59,7 +59,7 @@
 /* cacheability management, bits values 0x1000 to 0x3000 (0-3 shift 12) */
 #define TX_CACHEABLE	0x00001000	/* at least part of the response is cacheable */
 #define TX_CACHE_COOK	0x00002000	/* a cookie in the response is cacheable */
-#define TX_CACHE_IGNORE 0x00004000	/* do not retrieve object from cache, or avoid caching response */
+#define TX_CACHE_IGNORE 0x00004000	/* do not retrieve object from cache */
 #define TX_CACHE_SHIFT	12		/* bit shift */
 
 #define TX_CON_WANT_TUN 0x00008000	/* Will be a tunnel (CONNECT or 101-Switching-Protocol) */
@@ -71,8 +71,9 @@
 /* used only for keep-alive purposes, to indicate we're on a second transaction */
 #define TX_NOT_FIRST	0x00040000	/* the transaction is not the first one */
 
-#define TX_L7_RETRY     0x000800000     /* The transaction may attempt L7 retries */
-#define TX_D_L7_RETRY   0x001000000     /* Disable L7 retries on this transaction, even if configured to do it */
+#define TX_L7_RETRY     0x00080000      /* The transaction may attempt L7 retries */
+#define TX_D_L7_RETRY   0x00100000      /* Disable L7 retries on this transaction, even if configured to do it */
+
 /*
  * HTTP message status flags (msg->flags)
  */
@@ -92,6 +93,8 @@
 
 #define HTTP_MSGF_BODYLESS    0x00000040  /* The message has no body (content-length = 0) */
 #define HTTP_MSGF_CONN_UPG    0x00000080  /* The message contains "Connection: Upgrade" header */
+
+#define HTTP_MSGF_EXPECT_CHECKED 0x00000100  /* Expect header was already handled, if any */
 
 /* Maximum length of the cache secondary key (sum of all the possible parts of
  * the secondary key). The actual keys might be smaller for some

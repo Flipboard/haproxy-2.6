@@ -134,6 +134,11 @@
 #define MAX_HDR_HISTORY 10
 #endif
 
+// max length of a TRACE_PRINTF() output buffer (one less char for the message)
+#ifndef TRACE_MAX_MSG
+#define TRACE_MAX_MSG 1024
+#endif
+
 // max # of stick counters per session (at least 3 for sc0..sc2)
 #ifndef MAX_SESS_STKCTR
 #define MAX_SESS_STKCTR 3
@@ -269,6 +274,34 @@
 #define DEFAULT_MAXCONN 100
 #endif
 
+/* Default file descriptor limit.
+ *
+ * DEFAULT_MAXFD explicitly reduces the hard RLIMIT_NOFILE, which is used by the
+ * process as the base value to calculate the default global.maxsock, if
+ * global.maxconn, global.rlimit_memmax are not defined. This is useful in the
+ * case, when hard nofile limit has been bumped to fs.nr_open (kernel max),
+ * which is extremely large on many modern distros. So, we will also finish with
+ * an extremely large default global.maxsock. The only way to override
+ * DEFAULT_MAXFD, if defined, is to set fd_hard_limit in the config global
+ * section. If DEFAULT_MAXFD is not set, a reasonable maximum of 1048576 will be
+ * used as the default value, which almost guarantees that a process will
+ * correctly start in any situation and will be not killed then by watchdog,
+ * when it will loop over the allocated fdtab.
+*/
+#ifndef DEFAULT_MAXFD
+#define DEFAULT_MAXFD 1048576
+#endif
+
+/* Define a maxconn which will be used in the master process once it re-exec to
+ * the MODE_MWORKER_WAIT and won't change when SYSTEM_MAXCONN is set.
+ *
+ * 100 must be enough for the master since it only does communication between
+ * the master and the workers, and the master CLI.
+ */
+#ifndef MASTER_MAXCONN
+#define MASTER_MAXCONN 100
+#endif
+
 /* Minimum check interval for spread health checks. Servers with intervals
  * greater than or equal to this value will have their checks spread apart
  * and will be considered when searching the minimal interval.
@@ -284,7 +317,7 @@
  * disable the feature.
  */
 #ifndef STATS_VERSION_STRING
-#define STATS_VERSION_STRING " version " HAPROXY_VERSION ", released " HAPROXY_DATE
+#define STATS_VERSION_STRING " version " HAPROXY_VERSION "-flipboard, released " HAPROXY_DATE
 #endif
 
 /* This is the default statistics URI */

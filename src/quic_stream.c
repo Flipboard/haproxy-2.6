@@ -17,6 +17,33 @@ DECLARE_STATIC_POOL(pool_head_quic_stream_buf, "qc_stream_buf",
                     sizeof(struct qc_stream_buf));
 
 
+static void qc_stream_buf_free(struct qc_stream_desc *stream,
+                               struct qc_stream_buf **stream_buf)
+{
+	struct quic_conn *qc = stream->qc;
+	struct buffer *buf = &(*stream_buf)->buf;
+
+	LIST_DEL_INIT(&(*stream_buf)->list);
+
+	/* Reset current buf ptr if deleted instance is the same one. */
+	if (*stream_buf == stream->buf)
+		stream->buf = NULL;
+
+	b_free(buf);
+	offer_buffers(NULL, 1);
+	pool_free(pool_head_quic_stream_buf, *stream_buf);
+	*stream_buf = NULL;
+
+	/* notify MUX about available buffers. */
+	--qc->stream_buf_count;
+	if (qc->mux_state == QC_MUX_READY) {
+		if (qc->qcc->flags & QC_CF_CONN_FULL) {
+			qc->qcc->flags &= ~QC_CF_CONN_FULL;
+			tasklet_wakeup(qc->qcc->wait_event.tasklet);
+		}
+	}
+}
+
 /* Allocate a new stream descriptor with id <id>. The caller is responsible to
  * store the stream in the appropriate tree. -1 special value must be used for
  * a CRYPTO data stream, the type being ignored.
@@ -57,8 +84,13 @@ struct qc_stream_desc *qc_stream_desc_new(uint64_t id, enum qcs_type type, void 
 /* Mark the stream descriptor <stream> as released. It will be freed as soon as
  * all its buffered data are acknowledged. Does nothing if <stream> is already
  * NULL.
+ *
+ * <final_size> corresponds to the last offset sent for this stream. If there
+ * is unsent data present, they will be remove first to guarantee that buffer
+ * is freed after receiving all acknowledges.
  */
-void qc_stream_desc_release(struct qc_stream_desc *stream)
+void qc_stream_desc_release(struct qc_stream_desc *stream,
+                            uint64_t final_size)
 {
 	if (!stream)
 		return;
@@ -69,13 +101,30 @@ void qc_stream_desc_release(struct qc_stream_desc *stream)
 	stream->release = 1;
 	stream->ctx = NULL;
 
+	if (stream->buf) {
+		struct qc_stream_buf *stream_buf = stream->buf;
+		struct buffer *buf = &stream_buf->buf;
+		const uint64_t tail_offset =
+		  MAX(stream->buf_offset, stream->ack_offset) + b_data(buf);
+
+		/* final_size cannot be greater than all currently stored data. */
+		BUG_ON(final_size > tail_offset);
+
+		/* Remove unsent data from current buffer. */
+		if (final_size < tail_offset) {
+			b_sub(buf, tail_offset - final_size);
+			/* Remove buffer is all ACK already received. */
+			if (!b_data(buf))
+				qc_stream_buf_free(stream, &stream_buf);
+		}
+
+		/* A released stream does not use <stream.buf>. */
+		stream->buf = NULL;
+	}
+
 	if (LIST_ISEMPTY(&stream->buf_list)) {
 		/* if no buffer left we can free the stream. */
 		qc_stream_desc_free(stream, 0);
-	}
-	else {
-		/* A released stream does not use <stream.buf>. */
-		stream->buf = NULL;
 	}
 }
 
@@ -92,7 +141,6 @@ int qc_stream_desc_ack(struct qc_stream_desc **stream, size_t offset, size_t len
 {
 	struct qc_stream_desc *s = *stream;
 	struct qc_stream_buf *stream_buf;
-	struct quic_conn *qc = s->qc;
 	struct buffer *buf;
 	size_t diff;
 
@@ -110,37 +158,15 @@ int qc_stream_desc_ack(struct qc_stream_desc **stream, size_t offset, size_t len
 	s->ack_offset += diff;
 	b_del(buf, diff);
 
-	/* nothing more to do if buf still not empty. */
-	if (b_data(buf))
-		return diff;
+	/* Free oldest buffer if all data acknowledged. */
+	if (!b_data(buf)) {
+		qc_stream_buf_free(s, &stream_buf);
 
-	/* buf is empty and can now be freed. Do not forget to reset current
-	 * buf ptr if we were working on it.
-	 */
-	LIST_DELETE(&stream_buf->list);
-	if (stream_buf == s->buf) {
-		/* current buf must always be last entry in buflist */
-		BUG_ON(!LIST_ISEMPTY(&s->buf_list));
-		s->buf = NULL;
-	}
-
-	b_free(buf);
-	pool_free(pool_head_quic_stream_buf, stream_buf);
-	offer_buffers(NULL, 1);
-
-	/* notify MUX about available buffers. */
-	--qc->stream_buf_count;
-	if (qc->mux_state == QC_MUX_READY) {
-		if (qc->qcc->flags & QC_CF_CONN_FULL) {
-			qc->qcc->flags &= ~QC_CF_CONN_FULL;
-			tasklet_wakeup(qc->qcc->wait_event.tasklet);
+		/* Free stream instance if already released and no buffers left. */
+		if (s->release && LIST_ISEMPTY(&s->buf_list)) {
+			qc_stream_desc_free(s, 0);
+			*stream = NULL;
 		}
-	}
-
-	/* Free stream instance if already released and no buffers left. */
-	if (s->release && LIST_ISEMPTY(&s->buf_list)) {
-		qc_stream_desc_free(s, 0);
-		*stream = NULL;
 	}
 
 	return diff;
@@ -215,12 +241,11 @@ struct buffer *qc_stream_buf_get(struct qc_stream_desc *stream)
 	return &stream->buf->buf;
 }
 
-/* Check if a new stream buffer can be allocated for the connection <qc>.
- * Returns a boolean.
- */
+/* Returns the count of available buffer left for <qc>. */
 static int qc_stream_buf_avail(struct quic_conn *qc)
 {
-	return qc->stream_buf_count < global.tune.quic_streams_buf;
+	BUG_ON(qc->stream_buf_count > global.tune.quic_streams_buf);
+	return global.tune.quic_streams_buf - qc->stream_buf_count;
 }
 
 /* Allocate a new current buffer for <stream>. The buffer limit count for the
@@ -228,25 +253,27 @@ static int qc_stream_buf_avail(struct quic_conn *qc)
  * is not NULL prior to this call. The new buffer represents stream payload at
  * offset <offset>.
  *
- * Returns the buffer or NULL.
+ * Returns the buffer or NULL on error. Caller may check <avail> to ensure if
+ * the connection buffer limit was reached or a fatal error was encountered.
  */
 struct buffer *qc_stream_buf_alloc(struct qc_stream_desc *stream,
-                                   uint64_t offset)
+                                   uint64_t offset, int *avail)
 {
 	struct quic_conn *qc = stream->qc;
 
 	/* current buffer must be released first before allocate a new one. */
 	BUG_ON(stream->buf);
 
-	if (!qc_stream_buf_avail(qc))
+	*avail = qc_stream_buf_avail(qc);
+	if (!*avail)
 		return NULL;
-
-	++qc->stream_buf_count;
 
 	stream->buf_offset = offset;
 	stream->buf = pool_alloc(pool_head_quic_stream_buf);
 	if (!stream->buf)
 		return NULL;
+
+	++qc->stream_buf_count;
 
 	stream->buf->buf = BUF_NULL;
 	LIST_APPEND(&stream->buf_list, &stream->buf->list);

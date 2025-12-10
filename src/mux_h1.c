@@ -363,6 +363,7 @@ struct task *h1_timeout_task(struct task *t, void *context, unsigned int state);
 static void h1_shutw_conn(struct connection *conn);
 static void h1_wake_stream_for_recv(struct h1s *h1s);
 static void h1_wake_stream_for_send(struct h1s *h1s);
+static void h1s_destroy(struct h1s *h1s);
 
 /* returns the stconn associated to the H1 stream */
 static forceinline struct stconn *h1s_sc(const struct h1s *h1s)
@@ -607,18 +608,24 @@ static void h1_refresh_timeout(struct h1c *h1c)
 			 * timeouts so that we don't hang too long on clients that have
 			 * gone away (especially in tunnel mode).
 			 */
-			h1c->task->expire = tick_add(now_ms, h1c->shut_timeout);
+			h1c->task->expire = tick_add_ifset(now_ms, h1c->shut_timeout);
 			TRACE_DEVEL("refreshing connection's timeout (dead or half-closed)", H1_EV_H1C_SEND|H1_EV_H1C_RECV, h1c->conn);
 			is_idle_conn = 1;
 		}
 		else if (b_data(&h1c->obuf)) {
 			/* connection with pending outgoing data, need a timeout (server or client). */
-			h1c->task->expire = tick_add(now_ms, h1c->timeout);
+			h1c->task->expire = tick_add_ifset(now_ms, h1c->timeout);
 			TRACE_DEVEL("refreshing connection's timeout (pending outgoing data)", H1_EV_H1C_SEND|H1_EV_H1C_RECV, h1c->conn);
+		}
+		else if ((h1c->flags & (H1C_F_IS_BACK|H1C_F_ST_IDLE)) == H1C_F_ST_IDLE) {
+			/* idle front connections. */
+			h1c->task->expire = (tick_isset(h1c->idle_exp) ? h1c->idle_exp : tick_add_ifset(now_ms, h1c->timeout));
+			TRACE_DEVEL("refreshing connection's timeout (idle front h1c)", H1_EV_H1C_SEND|H1_EV_H1C_RECV, h1c->conn);
+			is_idle_conn = 1;
 		}
 		else if (!(h1c->flags & (H1C_F_IS_BACK|H1C_F_ST_READY))) {
 			/* front connections waiting for a fully usable stream need a timeout. */
-			h1c->task->expire = tick_add(now_ms, h1c->timeout);
+			h1c->task->expire = tick_first(h1c->idle_exp, tick_add_ifset(now_ms, h1c->timeout));
 			TRACE_DEVEL("refreshing connection's timeout (alive front h1c but not ready)", H1_EV_H1C_SEND|H1_EV_H1C_RECV, h1c->conn);
 			/* A frontend connection not yet ready could be treated the same way as an idle
 			 * one in case of soft-close.
@@ -630,9 +637,6 @@ static void h1_refresh_timeout(struct h1c *h1c)
 			h1c->task->expire = TICK_ETERNITY;
 			TRACE_DEVEL("no connection timeout (alive back h1c or front h1c with an SC)", H1_EV_H1C_SEND|H1_EV_H1C_RECV, h1c->conn);
 		}
-
-		/* Finally set the idle expiration date if shorter */
-		h1c->task->expire = tick_first(h1c->task->expire, h1c->idle_exp);
 
 		if ((h1c->px->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) &&
 		     is_idle_conn && tick_isset(global.close_spread_end)) {
@@ -844,7 +848,7 @@ static struct h1s *h1c_frt_stream_new(struct h1c *h1c, struct stconn *sc, struct
 
   fail:
 	TRACE_DEVEL("leaving on error", H1_EV_STRM_NEW|H1_EV_STRM_ERR, h1c->conn);
-	pool_free(pool_head_h1s, h1s);
+	h1s_destroy(h1s);
 	return NULL;
 }
 
@@ -878,7 +882,7 @@ static struct h1s *h1c_bck_stream_new(struct h1c *h1c, struct stconn *sc, struct
 
   fail:
 	TRACE_DEVEL("leaving on error", H1_EV_STRM_NEW|H1_EV_STRM_ERR, h1c->conn);
-	pool_free(pool_head_h1s, h1s);
+	h1s_destroy(h1s);
 	return NULL;
 }
 
@@ -983,19 +987,16 @@ static int h1_init(struct connection *conn, struct proxy *proxy, struct session 
 		LIST_APPEND(&mux_stopping_data[tid].list,
 		            &h1c->conn->stopping_list);
 	}
-	if (tick_isset(h1c->timeout)) {
-		t = task_new_here();
-		if (!t) {
-			TRACE_ERROR("H1C task allocation failure", H1_EV_H1C_NEW|H1_EV_H1C_END|H1_EV_H1C_ERR);
-			goto fail;
-		}
 
-		h1c->task = t;
-		t->process = h1_timeout_task;
-		t->context = h1c;
-
-		t->expire = tick_add(now_ms, h1c->timeout);
+	t = task_new_here();
+	if (!t) {
+		TRACE_ERROR("H1C task allocation failure", H1_EV_H1C_NEW|H1_EV_H1C_END|H1_EV_H1C_ERR);
+		goto fail;
 	}
+	h1c->task = t;
+	t->process = h1_timeout_task;
+	t->context = h1c;
+	t->expire = tick_add_ifset(now_ms, h1c->timeout);
 
 	conn->ctx = h1c;
 
@@ -1088,8 +1089,10 @@ static void h1_release(struct h1c *h1c)
 		h1c->task = NULL;
 	}
 
-	if (h1c->wait_event.tasklet)
+	if (h1c->wait_event.tasklet) {
 		tasklet_free(h1c->wait_event.tasklet);
+		h1c->wait_event.tasklet = NULL;
+	}
 
 	h1s_destroy(h1c->h1s);
 	if (conn) {
@@ -1823,8 +1826,16 @@ static size_t h1_process_demux(struct h1c *h1c, struct buffer *buf, size_t count
 				   H1_EV_RX_DATA|H1_EV_RX_EOI, h1c->conn, h1s, htx);
 
 			if ((h1m->flags & H1_MF_RESP) &&
-			    ((h1s->meth == HTTP_METH_CONNECT && h1s->status >= 200 && h1s->status < 300) || h1s->status == 101))
+			    ((h1s->meth == HTTP_METH_CONNECT && h1s->status >= 200 && h1s->status < 300) || h1s->status == 101)) {
+				if (h1s->req.state != H1_MSG_DONE) {
+					TRACE_STATE("Reject tunnel because request is not finished", H1_EV_RX_DATA|H1_EV_H1S_BLK, h1c->conn, h1s);
+					h1s->flags |= H1S_F_PARSING_ERROR;
+					htx->flags |= HTX_FL_PARSING_ERROR;
+					h1_capture_bad_message(h1s->h1c, h1s, h1m, buf);
+					break;
+				}
 				h1_set_tunnel_mode(h1s);
+			}
 			else {
 				if (h1s->req.state < H1_MSG_DONE || h1s->res.state < H1_MSG_DONE) {
 					/* Unfinished transaction: block this input side waiting the end of the output side */
@@ -1920,13 +1931,15 @@ static size_t h1_process_demux(struct h1c *h1c, struct buffer *buf, size_t count
 
 	/* Set EOI on stream connector in DONE state iff:
 	 *  - it is a response
+	 *  - it is a request and the response is DONE too
 	 *  - it is a request but no a protocol upgrade nor a CONNECT
 	 *
 	 * If not set, Wait the response to do so or not depending on the status
 	 * code.
 	 */
-	if (((h1m->state == H1_MSG_DONE) && (h1m->flags & H1_MF_RESP)) ||
-	    ((h1m->state == H1_MSG_DONE) && (h1s->meth != HTTP_METH_CONNECT) && !(h1m->flags & H1_MF_CONN_UPG)))
+	if ((h1m->state == H1_MSG_DONE) && ((h1m->flags & H1_MF_RESP) ||
+					    (h1s->res.state == H1_MSG_DONE) ||
+					    ((h1s->meth != HTTP_METH_CONNECT) && !(h1m->flags & H1_MF_CONN_UPG))))
 		se_fl_set(h1s->sd, SE_FL_EOI);
 
   out:
@@ -2179,7 +2192,10 @@ static size_t h1_process_mux(struct h1c *h1c, struct buffer *buf, size_t count)
 				if (isteq(n, ist("transfer-encoding"))) {
 					if ((h1m->flags & H1_MF_RESP) && (h1s->status < 200 || h1s->status == 204))
 						goto skip_hdr;
-					h1_parse_xfer_enc_header(h1m, v);
+					if (h1m->flags & H1_MF_CHNK)
+						goto skip_hdr;
+					h1m->flags |= (H1_MF_XFER_ENC|H1_MF_CHNK);
+					v = ist("chunked");
 				}
 				else if (isteq(n, ist("content-length"))) {
 					if ((h1m->flags & H1_MF_RESP) && (h1s->status < 200 || h1s->status == 204))
@@ -2241,6 +2257,7 @@ static size_t h1_process_mux(struct h1c *h1c, struct buffer *buf, size_t count)
 					else if ((h1m->flags & (H1_MF_XFER_ENC|H1_MF_CLEN)) == (H1_MF_XFER_ENC|H1_MF_CLEN)) {
 						/* T-E + C-L: force close */
 						h1s->flags = (h1s->flags & ~H1S_F_WANT_MSK) | H1S_F_WANT_CLO;
+						h1m->flags &= ~H1_MF_CLEN;
 						TRACE_STATE("force close mode (T-E + C-L)", H1_EV_TX_DATA|H1_EV_TX_HDRS, h1s->h1c->conn, h1s);
 					}
 					else if ((h1m->flags & (H1_MF_VER_11|H1_MF_XFER_ENC)) == H1_MF_XFER_ENC) {
@@ -2824,13 +2841,30 @@ static int h1_recv(struct h1c *h1c)
 	if (b_data(&h1c->ibuf) > 0 && b_data(&h1c->ibuf) < 128)
 		b_slow_realign_ofs(&h1c->ibuf, trash.area, sizeof(struct htx));
 
+	max = buf_room_for_htx_data(&h1c->ibuf);
+
 	/* avoid useless reads after first responses */
 	if (!h1c->h1s ||
 	    (!(h1c->flags & H1C_F_IS_BACK) && h1c->h1s->req.state == H1_MSG_RQBEFORE) ||
-	    ((h1c->flags & H1C_F_IS_BACK) && h1c->h1s->res.state == H1_MSG_RPBEFORE))
+	    ((h1c->flags & H1C_F_IS_BACK) && h1c->h1s->res.state == H1_MSG_RPBEFORE)) {
 		flags |= CO_RFL_READ_ONCE;
 
-	max = buf_room_for_htx_data(&h1c->ibuf);
+		/* we know that the first read will be constrained to a smaller
+		 * read by the stream layer in order to respect the reserve.
+		 * Reading too much will result in global.tune.maxrewrite being
+		 * left at the end of the buffer, and in a very small read
+		 * being performed again to complete them (typically 16 bytes
+		 * freed in the index after headers were consumed) before
+		 * another larger read. Instead, given that we know we're
+		 * waiting for a header and we'll be limited, let's perform a
+		 * shorter first read that the upper layer can retrieve by just
+		 * a pointer swap and the next read will be doable at once in
+		 * an empty buffer.
+		 */
+		if (max > global.tune.bufsize - global.tune.maxrewrite)
+			max = global.tune.bufsize - global.tune.maxrewrite;
+	}
+
 	if (max) {
 		if (h1c->flags & H1C_F_IN_FULL) {
 			h1c->flags &= ~H1C_F_IN_FULL;
@@ -3122,6 +3156,7 @@ static int h1_process(struct h1c * h1c)
 			se_fl_set(h1s->sd, SE_FL_ERROR);
 		h1_alert(h1s);
 		TRACE_DEVEL("waiting to release the SC before releasing the connection", H1_EV_H1C_WAKE);
+		return 0;
 	}
 	else {
 		h1_release(h1c);
@@ -3158,7 +3193,7 @@ struct task *h1_io_cb(struct task *t, void *ctx, unsigned int state)
 		/* Remove the connection from the list, to be sure nobody attempts
 		 * to use it while we handle the I/O events
 		 */
-		conn_in_list = conn->flags & CO_FL_LIST_MASK;
+		conn_in_list = conn_get_idle_flag(conn);
 		if (conn_in_list)
 			conn_delete_from_tree(&conn->hash_node->node);
 
@@ -3360,7 +3395,7 @@ static void h1_destroy(void *ctx)
 {
 	struct h1c *h1c = ctx;
 
-	TRACE_POINT(H1_EV_H1C_END, h1c->conn);
+	TRACE_POINT(H1_EV_H1C_END);
 	if (!h1c->h1s || h1c->conn->ctx != h1c)
 		h1_release(h1c);
 }
@@ -3576,6 +3611,10 @@ static void h1_shutw_conn(struct connection *conn)
 	TRACE_ENTER(H1_EV_H1C_END, conn);
 	conn_xprt_shutw(conn);
 	conn_sock_shutw(conn, (h1c && !(h1c->flags & H1C_F_ST_SILENT_SHUT)));
+
+	if (h1c->wait_event.tasklet && !h1c->wait_event.events)
+		tasklet_wakeup(h1c->wait_event.tasklet);
+
 	TRACE_LEAVE(H1_EV_H1C_END, conn);
 }
 
@@ -3882,7 +3921,7 @@ static int h1_snd_pipe(struct stconn *sc, struct pipe *pipe)
 
 static int h1_ctl(struct connection *conn, enum mux_ctl_type mux_ctl, void *output)
 {
-	const struct h1c *h1c = conn->ctx;
+	struct h1c *h1c = conn->ctx;
 	int ret = 0;
 
 	switch (mux_ctl) {
@@ -3899,6 +3938,10 @@ static int h1_ctl(struct connection *conn, enum mux_ctl_type mux_ctl, void *outp
 			 ((h1c->errcode >= 400 && h1c->errcode <= 499) ? MUX_ES_INVALID_ERR :
 			  MUX_ES_SUCCESS))));
 		return ret;
+	case MUX_SUBS_RECV:
+		if (!(h1c->wait_event.events & SUB_RETRY_RECV))
+			h1c->conn->xprt->subscribe(h1c->conn, h1c->conn->xprt_ctx, SUB_RETRY_RECV, &h1c->wait_event);
+		return 0;
 	default:
 		return -1;
 	}
@@ -4010,9 +4053,19 @@ static int h1_takeover(struct connection *conn, int orig_tid)
 {
 	struct h1c *h1c = conn->ctx;
 	struct task *task;
+	struct task *new_task;
+	struct tasklet *new_tasklet;
+
+	/* Pre-allocate tasks so that we don't have to roll back after the xprt
+	 * has been migrated.
+	 */
+	new_task = task_new_here();
+	new_tasklet = tasklet_new();
+	if (!new_task || !new_tasklet)
+		goto fail;
 
 	if (fd_takeover(conn->handle.fd, conn) != 0)
-		return -1;
+		goto fail;
 
 	if (conn->xprt->takeover && conn->xprt->takeover(conn, conn->xprt_ctx, orig_tid) != 0) {
 		/* We failed to takeover the xprt, even if the connection may
@@ -4022,44 +4075,49 @@ static int h1_takeover(struct connection *conn, int orig_tid)
 		 */
 		conn->flags |= CO_FL_ERROR;
 		tasklet_wakeup_on(h1c->wait_event.tasklet, orig_tid);
-		return -1;
+		goto fail;
 	}
 
 	if (h1c->wait_event.events)
 		h1c->conn->xprt->unsubscribe(h1c->conn, h1c->conn->xprt_ctx,
 		    h1c->wait_event.events, &h1c->wait_event);
+
+	task = h1c->task;
+	if (task) {
+		/* only assign a task if there was already one, otherwise
+		 * the preallocated new task will be released.
+		 */
+		task->context = NULL;
+		h1c->task = NULL;
+		__ha_barrier_store();
+		task_kill(task);
+
+		h1c->task = new_task;
+		new_task = NULL;
+		h1c->task->process = h1_timeout_task;
+		h1c->task->context = h1c;
+	}
+
 	/* To let the tasklet know it should free itself, and do nothing else,
 	 * set its context to NULL.
 	 */
 	h1c->wait_event.tasklet->context = NULL;
 	tasklet_wakeup_on(h1c->wait_event.tasklet, orig_tid);
 
-	task = h1c->task;
-	if (task) {
-		task->context = NULL;
-		h1c->task = NULL;
-		__ha_barrier_store();
-		task_kill(task);
-
-		h1c->task = task_new_here();
-		if (!h1c->task) {
-			h1_release(h1c);
-			return -1;
-		}
-		h1c->task->process = h1_timeout_task;
-		h1c->task->context = h1c;
-	}
-	h1c->wait_event.tasklet = tasklet_new();
-	if (!h1c->wait_event.tasklet) {
-		h1_release(h1c);
-		return -1;
-	}
+	h1c->wait_event.tasklet = new_tasklet;
 	h1c->wait_event.tasklet->process = h1_io_cb;
 	h1c->wait_event.tasklet->context = h1c;
 	h1c->conn->xprt->subscribe(h1c->conn, h1c->conn->xprt_ctx,
 		                   SUB_RETRY_RECV, &h1c->wait_event);
 
+	if (new_task)
+		__task_free(new_task);
 	return 0;
+ fail:
+	if (new_task)
+		__task_free(new_task);
+	tasklet_free(new_tasklet);
+	return -1;
 }
 
 

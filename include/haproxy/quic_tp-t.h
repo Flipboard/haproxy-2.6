@@ -28,8 +28,6 @@ struct tp_preferred_address {
 
 struct tp_version_information {
 	uint32_t choosen;
-	const uint32_t *others;
-	size_t nb_others;
 	const struct quic_version *negotiated_version;
 };
 
@@ -112,6 +110,13 @@ struct quic_transport_params {
 	struct tp_cid initial_source_connection_id;
 	struct tp_preferred_address preferred_address;                    /* Forbidden for clients */
 	struct tp_version_information version_information;
+};
+
+/* Return type for QUIC TP decode function */
+enum quic_tp_dec_err {
+	QUIC_TP_DEC_ERR_NONE = 0,  /* no error */
+	QUIC_TP_DEC_ERR_INVAL,     /* invalid value as per RFC 9000 */
+	QUIC_TP_DEC_ERR_TRUNC,     /* field encoding too small or too large */
 };
 
 #endif /* USE_QUIC */

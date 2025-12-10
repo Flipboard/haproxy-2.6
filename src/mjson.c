@@ -192,7 +192,7 @@ static int plen1(const char *s) {
 }
 
 static int plen2(const char *s) {
-  int i = 0, n = 0;
+  int i = 0, __attribute__((unused)) n = 0;
   while (s[i] != '\0' && s[i] != '.' && s[i] != '[')
     n++, i += s[i] == '\\' ? 2 : 1;
   // printf("PLEN: s: [%s], [%.*s] => %d\n", s, i, s, n);
@@ -724,7 +724,7 @@ static int is_digit(int c) {
 /* NOTE: strtod() implementation by Yasuhiro Matsumoto. */
 static double mystrtod(const char *str, char **end) {
   double d = 0.0;
-  int sign = 1, n = 0;
+  int sign = 1, __attribute__((unused)) n = 0;
   const char *p = str, *a = str;
 
   /* decimal part */
@@ -767,11 +767,13 @@ static double mystrtod(const char *str, char **end) {
 
   /* exponential part */
   if ((*p == 'E') || (*p == 'e')) {
+    double exp, f;
     int i, e = 0, neg = 0;
     p++;
     if (*p == '-') p++, neg++;
     if (*p == '+') p++;
     while (is_digit(*p)) e = e * 10 + *p++ - '0';
+    i = e;
     if (neg) e = -e;
 #if 0
     if (d == 2.2250738585072011 && e == -308) {
@@ -785,8 +787,16 @@ static double mystrtod(const char *str, char **end) {
       goto done;
     }
 #endif
-    for (i = 0; i < e; i++) d *= 10;
-    for (i = 0; i < -e; i++) d /= 10;
+    /* calculate f = 10^i */
+    exp = 10;
+    f = 1;
+    while (i > 0) {
+      if (i & 1) f *= exp;
+      exp *= exp;
+      i >>= 1;
+    }
+    if (e > 0) d *= f;
+    else if (e < 0) d /= f;
     a = p;
   } else if (p > str && !is_digit(*(p - 1))) {
     a = str;

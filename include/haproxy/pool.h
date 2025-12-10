@@ -110,8 +110,8 @@ void dump_pools_to_trash(void);
 void dump_pools(void);
 int pool_parse_debugging(const char *str, char **err);
 int pool_total_failures(void);
-unsigned long pool_total_allocated(void);
-unsigned long pool_total_used(void);
+unsigned long long pool_total_allocated(void);
+unsigned long long pool_total_used(void);
 void pool_flush(struct pool_head *pool);
 void pool_gc(struct pool_head *pool_ctx);
 struct pool_head *create_pool(char *name, unsigned int size, unsigned int flags);
@@ -154,8 +154,8 @@ static inline uint pool_releasable(const struct pool_head *pool)
 
 	alloc = HA_ATOMIC_LOAD(&pool->allocated);
 	used = HA_ATOMIC_LOAD(&pool->used);
-	if (used < alloc)
-		used = alloc;
+	if (used > alloc)
+		alloc = used;
 
 	if (alloc < swrate_avg(pool->needed_avg + pool->needed_avg / 4, POOL_AVG_SAMPLES))
 		return used; // less than needed is allocated, can release everything

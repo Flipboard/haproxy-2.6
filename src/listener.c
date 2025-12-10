@@ -25,6 +25,7 @@
 #include <haproxy/errors.h>
 #include <haproxy/fd.h>
 #include <haproxy/freq_ctr.h>
+#include <haproxy/frontend.h>
 #include <haproxy/global.h>
 #include <haproxy/list.h>
 #include <haproxy/listener.h>
@@ -287,6 +288,7 @@ void listener_set_state(struct listener *l, enum li_state st)
 		case LI_LIMITED:
 			BUG_ON(l->rx.fd == -1);
 			_HA_ATOMIC_INC(&px->li_ready);
+			l->flags |= LI_F_FINALIZED;
 			break;
 		}
 	}
@@ -335,12 +337,12 @@ void enable_listener(struct listener *listener)
  * This function completely stops a listener.
  * The proxy's listeners count is updated and the proxy is
  * disabled and woken up after the last one is gone.
- * It will need to operate under the proxy's lock and the protocol's lock.
- * The caller is responsible for indicating in lpx, lpr whether the
- * respective locks are already held (non-zero) or not (zero) so that the
- * function picks the missing ones, in this order.
+ * It will need to operate under the proxy's lock, the protocol's lock and
+ * the listener's lock. The caller is responsible for indicating in lpx,
+ * lpr, lli whether the respective locks are already held (non-zero) or
+ * not (zero) so that the function picks the missing ones, in this order.
  */
-void stop_listener(struct listener *l, int lpx, int lpr)
+void stop_listener(struct listener *l, int lpx, int lpr, int lli)
 {
 	struct proxy *px = l->bind_conf->frontend;
 
@@ -357,7 +359,8 @@ void stop_listener(struct listener *l, int lpx, int lpr)
 	if (!lpr)
 		HA_SPIN_LOCK(PROTO_LOCK, &proto_lock);
 
-	HA_RWLOCK_WRLOCK(LISTENER_LOCK, &l->lock);
+	if (!lli)
+		HA_RWLOCK_WRLOCK(LISTENER_LOCK, &l->lock);
 
 	if (l->state > LI_INIT) {
 		do_unbind_listener(l);
@@ -369,7 +372,8 @@ void stop_listener(struct listener *l, int lpx, int lpr)
 			proxy_cond_disable(px);
 	}
 
-	HA_RWLOCK_WRUNLOCK(LISTENER_LOCK, &l->lock);
+	if (!lli)
+		HA_RWLOCK_WRUNLOCK(LISTENER_LOCK, &l->lock);
 
 	if (!lpr)
 		HA_SPIN_UNLOCK(PROTO_LOCK, &proto_lock);
@@ -395,19 +399,17 @@ void default_add_listener(struct protocol *proto, struct listener *listener)
 
 /* default function called to suspend a listener: it simply passes the call to
  * the underlying receiver. This is find for most socket-based protocols. This
- * must be called under the listener's lock. It will return non-zero on success,
- * 0 on failure. If no receiver-level suspend is provided, the operation is
- * assumed to succeed.
+ * must be called under the listener's lock. It will return < 0 in case of
+ * failure, 0 if the listener was totally stopped, or > 0 if correctly paused..
+ * If no receiver-level suspend is provided, the operation is assumed
+ * to succeed.
  */
 int default_suspend_listener(struct listener *l)
 {
-	int ret = 1;
-
 	if (!l->rx.proto->rx_suspend)
 		return 1;
 
-	ret = l->rx.proto->rx_suspend(&l->rx);
-	return ret > 0 ? ret : 0;
+	return l->rx.proto->rx_suspend(&l->rx);
 }
 
 
@@ -425,8 +427,28 @@ int default_resume_listener(struct listener *l)
 
 	if (l->state == LI_ASSIGNED) {
 		char msg[100];
+		char *errmsg;
 		int err;
 
+		/* first, try to bind the receiver */
+		err = l->rx.proto->fam->bind(&l->rx, &errmsg);
+		if (err != ERR_NONE) {
+			if (err & ERR_WARN)
+				ha_warning("Resuming listener: %s\n", errmsg);
+			else if (err & ERR_ALERT)
+				ha_alert("Resuming listener: %s\n", errmsg);
+			ha_free(&errmsg);
+			if (err & (ERR_FATAL | ERR_ABORT)) {
+				ret = 0;
+				goto end;
+			}
+		}
+
+		/* then, try to listen:
+		 * for now there's still always a listening function
+		 * (same check performed in protocol_bind_all()
+		 */
+		BUG_ON(!l->rx.proto->listen);
 		err = l->rx.proto->listen(l, msg, sizeof(msg));
 		if (err & ERR_ALERT)
 			ha_alert("Resuming listener: %s\n", msg);
@@ -458,11 +480,14 @@ int default_resume_listener(struct listener *l)
  * closes upon SHUT_WR and refuses to rebind. So a common validation path
  * involves SHUT_WR && listen && SHUT_RD. In case of success, the FD's polling
  * is disabled. It normally returns non-zero, unless an error is reported.
- * It will need to operate under the proxy's lock. The caller is
- * responsible for indicating in lpx whether the proxy locks is
- * already held (non-zero) or not (zero) so that the function picks it.
+ * suspend() may totally stop a listener if it doesn't support the PAUSED
+ * state, in which case state will be set to ASSIGNED.
+ * It will need to operate under the proxy's lock and the listener's lock.
+ * The caller is responsible for indicating in lpx, lli whether the respective
+ * locks are already held (non-zero) or not (zero) so that the function pick
+ * the missing ones, in this order.
  */
-int pause_listener(struct listener *l, int lpx)
+int suspend_listener(struct listener *l, int lpx, int lli)
 {
 	struct proxy *px = l->bind_conf->frontend;
 	int ret = 1;
@@ -470,26 +495,47 @@ int pause_listener(struct listener *l, int lpx)
 	if (!lpx && px)
 		HA_RWLOCK_WRLOCK(PROXY_LOCK, &px->lock);
 
-	HA_RWLOCK_WRLOCK(LISTENER_LOCK, &l->lock);
+	if (!lli)
+		HA_RWLOCK_WRLOCK(LISTENER_LOCK, &l->lock);
 
-	if (l->state <= LI_PAUSED)
+	if (!(l->flags & LI_F_FINALIZED) || l->state <= LI_PAUSED)
 		goto end;
 
-	if (l->rx.proto->suspend)
+	if (l->rx.proto->suspend) {
 		ret = l->rx.proto->suspend(l);
+		/* if the suspend() fails, we don't want to change the
+		 * current listener state
+		 */
+		if (ret < 0)
+			goto end;
+	}
 
 	MT_LIST_DELETE(&l->wait_queue);
 
-	listener_set_state(l, LI_PAUSED);
+	/* ret == 0 means that the suspend() has been turned into
+	 * an unbind(), meaning the listener is now stopped (ie: ABNS), we need
+	 * to report this state change properly
+	 */
+	listener_set_state(l, ((ret) ? LI_PAUSED : LI_ASSIGNED));
 
-	if (px && !px->li_ready) {
+	if (px && !(l->flags & LI_F_SUSPENDED))
+		px->li_suspended++;
+	l->flags |= LI_F_SUSPENDED;
+
+	/* at this point, everything is under control, no error should be
+	 * returned to calling function
+	 */
+	ret = 1;
+
+	if (px && !(px->flags & PR_FL_PAUSED) && !px->li_ready) {
 		/* PROXY_LOCK is required */
 		proxy_cond_pause(px);
 		ha_warning("Paused %s %s.\n", proxy_cap_str(px->cap), px->id);
 		send_log(px, LOG_WARNING, "Paused %s %s.\n", proxy_cap_str(px->cap), px->id);
 	}
   end:
-	HA_RWLOCK_WRUNLOCK(LISTENER_LOCK, &l->lock);
+	if (!lli)
+		HA_RWLOCK_WRUNLOCK(LISTENER_LOCK, &l->lock);
 
 	if (!lpx && px)
 		HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &px->lock);
@@ -503,23 +549,24 @@ int pause_listener(struct listener *l, int lpx)
  * or LI_FULL. 0 is returned in case of failure to resume (eg: dead socket).
  * Listeners bound to a different process are not woken up unless we're in
  * foreground mode, and are ignored. If the listener was only in the assigned
- * state, it's totally rebound. This can happen if a pause() has completely
+ * state, it's totally rebound. This can happen if a suspend() has completely
  * stopped it. If the resume fails, 0 is returned and an error might be
  * displayed.
- * It will need to operate under the proxy's lock. The caller is
- * responsible for indicating in lpx whether the proxy locks is
- * already held (non-zero) or not (zero) so that the function picks it.
+ * It will need to operate under the proxy's lock and the listener's lock.
+ * The caller is responsible for indicating in lpx, lli whether the respective
+ * locks are already held (non-zero) or not (zero) so that the function pick
+ * the missing ones, in this order.
  */
-int resume_listener(struct listener *l, int lpx)
+int resume_listener(struct listener *l, int lpx, int lli)
 {
 	struct proxy *px = l->bind_conf->frontend;
-	int was_paused = px && px->li_paused;
 	int ret = 1;
 
 	if (!lpx && px)
 		HA_RWLOCK_WRLOCK(PROXY_LOCK, &px->lock);
 
-	HA_RWLOCK_WRLOCK(LISTENER_LOCK, &l->lock);
+	if (!lli)
+		HA_RWLOCK_WRLOCK(LISTENER_LOCK, &l->lock);
 
 	/* check that another thread didn't to the job in parallel (e.g. at the
 	 * end of listen_accept() while we'd come from dequeue_all_listeners().
@@ -527,11 +574,14 @@ int resume_listener(struct listener *l, int lpx)
 	if (MT_LIST_INLIST(&l->wait_queue))
 		goto end;
 
-	if (l->state == LI_READY)
+	if (!(l->flags & LI_F_FINALIZED) || l->state == LI_READY)
 		goto end;
 
-	if (l->rx.proto->resume)
+	if (l->rx.proto->resume) {
 		ret = l->rx.proto->resume(l);
+		if (!ret)
+			goto end; /* failure to resume */
+	}
 
 	if (l->maxconn && l->nbconn >= l->maxconn) {
 		l->rx.proto->disable(l);
@@ -543,14 +593,54 @@ int resume_listener(struct listener *l, int lpx)
 	listener_set_state(l, LI_READY);
 
   done:
-	if (was_paused && !px->li_paused) {
+	if (px && (l->flags & LI_F_SUSPENDED))
+		px->li_suspended--;
+	l->flags &= ~LI_F_SUSPENDED;
+
+	if (px && (px->flags & PR_FL_PAUSED) && !px->li_suspended) {
 		/* PROXY_LOCK is required */
 		proxy_cond_resume(px);
 		ha_warning("Resumed %s %s.\n", proxy_cap_str(px->cap), px->id);
 		send_log(px, LOG_WARNING, "Resumed %s %s.\n", proxy_cap_str(px->cap), px->id);
 	}
   end:
-	HA_RWLOCK_WRUNLOCK(LISTENER_LOCK, &l->lock);
+	if (!lli)
+		HA_RWLOCK_WRUNLOCK(LISTENER_LOCK, &l->lock);
+
+	if (!lpx && px)
+		HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &px->lock);
+
+	return ret;
+}
+
+/* Same as resume_listener(), but will only work to resume from
+ * LI_FULL or LI_LIMITED states because we try to relax listeners that
+ * were temporarily restricted and not to resume inactive listeners that
+ * may have been paused or completely stopped in the meantime.
+ * Returns positive value for success and 0 for failure.
+ * It will need to operate under the proxy's lock and the listener's lock.
+ * The caller is responsible for indicating in lpx, lli whether the respective
+ * locks are already held (non-zero) or not (zero) so that the function pick
+ * the missing ones, in this order.
+ */
+int relax_listener(struct listener *l, int lpx, int lli)
+{
+	struct proxy *px = l->bind_conf->frontend;
+	int ret = 1;
+
+	if (!lpx && px)
+		HA_RWLOCK_WRLOCK(PROXY_LOCK, &px->lock);
+
+	if (!lli)
+		HA_RWLOCK_WRLOCK(LISTENER_LOCK, &l->lock);
+
+	if (l->state != LI_FULL && l->state != LI_LIMITED)
+		goto end; /* listener may be suspended or even stopped */
+	ret = resume_listener(l, 1, 1);
+
+ end:
+	if (!lli)
+		HA_RWLOCK_WRUNLOCK(LISTENER_LOCK, &l->lock);
 
 	if (!lpx && px)
 		HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &px->lock);
@@ -559,7 +649,7 @@ int resume_listener(struct listener *l, int lpx)
 }
 
 /* Marks a ready listener as full so that the stream code tries to re-enable
- * it upon next close() using resume_listener().
+ * it upon next close() using relax_listener().
  */
 static void listener_full(struct listener *l)
 {
@@ -597,12 +687,16 @@ void dequeue_all_listeners()
 		/* This cannot fail because the listeners are by definition in
 		 * the LI_LIMITED state.
 		 */
-		resume_listener(listener, 0);
+		relax_listener(listener, 0, 0);
 	}
 }
 
-/* Dequeues all listeners waiting for a resource in proxy <px>'s queue */
-void dequeue_proxy_listeners(struct proxy *px)
+/* Dequeues all listeners waiting for a resource in proxy <px>'s queue
+ * The caller is responsible for indicating in lpx, whether the proxy's lock
+ * is already held (non-zero) or not (zero) so that this information can be
+ * passed to relax_listener
+*/
+void dequeue_proxy_listeners(struct proxy *px, int lpx)
 {
 	struct listener *listener;
 
@@ -610,7 +704,7 @@ void dequeue_proxy_listeners(struct proxy *px)
 		/* This cannot fail because the listeners are by definition in
 		 * the LI_LIMITED state.
 		 */
-		resume_listener(listener, 0);
+		relax_listener(listener, lpx, 0);
 	}
 }
 
@@ -821,6 +915,13 @@ int listener_backlog(const struct listener *l)
 	return 1024;
 }
 
+/* Returns true if listener <l> must check maxconn limit prior to accept. */
+static inline int listener_uses_maxconn(const struct listener *l)
+{
+	return !(l->options & LI_O_UNLIMITED) &&
+	       !(l->bind_conf->options & BC_O_XPRT_MAXCONN);
+}
+
 /* This function is called on a read event from a listening socket, corresponding
  * to an accept. It tries to accept as many connections as possible, and for each
  * calls the listener's accept handler (generally the frontend's accept handler).
@@ -938,19 +1039,15 @@ void listener_accept(struct listener *l)
 			} while (!_HA_ATOMIC_CAS(&p->feconn, &count, next_feconn));
 		}
 
-		if (!(l->options & LI_O_UNLIMITED)) {
-			do {
-				count = actconn;
-				if (unlikely(count >= global.maxconn)) {
-					/* the process was marked full or another
-					 * thread is going to do it.
-					 */
-					next_actconn = 0;
-					expire = tick_add(now_ms, 1000); /* try again in 1 second */
-					goto limit_global;
-				}
-				next_actconn = count + 1;
-			} while (!_HA_ATOMIC_CAS(&actconn, (int *)(&count), next_actconn));
+		if (listener_uses_maxconn(l)) {
+			next_actconn = increment_actconn();
+			if (!next_actconn) {
+				/* the process was marked full or another
+				 * thread is going to do it.
+				 */
+				expire = tick_add(now_ms, 1000); /* try again in 1 second */
+				goto limit_global;
+			}
 		}
 
 		/* be careful below, the listener might be shutting down in
@@ -974,7 +1071,7 @@ void listener_accept(struct listener *l)
 				_HA_ATOMIC_DEC(&l->nbconn);
 				if (p)
 					_HA_ATOMIC_DEC(&p->feconn);
-				if (!(l->options & LI_O_UNLIMITED))
+				if (listener_uses_maxconn(l))
 					_HA_ATOMIC_DEC(&actconn);
 				continue;
 
@@ -1179,14 +1276,14 @@ void listener_accept(struct listener *l)
 	      (!tick_isset(global_listener_queue_task->expire) ||
 	       tick_is_expired(global_listener_queue_task->expire, now_ms))))) {
 		/* at least one thread has to this when quitting */
-		resume_listener(l, 0);
+		relax_listener(l, 0, 0);
 
 		/* Dequeues all of the listeners waiting for a resource */
 		dequeue_all_listeners();
 
 		if (p && !MT_LIST_ISEMPTY(&p->listener_queue) &&
 		    (!p->fe_sps_lim || freq_ctr_remain(&p->fe_sess_per_sec, p->fe_sps_lim, 0) > 0))
-			dequeue_proxy_listeners(p);
+			dequeue_proxy_listeners(p, 0);
 	}
 	return;
 
@@ -1198,7 +1295,7 @@ void listener_accept(struct listener *l)
 	 * Let's put it to pause in this case.
 	 */
 	if (l->rx.proto && l->rx.proto->rx_listening(&l->rx) == 0) {
-		pause_listener(l, 0);
+		suspend_listener(l, 0, 0);
 		goto end;
 	}
 
@@ -1230,7 +1327,7 @@ void listener_release(struct listener *l)
 {
 	struct proxy *fe = l->bind_conf->frontend;
 
-	if (!(l->options & LI_O_UNLIMITED))
+	if (listener_uses_maxconn(l))
 		_HA_ATOMIC_DEC(&actconn);
 	if (fe)
 		_HA_ATOMIC_DEC(&fe->feconn);
@@ -1238,14 +1335,30 @@ void listener_release(struct listener *l)
 	_HA_ATOMIC_DEC(&l->thr_conn[tid]);
 
 	if (l->state == LI_FULL || l->state == LI_LIMITED)
-		resume_listener(l, 0);
+		relax_listener(l, 0, 0);
 
 	/* Dequeues all of the listeners waiting for a resource */
 	dequeue_all_listeners();
 
 	if (fe && !MT_LIST_ISEMPTY(&fe->listener_queue) &&
 	    (!fe->fe_sps_lim || freq_ctr_remain(&fe->fe_sess_per_sec, fe->fe_sps_lim, 0) > 0))
-		dequeue_proxy_listeners(fe);
+		dequeue_proxy_listeners(fe, 0);
+	else {
+		unsigned int wait;
+		int expire = TICK_ETERNITY;
+
+		if (fe->task && fe->fe_sps_lim &&
+		    (wait = next_event_delay(&fe->fe_sess_per_sec,fe->fe_sps_lim, 0))) {
+			/* we're blocking because a limit was reached on the number of
+			 * requests/s on the frontend. We want to re-check ASAP, which
+			 * means in 1 ms before estimated expiration date, because the
+			 * timer will have settled down.
+			 */
+			expire = tick_first(fe->task->expire, tick_add(now_ms, wait));
+			if (tick_isset(expire))
+				task_schedule(fe->task, expire);
+		}
+	}
 }
 
 /* Initializes the listener queues. Returns 0 on success, otherwise ERR_* flags */
@@ -1677,6 +1790,9 @@ int bind_parse_args_list(struct bind_conf *bind_conf, char **args, int cur_arg, 
 	 */
 	if ((bind_conf->options & (BC_O_USE_SOCK_DGRAM|BC_O_USE_XPRT_STREAM)) == (BC_O_USE_SOCK_DGRAM|BC_O_USE_XPRT_STREAM)) {
 #ifdef USE_QUIC
+		struct listener *l __maybe_unused;
+		int listener_count __maybe_unused = 0;
+
 		bind_conf->xprt = xprt_get(XPRT_QUIC);
 		if (!(bind_conf->options & BC_O_USE_SSL)) {
 			bind_conf->options |= BC_O_USE_SSL;
@@ -1684,6 +1800,15 @@ int bind_parse_args_list(struct bind_conf *bind_conf, char **args, int cur_arg, 
 				 file, linenum, args[0], args[1], section);
 		}
 		quic_transport_params_init(&bind_conf->quic_params, 1);
+
+		list_for_each_entry(l, &bind_conf->listeners, by_bind) {
+			if (++listener_count > 1 || !is_inet_addr(&l->rx.addr)) {
+				ha_diag_warning("parsing [%s:%d] : '%s %s' in section '%s' : UDP binding on multiple addresses may be unreliable.\n",
+						file, linenum, args[0], args[1], section);
+				break;
+			}
+		}
+
 #else
 		ha_alert("parsing [%s:%d] : '%s %s' in section '%s' : QUIC protocol selected but support not compiled in (check build options).\n",
 			 file, linenum, args[0], args[1], section);

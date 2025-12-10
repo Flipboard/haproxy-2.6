@@ -1345,7 +1345,6 @@ int ssl_store_load_locations_file(char *path, int create_if_none, enum cafile_ty
 
 struct cert_exts cert_exts[] = {
 	{ "",        CERT_TYPE_PEM,      &ssl_sock_load_pem_into_ckch }, /* default mode, no extensions */
-	{ "crt",     CERT_TYPE_CRT,      &ssl_sock_load_pem_into_ckch },
 	{ "key",     CERT_TYPE_KEY,      &ssl_sock_load_key_into_ckch },
 #if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) || defined OPENSSL_IS_BORINGSSL)
 	{ "ocsp",    CERT_TYPE_OCSP,     &ssl_sock_load_ocsp_response_from_file },
@@ -2325,7 +2324,7 @@ static int cli_parse_set_cert(char **args, char *payload, struct appctx *appctx,
 					errcode |= ERR_ALERT | ERR_FATAL;
 					goto end;
 				}
-
+				/* check again with the right extension */
 				if (strcmp(ckchs_transaction.path, buf->area) != 0) {
 					/* remove .crt of the error message */
 					*(b_orig(buf) + b_data(buf) + strlen(".crt")) = '\0';
@@ -2335,6 +2334,11 @@ static int cli_parse_set_cert(char **args, char *payload, struct appctx *appctx,
 					errcode |= ERR_ALERT | ERR_FATAL;
 					goto end;
 				}
+			} else {
+				/* without del-ext the error is definitive */
+				memprintf(&err, "The ongoing transaction is about '%s' but you are trying to set '%s'\n", ckchs_transaction.path, buf->area);
+				errcode |= ERR_ALERT | ERR_FATAL;
+				goto end;
 			}
 		}
 
@@ -3925,7 +3929,7 @@ static struct cli_kw_list cli_kws = {{ },{
 	{ { "del", "ssl", "ca-file", NULL },    "del ssl ca-file <cafile>                : delete an unused CA file",                                              cli_parse_del_cafile, NULL, NULL },
 	{ { "show", "ssl", "ca-file", NULL },   "show ssl ca-file [<cafile>[:<index>]]   : display the SSL CA files used in memory, or the details of a <cafile>, or a single certificate of index <index> of a CA file <cafile>", cli_parse_show_cafile, cli_io_handler_show_cafile, cli_release_show_cafile },
 
-	{ { "new", "ssl", "crl-file", NULL },   "new ssl crlfile <crlfile>               : create a new CRL file to be used in a crt-list",                        cli_parse_new_crlfile, NULL, NULL },
+	{ { "new", "ssl", "crl-file", NULL },   "new ssl crl-file <crlfile>               : create a new CRL file to be used in a crt-list",                        cli_parse_new_crlfile, NULL, NULL },
 	{ { "set", "ssl", "crl-file", NULL },   "set ssl crl-file <crlfile> <payload>    : replace a CRL file",                                                    cli_parse_set_crlfile, NULL, NULL },
 	{ { "commit", "ssl", "crl-file", NULL },"commit ssl crl-file <crlfile>           : commit a CRL file",                                                     cli_parse_commit_crlfile, cli_io_handler_commit_cafile_crlfile, cli_release_commit_crlfile },
 	{ { "abort", "ssl", "crl-file", NULL }, "abort ssl crl-file <crlfile>            : abort a transaction for a CRL file",                                    cli_parse_abort_crlfile, NULL, NULL },

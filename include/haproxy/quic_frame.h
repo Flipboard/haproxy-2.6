@@ -26,6 +26,7 @@
 #error "Must define USE_OPENSSL"
 #endif
 
+#include <import/eb64tree.h>
 #include <haproxy/quic_conn-t.h>
 #include <haproxy/quic_enc.h>
 #include <haproxy/quic_frame-t.h>
@@ -48,6 +49,27 @@ static inline size_t qc_frm_len(struct quic_frame *frm)
 	size_t len = 0;
 
 	switch (frm->type) {
+	case QUIC_FT_ACK: {
+		struct quic_tx_ack *tx_ack = &frm->tx_ack;
+		struct eb64_node *ar, *prev_ar;
+		struct quic_arng_node *ar_node, *prev_ar_node;
+
+		ar = eb64_last(&tx_ack->arngs->root);
+		ar_node = eb64_entry(ar, struct quic_arng_node, first);
+		len += 1 + quic_int_getsize(ar_node->last);
+		len += quic_int_getsize(tx_ack->ack_delay);
+		len += quic_int_getsize(tx_ack->arngs->sz - 1);
+		len += quic_int_getsize(ar_node->last - ar_node->first.key);
+
+		while ((prev_ar = eb64_prev(ar))) {
+			prev_ar_node = eb64_entry(prev_ar, struct quic_arng_node, first);
+			len += quic_int_getsize(ar_node->first.key - prev_ar_node->last - 2);
+			len += quic_int_getsize(prev_ar_node->last - prev_ar_node->first.key);
+			ar = prev_ar;
+			ar_node = eb64_entry(ar, struct quic_arng_node, first);
+		}
+		break;
+	}
 	case QUIC_FT_RESET_STREAM: {
 		struct quic_reset_stream *f = &frm->reset_stream;
 		len += 1 + quic_int_getsize(f->id) +
@@ -174,6 +196,23 @@ static inline struct quic_err quic_err_tls(uint64_t tls_alert)
 static inline struct quic_err quic_err_app(uint64_t code)
 {
 	return (struct quic_err){ .code = code, .app = 1 };
+}
+
+/* Move forward <strm> STREAM frame by <data> bytes. */
+static inline void qc_stream_frm_mv_fwd(struct quic_frame *frm, uint64_t data)
+{
+	struct quic_stream *strm = &frm->stream;
+	struct buffer cf_buf;
+
+	/* Set offset bit if not already there. */
+	strm->offset.key += data;
+	frm->type |= QUIC_STREAM_FRAME_TYPE_OFF_BIT;
+
+	strm->len -= data;
+	cf_buf = b_make(b_orig(strm->buf),
+	                b_size(strm->buf),
+	                (char *)strm->data - b_orig(strm->buf), 0);
+	strm->data = (unsigned char *)b_peek(&cf_buf, data);
 }
 
 #endif /* USE_QUIC */

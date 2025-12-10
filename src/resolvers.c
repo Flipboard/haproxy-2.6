@@ -291,11 +291,11 @@ static void resolv_update_resolvers_timeout(struct resolvers *resolvers)
 	next = tick_add(now_ms, resolvers->timeout.resolve);
 	if (!LIST_ISEMPTY(&resolvers->resolutions.curr)) {
 		res  = LIST_NEXT(&resolvers->resolutions.curr, struct resolv_resolution *, list);
-		next = MIN(next, tick_add(res->last_query, resolvers->timeout.retry));
+		next = tick_first(next, tick_add(res->last_query, resolvers->timeout.retry));
 	}
 
 	list_for_each_entry(res, &resolvers->resolutions.wait, list)
-		next = MIN(next, tick_add(res->last_resolution, resolv_resolution_timeout(res)));
+		next = tick_first(next, tick_add(res->last_resolution, resolv_resolution_timeout(res)));
 
 	resolvers->t->expire = next;
 	task_queue(resolvers->t);
@@ -2394,6 +2394,48 @@ static struct task *process_resolvers(struct task *t, void *context, unsigned in
 
 	/* Handle all resolutions in the wait list */
 	list_for_each_entry_safe(res, resback, &resolvers->resolutions.wait, list) {
+
+		if (unlikely(stopping)) {
+			/* If haproxy is stopping, check if the resolution to know if it must be run or not.
+			 * If at least a requester is a stream (because of a do-resolv action) or if there
+			 * is a requester attached to a running proxy, the resolution is performed.
+			 * Otherwise, it is skipped for now.
+			 */
+			struct resolv_requester *req;
+			int must_run = 0;
+
+			list_for_each_entry(req, &res->requesters, list) {
+				struct proxy *px = NULL;
+
+				switch (obj_type(req->owner)) {
+					case OBJ_TYPE_SERVER:
+						px = __objt_server(req->owner)->proxy;
+						break;
+					case OBJ_TYPE_SRVRQ:
+						px = __objt_resolv_srvrq(req->owner)->proxy;
+						break;
+					case OBJ_TYPE_STREAM:
+						/* Always perform the resolution */
+						must_run = 1;
+						break;
+					default:
+						break;
+				}
+				/* Perform the resolution if the proxy is not stopped or disabled */
+				if (px && !(px->flags & (PR_FL_DISABLED|PR_FL_STOPPED)))
+					must_run = 1;
+
+				if (must_run)
+					break;
+			}
+
+			if (!must_run) {
+				/* Skip the reolsution. reset it and wait for the next wakeup */
+				resolv_reset_resolution(res);
+				continue;
+			}
+		}
+
 		if (LIST_ISEMPTY(&res->requesters)) {
 			abort_resolution(res);
 			continue;
@@ -2406,11 +2448,21 @@ static struct task *process_resolvers(struct task *t, void *context, unsigned in
 		if (resolv_run_resolution(res) != 1) {
 			res->last_resolution = now_ms;
 			LIST_DEL_INIT(&res->list);
-			LIST_APPEND(&resolvers->resolutions.wait, &res->list);
+			LIST_INSERT(&resolvers->resolutions.wait, &res->list);
 		}
 	}
+
 	resolv_update_resolvers_timeout(resolvers);
 	HA_SPIN_UNLOCK(DNS_LOCK, &resolvers->lock);
+
+	if (unlikely(stopping)) {
+		struct dns_nameserver *ns;
+
+		list_for_each_entry(ns, &resolvers->nameservers, list) {
+			if (ns->stream)
+				task_wakeup(ns->stream->task_idle, TASK_WOKEN_MSG);
+		}
+	}
 
 	/* now we can purge all queued deletions */
 	leave_resolver_code();
@@ -2517,9 +2569,11 @@ static int resolvers_finalize_config(void)
 			if (ns->dgram) {
 				/* Check nameserver info */
 				if ((fd = socket(ns->dgram->conn.addr.to.ss_family, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
-					ha_alert("resolvers '%s': can't create socket for nameserver '%s'.\n",
-						 resolvers->id, ns->id);
-					err_code |= (ERR_ALERT|ERR_ABORT);
+					if (!resolvers->conf.implicit) {  /* emit a warning only if it was configured manually */
+						ha_alert("resolvers '%s': can't create socket for nameserver '%s'.\n",
+							 resolvers->id, ns->id);
+						err_code |= (ERR_ALERT|ERR_ABORT);
+					}
 					continue;
 				}
 				if (connect(fd, (struct sockaddr*)&ns->dgram->conn.addr.to, get_addr_len(&ns->dgram->conn.addr.to)) == -1) {
@@ -2640,13 +2694,13 @@ static int stats_dump_resolv_to_buffer(struct stconn *sc,
 	if (!stats_dump_one_line(stats, idx, appctx))
 		return 0;
 
-	if (!stats_putchk(rep, NULL, &trash))
+	if (!stats_putchk(rep, NULL))
 		goto full;
 
 	return 1;
 
   full:
-	sc_have_room(sc);
+	sc_need_room(sc);
 	return 0;
 }
 
@@ -2930,7 +2984,12 @@ enum act_return resolv_action_do_resolve(struct act_rule *rule, struct proxy *px
 		if (resolution->step == RSLV_STEP_RUNNING)
 			goto yield;
 		if (resolution->step == RSLV_STEP_NONE) {
-			/* We update the variable only if we have a valid response. */
+			/* We update the variable only if we have a valid
+			 * response. If the response was not received yet, we
+			 * must yield.
+			 */
+			if (resolution->status == RSLV_STATUS_NONE)
+				goto yield;
 			if (resolution->status == RSLV_STATUS_VALID) {
 				struct sample smp;
 				short ip_sin_family = 0;
@@ -3188,7 +3247,7 @@ void resolvers_setup_proxy(struct proxy *px)
 	px->conn_retries = 1;
 	px->timeout.server = TICK_ETERNITY;
 	px->timeout.client = TICK_ETERNITY;
-	px->timeout.connect = TICK_ETERNITY;
+	px->timeout.connect = 1000; // by default same than timeout.resolve
 	px->accept = NULL;
 	px->options2 |= PR_O2_INDEPSTR | PR_O2_SMARTCON;
 }
@@ -3657,8 +3716,11 @@ int cfg_parse_resolvers(const char *file, int linenum, char **args, int kwm)
 			}
 			if (args[1][2] == 't')
 				curr_resolvers->timeout.retry = tout;
-			else
+			else {
 				curr_resolvers->timeout.resolve = tout;
+				curr_resolvers->px->timeout.connect = tout;
+			}
+
 		}
 		else {
 			ha_alert("parsing [%s:%d] : '%s' expects 'retry' or 'resolve' and <time> as arguments got '%s'.\n",

@@ -213,7 +213,7 @@ enum {
 	CO_ER_SOCKS4_DENY,       /* SOCKS4 Proxy deny the request */
 	CO_ER_SOCKS4_ABORT,      /* SOCKS4 Proxy handshake aborted by server */
 
-	CO_ERR_SSL_FATAL,        /* SSL fatal error during a SSL_read or SSL_write */
+	CO_ER_SSL_FATAL,         /* SSL fatal error during a SSL_read or SSL_write */
 };
 
 /* error return codes for accept_conn() */
@@ -302,6 +302,7 @@ enum proto_proxy_side {
 enum mux_ctl_type {
 	MUX_STATUS, /* Expects an int as output, sets it to a combinaison of MUX_STATUS flags */
 	MUX_EXIT_STATUS, /* Expects an int as output, sets the mux exist/error/http status, if known or 0 */
+	MUX_SUBS_RECV, /* Notify the mux it must wait for read events again  */
 };
 
 /* response for ctl MUX_STATUS */
@@ -499,7 +500,7 @@ struct connection {
 	struct wait_event *subs; /* Task to wake when awaited events are ready */
 	struct mt_list toremove_list; /* list for connection to clean up */
 	union {
-		struct list session_list;  /* used by backend conns, list of attached connections to a session */
+		struct list sess_el;       /* used by private backend conns, list elem into session */
 		struct list stopping_list; /* used by frontend conns, attach point in mux stopping list */
 	};
 	union conn_handle handle;     /* connection handle at the socket layer */

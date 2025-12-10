@@ -650,16 +650,21 @@ void pool_flush(struct pool_head *pool)
 	 * replaces it with a NULL. Then the list can be released.
 	 */
 	next = pool->free_list;
-	do {
+	while (1) {
 		while (unlikely(next == POOL_BUSY)) {
 			__ha_cpu_relax();
 			next = _HA_ATOMIC_LOAD(&pool->free_list);
 		}
+
 		if (next == NULL)
-			return;
-	} while (unlikely((next = _HA_ATOMIC_XCHG(&pool->free_list, POOL_BUSY)) == POOL_BUSY));
-	_HA_ATOMIC_STORE(&pool->free_list, NULL);
-	__ha_barrier_atomic_store();
+			break;
+
+		next = _HA_ATOMIC_XCHG(&pool->free_list, POOL_BUSY);
+		if (next != POOL_BUSY) {
+			HA_ATOMIC_STORE(&pool->free_list, NULL);
+			break;
+		}
+	}
 
 	while (next) {
 		temp = next;
@@ -905,24 +910,24 @@ int pool_total_failures()
 }
 
 /* This function returns the total amount of memory allocated in pools (in bytes) */
-unsigned long pool_total_allocated()
+unsigned long long pool_total_allocated()
 {
 	struct pool_head *entry;
-	unsigned long allocated = 0;
+	unsigned long long allocated = 0;
 
 	list_for_each_entry(entry, &pools, list)
-		allocated += entry->allocated * entry->size;
+		allocated += entry->allocated * (ullong)entry->size;
 	return allocated;
 }
 
 /* This function returns the total amount of memory used in pools (in bytes) */
-unsigned long pool_total_used()
+unsigned long long pool_total_used()
 {
 	struct pool_head *entry;
-	unsigned long used = 0;
+	unsigned long long used = 0;
 
 	list_for_each_entry(entry, &pools, list)
-		used += entry->used * entry->size;
+		used += entry->used * (ullong)entry->size;
 	return used;
 }
 

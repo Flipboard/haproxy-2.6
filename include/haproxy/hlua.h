@@ -30,6 +30,9 @@
 #define HLUA_SET_RUN(__hlua)         do {(__hlua)->flags |= HLUA_RUN;} while(0)
 #define HLUA_CLR_RUN(__hlua)         do {(__hlua)->flags &= ~HLUA_RUN;} while(0)
 #define HLUA_IS_RUNNING(__hlua)      ((__hlua)->flags & HLUA_RUN)
+#define HLUA_SET_BUSY(__hlua)        do {(__hlua)->flags |= HLUA_BUSY;} while(0)
+#define HLUA_CLR_BUSY(__hlua)        do {(__hlua)->flags &= ~HLUA_BUSY;} while(0)
+#define HLUA_IS_BUSY(__hlua)         ((__hlua)->flags & HLUA_BUSY)
 #define HLUA_SET_CTRLYIELD(__hlua)   do {(__hlua)->flags |= HLUA_CTRLYIELD;} while(0)
 #define HLUA_CLR_CTRLYIELD(__hlua)   do {(__hlua)->flags &= ~HLUA_CTRLYIELD;} while(0)
 #define HLUA_IS_CTRLYIELDING(__hlua) ((__hlua)->flags & HLUA_CTRLYIELD)
@@ -54,6 +57,7 @@ int hlua_post_init();
 void hlua_applet_tcp_fct(struct appctx *ctx);
 void hlua_applet_http_fct(struct appctx *ctx);
 struct task *hlua_process_task(struct task *task, void *context, unsigned int state);
+void hlua_yieldk(lua_State *L, int nresults, lua_KContext ctx, lua_KFunction k, int timeout, unsigned int flags);
 
 #else /* USE_LUA */
 

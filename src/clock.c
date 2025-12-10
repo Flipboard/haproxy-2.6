@@ -27,6 +27,7 @@
 #include <haproxy/tools.h>
 
 struct timeval                   start_date;      /* the process's start date in wall-clock time */
+struct timeval                   ready_date;      /* date when the process was considered ready */
 volatile ullong                  global_now;      /* common monotonic date between all threads (32:32) */
 volatile uint                    global_now_ms;   /* common monotonic date in milliseconds (may wrap) */
 
@@ -86,7 +87,7 @@ uint64_t now_cpu_time_thread(int thr)
 /* set the clock source for the local thread */
 void clock_set_local_source(void)
 {
-#if defined(_POSIX_TIMERS) && (_POSIX_TIMERS > 0) && defined(_POSIX_THREAD_CPUTIME)
+#if defined(_POSIX_TIMERS) && (_POSIX_TIMERS > 0) && defined(_POSIX_THREAD_CPUTIME) && (_POSIX_THREAD_CPUTIME >= 0)
 #ifdef USE_THREAD
 	pthread_getcpuclockid(pthread_self(), &per_thread_clock_id[tid]);
 #else
@@ -214,6 +215,9 @@ void clock_update_date(int max_wait, int interrupted)
 		 */
 		new_now = ((ullong)now.tv_sec << 32) + (uint)now.tv_usec;
 		now_ms = __tv_to_ms(&now);
+		/* correct for TICK_ETNERITY (0) */
+		if (unlikely(now_ms == TICK_ETERNITY))
+			now_ms++;
 
 		/* let's try to update the global <now> (both in timeval
 		 * and ms forms) or loop again.

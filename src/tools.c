@@ -53,6 +53,7 @@ extern void *__elf_aux_vector;
 #include <haproxy/api.h>
 #include <haproxy/applet.h>
 #include <haproxy/chunk.h>
+#include <haproxy/compiler.h>
 #include <haproxy/dgram.h>
 #include <haproxy/global.h>
 #include <haproxy/hlua.h>
@@ -960,12 +961,12 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 
 	str2 = back = env_expand(strdup(str));
 	if (str2 == NULL) {
-		memprintf(err, "out of memory in '%s'\n", __FUNCTION__);
+		memprintf(err, "out of memory in '%s'", __FUNCTION__);
 		goto out;
 	}
 
 	if (!*str2) {
-		memprintf(err, "'%s' resolves to an empty address (environment variable missing?)\n", str);
+		memprintf(err, "'%s' resolves to an empty address (environment variable missing?)", str);
 		goto out;
 	}
 
@@ -1097,14 +1098,14 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 
 		new_fd = strtol(str2, &endptr, 10);
 		if (!*str2 || new_fd < 0 || *endptr) {
-			memprintf(err, "file descriptor '%s' is not a valid integer in '%s'\n", str2, str);
+			memprintf(err, "file descriptor '%s' is not a valid integer in '%s'", str2, str);
 			goto out;
 		}
 
 		/* just verify that it's a socket */
 		addr_len = sizeof(ss2);
 		if (getsockname(new_fd, (struct sockaddr *)&ss2, &addr_len) == -1) {
-			memprintf(err, "cannot use file descriptor '%d' : %s.\n", new_fd, strerror(errno));
+			memprintf(err, "cannot use file descriptor '%d' : %s.", new_fd, strerror(errno));
 			goto out;
 		}
 
@@ -1116,7 +1117,7 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 
 		new_fd = strtol(str2, &endptr, 10);
 		if (!*str2 || new_fd < 0 || *endptr) {
-			memprintf(err, "file descriptor '%s' is not a valid integer in '%s'\n", str2, str);
+			memprintf(err, "file descriptor '%s' is not a valid integer in '%s'", str2, str);
 			goto out;
 		}
 
@@ -1126,14 +1127,14 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 
 			addr_len = sizeof(ss);
 			if (getsockname(new_fd, (struct sockaddr *)&ss, &addr_len) == -1) {
-				memprintf(err, "cannot use file descriptor '%d' : %s.\n", new_fd, strerror(errno));
+				memprintf(err, "cannot use file descriptor '%d' : %s.", new_fd, strerror(errno));
 				goto out;
 			}
 
 			addr_len = sizeof(type);
 			if (getsockopt(new_fd, SOL_SOCKET, SO_TYPE, &type, &addr_len) != 0 ||
 			    (type == SOCK_STREAM) != (proto_type == PROTO_TYPE_STREAM)) {
-				memprintf(err, "socket on file descriptor '%d' is of the wrong type.\n", new_fd);
+				memprintf(err, "socket on file descriptor '%d' is of the wrong type.", new_fd);
 				goto out;
 			}
 
@@ -1142,7 +1143,7 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 			((struct sockaddr_in *)&ss)->sin_addr.s_addr = new_fd;
 			((struct sockaddr_in *)&ss)->sin_port = 0;
 		} else {
-			memprintf(err, "a file descriptor is not acceptable here in '%s'\n", str);
+			memprintf(err, "a file descriptor is not acceptable here in '%s'", str);
 			goto out;
 		}
 	}
@@ -1161,7 +1162,7 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 
 		adr_len = strlen(str2);
 		if (adr_len > max_path_len) {
-			memprintf(err, "socket path '%s' too long (max %d)\n", str, max_path_len);
+			memprintf(err, "socket path '%s' too long (max %d)", str, max_path_len);
 			goto out;
 		}
 
@@ -1252,7 +1253,7 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 			porta = porth;
 		}
 		else if (*port1) { /* other any unexpected char */
-			memprintf(err, "invalid character '%c' in port number '%s' in '%s'\n", *port1, port1, str);
+			memprintf(err, "invalid character '%c' in port number '%s' in '%s'", *port1, port1, str);
 			goto out;
 		}
 		else if (opts & PA_O_PORT_MAND) {
@@ -1268,7 +1269,7 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 		if (str2ip2(str2, &ss, 0) == NULL) {
 			if ((!(opts & PA_O_RESOLVE) && !fqdn) ||
 			    ((opts & PA_O_RESOLVE) && str2ip2(str2, &ss, 1) == NULL)) {
-				memprintf(err, "invalid address: '%s' in '%s'\n", str2, str);
+				memprintf(err, "invalid address: '%s' in '%s'", str2, str);
 				goto out;
 			}
 
@@ -1283,11 +1284,11 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 	}
 
 	if (ctrl_type == SOCK_STREAM && !(opts & PA_O_STREAM)) {
-		memprintf(err, "stream-type address not acceptable in '%s'\n", str);
+		memprintf(err, "stream-type address not acceptable in '%s'", str);
 		goto out;
 	}
 	else if (ctrl_type == SOCK_DGRAM && !(opts & PA_O_DGRAM)) {
-		memprintf(err, "dgram-type address not acceptable in '%s'\n", str);
+		memprintf(err, "dgram-type address not acceptable in '%s'", str);
 		goto out;
 	}
 
@@ -1905,13 +1906,13 @@ int addr_is_local(const struct netns_entry *ns,
  * <map> with the hexadecimal representation of their ASCII-code (2 digits)
  * prefixed by <escape>, and will store the result between <start> (included)
  * and <stop> (excluded), and will always terminate the string with a '\0'
- * before <stop>. The position of the '\0' is returned if the conversion
- * completes. If bytes are missing between <start> and <stop>, then the
- * conversion will be incomplete and truncated. If <stop> <= <start>, the '\0'
- * cannot even be stored so we return <start> without writing the 0.
+ * before <stop>. If bytes are missing between <start> and <stop>, then the
+ * conversion will be incomplete and truncated.
  * The input string must also be zero-terminated.
+ *
+ * Return the address of the \0 character, or NULL on error
  */
-const char hextab[16] = "0123456789ABCDEF";
+const char hextab[16] __nonstring = "0123456789ABCDEF";
 char *encode_string(char *start, char *stop,
 		    const char escape, const long *map,
 		    const char *string)
@@ -1931,8 +1932,9 @@ char *encode_string(char *start, char *stop,
 			string++;
 		}
 		*start = '\0';
+		return start;
 	}
-	return start;
+	return NULL;
 }
 
 /*
@@ -1961,8 +1963,9 @@ char *encode_chunk(char *start, char *stop,
 			str++;
 		}
 		*start = '\0';
+		return start;
 	}
-	return start;
+	return NULL;
 }
 
 /*
@@ -1971,8 +1974,9 @@ char *encode_chunk(char *start, char *stop,
  * is reached or NULL-byte is encountered. The result will
  * be stored between <start> (included) and <stop> (excluded). This
  * function will always try to terminate the resulting string with a '\0'
- * before <stop>, and will return its position if the conversion
- * completes.
+ * before <stop>.
+ *
+ * Return the address of the \0 character, or NULL on error
  */
 char *escape_string(char *start, char *stop,
 		    const char escape, const long *map,
@@ -1992,8 +1996,9 @@ char *escape_string(char *start, char *stop,
 			string++;
 		}
 		*start = '\0';
+		return start;
 	}
-	return start;
+	return NULL;
 }
 
 /*
@@ -2038,10 +2043,18 @@ char *escape_chunk(char *start, char *stop,
  * It is useful if the escaped string is used between double quotes in the
  * format.
  *
- *    printf("..., \"%s\", ...\r\n", csv_enc(str, 0, &trash));
+ *    printf("..., \"%s\", ...\r\n", csv_enc(str, 0, 0, &trash));
  *
  * If <quote> is 1, the converter puts the quotes only if any reserved character
  * is present. If <quote> is 2, the converter always puts the quotes.
+ *
+ * If <oneline> is not 0, CRs are skipped and LFs are replaced by spaces.
+ * This re-format multi-lines strings to only one line. The purpose is to
+ * allow a line by line parsing but also to keep the output compliant with
+ * the CLI witch uses LF to defines the end of the response.
+ *
+ * If <oneline> is 2, In addition to previous action, the trailing spaces are
+ * removed.
  *
  * <output> is a struct buffer used for storing the output string.
  *
@@ -2057,7 +2070,7 @@ char *escape_chunk(char *start, char *stop,
  * the chunk. Please use csv_enc() instead if you want to replace the output
  * chunk.
  */
-const char *csv_enc_append(const char *str, int quote, struct buffer *output)
+const char *csv_enc_append(const char *str, int quote, int oneline, struct buffer *output)
 {
 	char *end = output->area + output->size;
 	char *out = output->area + output->data;
@@ -2073,6 +2086,19 @@ const char *csv_enc_append(const char *str, int quote, struct buffer *output)
 		*ptr++ = '"';
 
 	while (*str && ptr < end - 2) { /* -2 for reserving space for <"> and \0. */
+		if (oneline) {
+			if (*str == '\n' ) {
+				/* replace LF by a space */
+				*ptr++ = ' ';
+				str++;
+				continue;
+			}
+			else if (*str == '\r' ) {
+				/* skip CR */
+				str++;
+				continue;
+			}
+		}
 		*ptr = *str;
 		if (*str == '"') {
 			ptr++;
@@ -2084,6 +2110,12 @@ const char *csv_enc_append(const char *str, int quote, struct buffer *output)
 		}
 		ptr++;
 		str++;
+	}
+
+	if (oneline == 2) {
+		/* remove trailing spaces */
+		while (ptr > out && *(ptr - 1) == ' ')
+			ptr--;
 	}
 
 	if (quote)
@@ -4262,8 +4294,9 @@ int my_unsetenv(const char *name)
  * corresponding value. A variable is identified as a series of alphanumeric
  * characters or underscores following a '$' sign. The <in> string must be
  * free()able. NULL returns NULL. The resulting string might be reallocated if
- * some expansion is made. Variable names may also be enclosed into braces if
- * needed (eg: to concatenate alphanum characters).
+ * some expansion is made (an NULL will be returned on failure). Variable names
+ * may also be enclosed into braces if needed (eg: to concatenate alphanum
+ * characters).
  */
 char *env_expand(char *in)
 {
@@ -4318,6 +4351,9 @@ char *env_expand(char *in)
 		}
 
 		out = my_realloc2(out, out_len + (txt_end - txt_beg) + val_len + 1);
+		if (!out)
+			goto leave;
+
 		if (txt_end > txt_beg) {
 			memcpy(out + out_len, txt_beg, txt_end - txt_beg);
 			out_len += txt_end - txt_beg;
@@ -4332,6 +4368,7 @@ char *env_expand(char *in)
 
 	/* here we know that <out> was allocated and that we don't need <in> anymore */
 	free(in);
+leave:
 	return out;
 }
 
@@ -5640,6 +5677,21 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 					}
 				}
 			}
+			else {
+				/* An unmatched environment variable was parsed.
+				 * Let's skip the trailing double-quote character
+				 * and spaces.
+				 */
+				if (likely(*var_name != '.') && *in == '"') {
+					in++;
+					while (isspace((unsigned char)*in))
+						in++;
+					if (dquote) {
+						dquote = 0;
+						quote = NULL;
+					}
+				}
+			}
 			word_expand = NULL;
 		}
 		else {
@@ -5838,7 +5890,7 @@ int openssl_compare_current_name(const char *name)
 static int init_tools_per_thread()
 {
 	/* Let's make each thread start from a different position */
-	statistical_prng_state += tid * MAX_THREADS;
+	statistical_prng_state += ha_random32();
 	if (!statistical_prng_state)
 		statistical_prng_state++;
 	return 1;

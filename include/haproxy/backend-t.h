@@ -48,6 +48,7 @@
 #define BE_LB_HASH_HDR  0x00003  /* hash HTTP header value */
 #define BE_LB_HASH_RDP  0x00004  /* hash RDP cookie value */
 #define BE_LB_HASH_SMP  0x00005  /* hash a sample expression */
+#define BE_LB_HASH_ON   0x00006  /* hash on value */
 #define BE_LB_HASH_RND  0x00008  /* hash a random value */
 
 /* BE_LB_RR_* is used with BE_LB_KIND_RR */
@@ -91,6 +92,7 @@
 #define BE_LB_ALGO_HH	(BE_LB_KIND_HI | BE_LB_NEED_HTTP | BE_LB_HASH_HDR) /* hash: HTTP header value  */
 #define BE_LB_ALGO_RCH	(BE_LB_KIND_HI | BE_LB_NEED_DATA | BE_LB_HASH_RDP) /* hash: RDP cookie value   */
 #define BE_LB_ALGO_SMP	(BE_LB_KIND_HI | BE_LB_NEED_DATA | BE_LB_HASH_SMP) /* hash: sample expression  */
+#define BE_LB_ALGO_HASH (BE_LB_KIND_HI | BE_LB_NEED_HTTP | BE_LB_HASH_ON)  /* hash: hash-on*/
 #define BE_LB_ALGO      (BE_LB_KIND    | BE_LB_NEED      | BE_LB_PARM    ) /* mask to clear algo */
 
 /* Higher bits define how a given criterion is mapped to a server. In fact it

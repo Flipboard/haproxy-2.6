@@ -530,7 +530,7 @@ struct stream *stream_new(struct session *sess, struct stconn *sc, struct buffer
 	s->res.analyse_exp = TICK_ETERNITY;
 
 	s->txn = NULL;
-	s->hlua = NULL;
+	s->hlua[0] = s->hlua[1] = NULL;
 
 	s->resolv_ctx.requester = NULL;
 	s->resolv_ctx.hostname_dn = NULL;
@@ -575,8 +575,8 @@ struct stream *stream_new(struct session *sess, struct stconn *sc, struct buffer
  out_fail_accept:
 	flt_stream_release(s, 0);
 	LIST_DELETE(&s->list);
- out_fail_alloc_scb:
 	sc_free(s->scb);
+ out_fail_alloc_scb:
  out_fail_attach_scf:
 	task_destroy(t);
  out_fail_alloc:
@@ -615,11 +615,14 @@ void stream_free(struct stream *s)
 	}
 
 	if (unlikely(s->srv_conn)) {
+		struct server *oldsrv = s->srv_conn;
 		/* the stream still has a reserved slot on a server, but
 		 * it should normally be only the same as the one above,
 		 * so this should not happen in fact.
 		 */
 		sess_change_server(s, NULL);
+		if (may_dequeue_tasks(oldsrv, s->be))
+			process_srv_queue(oldsrv);
 	}
 
 	if (s->req.pipe)
@@ -646,8 +649,10 @@ void stream_free(struct stream *s)
 	flt_stream_stop(s);
 	flt_stream_release(s, 0);
 
-	hlua_ctx_destroy(s->hlua);
-	s->hlua = NULL;
+	hlua_ctx_destroy(s->hlua[0]);
+	hlua_ctx_destroy(s->hlua[1]);
+	s->hlua[0] = s->hlua[1] = NULL;
+
 	if (s->txn)
 		http_destroy_txn(s);
 
@@ -1484,6 +1489,10 @@ int stream_set_http_mode(struct stream *s, const struct mux_proto_list *mux_prot
 		return 0;
 
 	conn = sc_conn(sc);
+
+	if (!sc_conn_ready(sc))
+		return 0;
+
 	if (conn) {
 		se_have_more_data(s->scf->sedesc);
 		/* Make sure we're unsubscribed, the the new
@@ -1643,6 +1652,13 @@ static void stream_cond_update_cpu_usage(struct stream *s)
  * nothing too many times, the request and response buffers flags are monitored
  * and each function is called only if at least another function has changed at
  * least one flag it is interested in.
+ *
+ * This task handler understands a few wake up reasons:
+ *  - TASK_WOKEN_MSG forces analysers to be re-evaluated
+ *  - TASK_WOKEN_OTHER+TASK_F_UEVT1 shuts the stream down on server down
+ *  - TASK_WOKEN_OTHER+TASK_F_UEVT2 shuts the stream down on active kill
+ *  - TASK_WOKEN_OTHER+TASK_F_UEVT3 shuts the stream down because a preferred backend became available
+ *  - TASK_WOKEN_OTHER alone has no effect
  */
 struct task *process_stream(struct task *t, void *context, unsigned int state)
 {
@@ -1660,6 +1676,11 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 	DBG_TRACE_ENTER(STRM_EV_STRM_PROC, s);
 
 	activity[tid].stream_calls++;
+
+	if ((state & TASK_WOKEN_OTHER) && (state & (TASK_F_UEVT1 | TASK_F_UEVT2 | TASK_F_UEVT3))) {
+		/* that an instant kill message, the reason is in _UEVT* */
+		stream_shutdown_self(s, (state & TASK_F_UEVT3) ? SF_ERR_UP : (state & TASK_F_UEVT2) ? SF_ERR_KILLED : SF_ERR_DOWN);
+	}
 
 	req = &s->req;
 	res = &s->res;
@@ -1750,7 +1771,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 		      (CF_SHUTR|CF_READ_ACTIVITY|CF_READ_TIMEOUT|CF_SHUTW|
 		       CF_WRITE_ACTIVITY|CF_WRITE_TIMEOUT|CF_ANA_TIMEOUT)) &&
 		    !(s->flags & SF_CONN_EXP) &&
-		    !((sc_ep_get(scf) | scb->flags) & SE_FL_ERROR) &&
+		    !((sc_ep_get(scf) | sc_ep_get(scb)) & SE_FL_ERROR) &&
 		    ((s->pending_events & TASK_WOKEN_ANY) == TASK_WOKEN_TIMER)) {
 			scf->flags &= ~SC_FL_DONT_WAKE;
 			scb->flags &= ~SC_FL_DONT_WAKE;
@@ -2273,6 +2294,13 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 				    (s->be->mode == PR_MODE_HTTP) &&
 				    !(s->txn->flags & TX_D_L7_RETRY))
 					s->txn->flags |= TX_L7_RETRY;
+
+				if (s->be->options & PR_O_ABRT_CLOSE) {
+					struct connection *conn = sc_conn(scf);
+
+					if (conn && conn->mux && conn->mux->ctl)
+						conn->mux->ctl(conn, MUX_SUBS_RECV, NULL);
+				}
 			}
 		}
 		else {
@@ -2341,7 +2369,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 
 	/* shutdown(write) pending */
 	if (unlikely((req->flags & (CF_SHUTW|CF_SHUTW_NOW)) == CF_SHUTW_NOW &&
-		     channel_is_empty(req))) {
+		     (channel_is_empty(req)  || (req->flags & CF_WRITE_TIMEOUT)))) {
 		if (req->flags & CF_READ_ERROR)
 			scb->flags |= SC_FL_NOLINGER;
 		sc_shutw(scb);
@@ -2468,7 +2496,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 
 	/* shutdown(write) pending */
 	if (unlikely((res->flags & (CF_SHUTW|CF_SHUTW_NOW)) == CF_SHUTW_NOW &&
-		     channel_is_empty(res))) {
+		     (channel_is_empty(res) || (res->flags & CF_WRITE_TIMEOUT)))) {
 		sc_shutw(scf);
 	}
 
@@ -2675,6 +2703,20 @@ void sess_change_server(struct stream *strm, struct server *newsrv)
 {
 	struct server *oldsrv = strm->srv_conn;
 
+	/* Dynamic servers may be deleted during process lifetime. This
+	 * operation is always conducted under thread isolation. Several
+	 * conditions prevent deletion, one of them is if server streams list
+	 * is not empty. sess_change_server() uses stream_add_srv_conn() to
+	 * ensure the latter condition.
+	 *
+	 * A race condition could exist for stream which referenced a server
+	 * instance (s->target) without registering itself in its server list.
+	 * This is notably the case for SF_DIRECT streams which referenced a
+	 * server earlier during process_stream(). However at this time the
+	 * code is deemed safe as process_stream() cannot be rescheduled before
+	 * invocation of sess_change_server().
+	 */
+
 	if (oldsrv == newsrv)
 		return;
 
@@ -2746,8 +2788,12 @@ void default_srv_error(struct stream *s, struct stconn *sc)
 		s->flags |= fin;
 }
 
-/* kill a stream and set the termination flags to <why> (one of SF_ERR_*) */
-void stream_shutdown(struct stream *stream, int why)
+/* shutdown the stream from itself. It's also possible for another one from the
+ * same thread but then an explicit wakeup will be needed since this function
+ * does not perform it. <why> is a set of SF_ERR_* flags to pass as the cause
+ * for shutting down.
+ */
+void stream_shutdown_self(struct stream *stream, int why)
 {
 	if (stream->req.flags & (CF_SHUTW|CF_SHUTW_NOW))
 		return;
@@ -2757,7 +2803,6 @@ void stream_shutdown(struct stream *stream, int why)
 	stream->task->nice = 1024;
 	if (!(stream->flags & SF_ERR_MASK))
 		stream->flags |= why;
-	task_wakeup(stream->task, TASK_WOKEN_OTHER);
 }
 
 /* Appends a dump of the state of stream <s> into buffer <buf> which must have
@@ -3020,7 +3065,7 @@ static int check_tcp_switch_stream_mode(struct act_rule *rule, struct proxy *px,
 	const struct mux_proto_list *mux_ent;
 	const struct mux_proto_list *mux_proto = rule->arg.act.p[1];
 	enum pr_mode pr_mode = (uintptr_t)rule->arg.act.p[0];
-	enum proto_proxy_mode mode = (1 << (pr_mode == PR_MODE_HTTP));
+	enum proto_proxy_mode mode = conn_pr_mode_to_proto_mode(pr_mode);
 
 	if (pr_mode == PR_MODE_HTTP)
 		px->options |= PR_O_HTTP_UPG;
@@ -3343,7 +3388,7 @@ static int stats_dump_full_strm_to_buffer(struct stconn *sc, struct stream *strm
 
 		chunk_appendf(&trash,
 			     " age=%s)\n",
-			     human_time(now.tv_sec - strm->logs.accept_date.tv_sec, 1));
+			      human_time(tv_ms_elapsed(&strm->logs.tv_request, &now), TICKS_TO_MS(1000)));
 
 		if (strm->txn)
 			chunk_appendf(&trash,
@@ -3681,7 +3726,7 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 		chunk_appendf(&trash,
 			     " ts=%02x epoch=%#x age=%s calls=%u rate=%u cpu=%llu lat=%llu",
 		             curr_strm->task->state, curr_strm->stream_epoch,
-			     human_time(now.tv_sec - curr_strm->logs.tv_accept.tv_sec, 1),
+			     human_time(tv_ms_elapsed(&curr_strm->logs.tv_request, &now), TICKS_TO_MS(1000)),
 		             curr_strm->task->calls, read_freq_ctr(&curr_strm->call_rate),
 		             (unsigned long long)curr_strm->task->cpu_time, (unsigned long long)curr_strm->task->lat_time);
 
@@ -3908,6 +3953,13 @@ static struct action_kw_list stream_http_res_keywords = { ILH, {
 }};
 
 INITCALL1(STG_REGISTER, http_res_keywords_register, &stream_http_res_keywords);
+
+static struct action_kw_list stream_http_after_res_actions =  { ILH, {
+	{ "set-log-level", stream_parse_set_log_level },
+	{ /* END */ }
+}};
+
+INITCALL1(STG_REGISTER, http_after_res_keywords_register, &stream_http_after_res_actions);
 
 static int smp_fetch_cur_server_timeout(const struct arg *args, struct sample *smp, const char *km, void *private)
 {

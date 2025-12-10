@@ -260,6 +260,8 @@ const struct name_desc stat_fields[ST_F_TOTAL_FIELDS] = {
 	[ST_F_NEED_CONN_EST]                 = { .name = "need_conn_est",               .desc = "Estimated needed number of connections"},
 	[ST_F_UWEIGHT]                       = { .name = "uweight",                     .desc = "Server's user weight, or sum of active servers' user weights for a backend" },
 	[ST_F_AGG_SRV_CHECK_STATUS]          = { .name = "agg_server_check_status",     .desc = "Backend's aggregated gauge of servers' state check status" },
+	[ST_F_AGG_SRV_STATUS ]               = { .name = "agg_server_status",           .desc = "Backend's aggregated gauge of servers' status" },
+	[ST_F_AGG_CHECK_STATUS]              = { .name = "agg_check_status",            .desc = "Backend's aggregated gauge of servers' state check status" },
 };
 
 /* one line of info */
@@ -279,6 +281,8 @@ static struct list stats_module_list[STATS_DOMAIN_COUNT] = {
 };
 
 THREAD_LOCAL void *trash_counters;
+static THREAD_LOCAL struct buffer trash_chunk = BUF_NULL;
+
 
 static inline uint8_t stats_get_domain(uint32_t domain)
 {
@@ -292,8 +296,10 @@ static inline enum stats_domain_px_cap stats_px_get_cap(uint32_t domain)
 
 static void stats_dump_json_schema(struct buffer *out);
 
-int stats_putchk(struct channel *chn, struct htx *htx, struct buffer *chk)
+int stats_putchk(struct channel *chn, struct htx *htx)
 {
+	struct buffer *chk = &trash_chunk;
+
 	if (htx) {
 		if (chk->data >= channel_htx_recv_max(chn, htx))
 			return 0;
@@ -343,8 +349,8 @@ static const char *stats_scope_ptr(struct appctx *appctx, struct stconn *sc)
  */
 
 
-/* Dumps the stats CSV header to the trash buffer which. The caller is responsible
- * for clearing it if needed.
+/* Dumps the stats CSV header to the local trash buffer. The caller is
+ * responsible for clearing it if needed.
  * NOTE: Some tools happen to rely on the field position instead of its name,
  *       so please only append new fields at the end, never in the middle.
  */
@@ -352,19 +358,19 @@ static void stats_dump_csv_header(enum stats_domain domain)
 {
 	int field;
 
-	chunk_appendf(&trash, "# ");
+	chunk_appendf(&trash_chunk, "# ");
 	if (stat_f[domain]) {
 		for (field = 0; field < stat_count[domain]; ++field) {
-			chunk_appendf(&trash, "%s,", stat_f[domain][field].name);
+			chunk_appendf(&trash_chunk, "%s,", stat_f[domain][field].name);
 
 			/* print special delimiter on proxy stats to mark end of
 			   static fields */
 			if (domain == STATS_DOMAIN_PROXY && field + 1 == ST_F_TOTAL_FIELDS)
-				chunk_appendf(&trash, "-,");
+				chunk_appendf(&trash_chunk, "-,");
 		}
 	}
 
-	chunk_appendf(&trash, "\n");
+	chunk_appendf(&trash_chunk, "\n");
 }
 
 /* Emits a stats field without any surrounding element and properly encoded to
@@ -383,7 +389,7 @@ int stats_emit_raw_data_field(struct buffer *out, const struct field *f)
 		out->data = flt_trim(out->area, prev_data, chunk_appendf(out, "%f", f->u.flt));
 		return out->data;
 	}
-	case FF_STR:   return csv_enc_append(field_str(f, 0), 1, out) != NULL;
+	case FF_STR:   return csv_enc_append(field_str(f, 0), 1, 2, out) != NULL;
 	default:       return chunk_appendf(out, "[INCORRECT_FIELD_TYPE_%08x]", f->type);
 	}
 }
@@ -428,7 +434,7 @@ int stats_emit_typed_data_field(struct buffer *out, const struct field *f)
 /* Limit JSON integer values to the range [-(2**53)+1, (2**53)-1] as per
  * the recommendation for interoperable integers in section 6 of RFC 7159.
  */
-#define JSON_INT_MAX ((1ULL << 53) - 1)
+#define JSON_INT_MAX ((1LL << 53) - 1)
 #define JSON_INT_MIN (0 - JSON_INT_MAX)
 
 /* Emits a stats field value and its type in JSON.
@@ -577,9 +583,9 @@ int stats_emit_json_field_tags(struct buffer *out, const struct field *f)
 /* Dump all fields from <stats> into <out> using CSV format */
 static int stats_dump_fields_csv(struct buffer *out,
                                  const struct field *stats, size_t stats_count,
-                                 unsigned int flags,
-                                 enum stats_domain domain)
+                                 struct show_stat_ctx *ctx)
 {
+	int domain = ctx->domain;
 	int field;
 
 	for (field = 0; field < stats_count; ++field) {
@@ -604,9 +610,10 @@ static int stats_dump_fields_csv(struct buffer *out,
 static int stats_dump_fields_typed(struct buffer *out,
                                    const struct field *stats,
                                    size_t stats_count,
-                                   unsigned int flags,
-                                   enum stats_domain domain)
+                                   struct show_stat_ctx * ctx)
 {
+	int flags = ctx->flags;
+	int domain = ctx->domain;
 	int field;
 
 	for (field = 0; field < stats_count; ++field) {
@@ -654,7 +661,8 @@ static int stats_dump_fields_typed(struct buffer *out,
 
 /* Dump all fields from <stats> into <out> using the "show info json" format */
 static int stats_dump_json_info_fields(struct buffer *out,
-				       const struct field *info, unsigned int flags)
+                                       const struct field *info,
+                                       struct show_stat_ctx *ctx)
 {
 	int field;
 	int started = 0;
@@ -744,19 +752,21 @@ static void stats_print_rslv_field_json(struct buffer *out,
 /* Dump all fields from <stats> into <out> using a typed "field:desc:type:value" format */
 static int stats_dump_fields_json(struct buffer *out,
                                   const struct field *stats, size_t stats_count,
-                                  unsigned int flags,
-                                  enum stats_domain domain)
+                                  struct show_stat_ctx *ctx)
 {
-	int field;
-	int started = 0;
+	int flags = ctx->flags;
+	int domain = ctx->domain;
+	int started = (ctx->field) ? 1 : 0;
+	int ready_data = 0;
 
-	if ((flags & STAT_STARTED) && !chunk_strcat(out, ","))
+	if (!started && (flags & STAT_STARTED) && !chunk_strcat(out, ","))
 		return 0;
-	if (!chunk_strcat(out, "["))
+	if (!started && !chunk_strcat(out, "["))
 		return 0;
 
-	for (field = 0; field < stats_count; field++) {
+	for (; ctx->field < stats_count; ctx->field++) {
 		int old_len;
+		int field = ctx->field;
 
 		if (!stats[field].type)
 			continue;
@@ -791,19 +801,27 @@ static int stats_dump_fields_json(struct buffer *out,
 
 		if (!chunk_strcat(out, "}"))
 			goto err;
+		ready_data = out->data;
 	}
 
 	if (!chunk_strcat(out, "]"))
 		goto err;
 
+	ctx->field = 0; /* we're done */
 	return 1;
 
 err:
-	chunk_reset(out);
-	if (flags & STAT_STARTED)
-		chunk_strcat(out, ",");
-	chunk_appendf(out, "{\"errorStr\":\"output buffer too short\"}");
-	return 0;
+	if (!ready_data) {
+		/* not enough buffer space for a single entry.. */
+		chunk_reset(out);
+		if (ctx->flags & STAT_STARTED)
+			chunk_strcat(out, ",");
+		chunk_appendf(out, "{\"errorStr\":\"output buffer too short\"}");
+		return 0; /* hard error */
+	}
+	/* push ready data and wait for a new buffer to complete the dump */
+	out->data = ready_data;
+	return 1;
 }
 
 /* Dump all fields from <stats> into <out> using the HTML format. A column is
@@ -813,11 +831,12 @@ err:
  * present in <flags>.
  */
 static int stats_dump_fields_html(struct buffer *out,
-				  const struct field *stats,
-				  unsigned int flags)
+                                  const struct field *stats,
+                                  struct show_stat_ctx *ctx)
 {
 	struct buffer src;
 	struct stats_module *mod;
+	int flags = ctx->flags;
 	int i = 0, j = 0;
 
 	if (stats[ST_F_TYPE].u.u32 == STATS_TYPE_FE) {
@@ -1623,16 +1642,13 @@ int stats_dump_one_line(const struct field *stats, size_t stats_count,
 	int ret;
 
 	if (ctx->flags & STAT_FMT_HTML)
-		ret = stats_dump_fields_html(&trash, stats, ctx->flags);
+		ret = stats_dump_fields_html(&trash_chunk, stats, ctx);
 	else if (ctx->flags & STAT_FMT_TYPED)
-		ret = stats_dump_fields_typed(&trash, stats, stats_count, ctx->flags, ctx->domain);
+		ret = stats_dump_fields_typed(&trash_chunk, stats, stats_count, ctx);
 	else if (ctx->flags & STAT_FMT_JSON)
-		ret = stats_dump_fields_json(&trash, stats, stats_count, ctx->flags, ctx->domain);
+		ret = stats_dump_fields_json(&trash_chunk, stats, stats_count, ctx);
 	else
-		ret = stats_dump_fields_csv(&trash, stats, stats_count, ctx->flags, ctx->domain);
-
-	if (ret)
-		ctx->flags |= STAT_STARTED;
+		ret = stats_dump_fields_csv(&trash_chunk, stats, stats_count, ctx);
 
 	return ret;
 }
@@ -1817,9 +1833,10 @@ int stats_fill_fe_stats(struct proxy *px, struct field *stats, int len,
 	return 1;
 }
 
-/* Dumps a frontend's line to the trash for the current proxy <px> and uses
- * the state from stream connector <sc>. The caller is responsible for clearing
- * the trash if needed. Returns non-zero if it emits anything, zero otherwise.
+/* Dumps a frontend's line to the local trash buffer for the current proxy <px>
+ * and uses the state from stream connector <sc>. The caller is responsible for
+ * clearing the local trash buffer if needed. Returns non-zero if it emits
+ * anything, zero otherwise.
  */
 static int stats_dump_fe_stats(struct stconn *sc, struct proxy *px)
 {
@@ -1985,9 +2002,10 @@ int stats_fill_li_stats(struct proxy *px, struct listener *l, int flags,
 	return 1;
 }
 
-/* Dumps a line for listener <l> and proxy <px> to the trash and uses the state
- * from stream connector <sc>. The caller is responsible for clearing the trash
- * if needed. Returns non-zero if it emits anything, zero otherwise.
+/* Dumps a line for listener <l> and proxy <px> to the local trash buffer and
+ * uses the state from stream connector <sc>. The caller is responsible for
+ * clearing the local trash buffer if needed. Returns non-zero if it emits
+ * anything, zero otherwise.
  */
 static int stats_dump_li_stats(struct stconn *sc, struct proxy *px, struct listener *l)
 {
@@ -2496,10 +2514,10 @@ int stats_fill_sv_stats(struct proxy *px, struct server *sv, int flags,
 	return 1;
 }
 
-/* Dumps a line for server <sv> and proxy <px> to the trash and uses the state
- * from stream connector <sc>, and server state <state>. The caller is
- * responsible for clearing the trash if needed. Returns non-zero if it emits
- * anything, zero otherwise.
+/* Dumps a line for server <sv> and proxy <px> to the local trash vbuffer and
+ * uses the state from stream connector <sc>, and server state <state>. The
+ * caller is responsible for clearing the local trash buffer if needed. Returns
+ * non-zero if it emits anything, zero otherwise.
  */
 static int stats_dump_sv_stats(struct stconn *sc, struct proxy *px, struct server *sv)
 {
@@ -2628,7 +2646,7 @@ int stats_fill_be_stats(struct proxy *px, int flags, struct field *stats, int le
 				metric = mkf_u32(FO_CONFIG|FN_LIMIT, px->fullconn);
 				break;
 			case ST_F_STOT:
-				metric = mkf_u64(FN_COUNTER, px->be_counters.cum_conn);
+				metric = mkf_u64(FN_COUNTER, px->be_counters.cum_sess);
 				break;
 			case ST_F_BIN:
 				metric = mkf_u64(FN_COUNTER, px->be_counters.bytes_in);
@@ -2673,7 +2691,11 @@ int stats_fill_be_stats(struct proxy *px, int flags, struct field *stats, int le
 					chunk_appendf(out, " (%d/%d)", nbup, nbsrv);
 				metric = mkf_str(FO_STATUS, fld);
 				break;
-			case ST_F_AGG_SRV_CHECK_STATUS:
+			case ST_F_AGG_SRV_CHECK_STATUS:   // DEPRECATED
+			case ST_F_AGG_SRV_STATUS:
+				metric = mkf_u32(FN_GAUGE, 0);
+				break;
+			case ST_F_AGG_CHECK_STATUS:
 				metric = mkf_u32(FN_GAUGE, 0);
 				break;
 			case ST_F_WEIGHT:
@@ -2823,9 +2845,10 @@ int stats_fill_be_stats(struct proxy *px, int flags, struct field *stats, int le
 	return 1;
 }
 
-/* Dumps a line for backend <px> to the trash for and uses the state from stream
- * interface <si>. The caller is responsible for clearing the trash if needed.
- * Returns non-zero if it emits anything, zero otherwise.
+/* Dumps a line for backend <px> to the local trash buffer for and uses the
+ * state from stream interface <si>. The caller is responsible for clearing the
+ * local trash buffer if needed.  Returns non-zero if it emits anything, zero
+ * otherwise.
  */
 static int stats_dump_be_stats(struct stconn *sc, struct proxy *px)
 {
@@ -2865,9 +2888,9 @@ static int stats_dump_be_stats(struct stconn *sc, struct proxy *px)
 	return stats_dump_one_line(stats, stats_count, appctx);
 }
 
-/* Dumps the HTML table header for proxy <px> to the trash for and uses the state from
- * stream connector <sc> and per-uri parameters <uri>. The caller is responsible
- * for clearing the trash if needed.
+/* Dumps the HTML table header for proxy <px> to the local trash buffer for and
+ * uses the state from stream connector <sc>. The caller is responsible for
+ * clearing the local trash buffer if needed.
  */
 static void stats_dump_html_px_hdr(struct stconn *sc, struct proxy *px)
 {
@@ -2890,17 +2913,17 @@ static void stats_dump_html_px_hdr(struct stconn *sc, struct proxy *px)
 			scope_txt[strlen(STAT_SCOPE_PATTERN) + ctx->scope_len] = 0;
 		}
 
-		chunk_appendf(&trash,
+		chunk_appendf(&trash_chunk,
 			      "<form method=\"post\">");
 	}
 
 	/* print a new table */
-	chunk_appendf(&trash,
+	chunk_appendf(&trash_chunk,
 		      "<table class=\"tbl\" width=\"100%%\">\n"
 		      "<tr class=\"titre\">"
 		      "<th class=\"pxname\" width=\"10%%\">");
 
-	chunk_appendf(&trash,
+	chunk_appendf(&trash_chunk,
 	              "<a name=\"%s\"></a>%s"
 	              "<a class=px href=\"#%s\">%s</a>",
 	              px->id,
@@ -2909,13 +2932,13 @@ static void stats_dump_html_px_hdr(struct stconn *sc, struct proxy *px)
 
 	if (ctx->flags & STAT_SHLGNDS) {
 		/* cap, mode, id */
-		chunk_appendf(&trash, "<div class=tips>cap: %s, mode: %s, id: %d",
+		chunk_appendf(&trash_chunk, "<div class=tips>cap: %s, mode: %s, id: %d",
 		              proxy_cap_str(px->cap), proxy_mode_str(px->mode),
 		              px->uuid);
-		chunk_appendf(&trash, "</div>");
+		chunk_appendf(&trash_chunk, "</div>");
 	}
 
-	chunk_appendf(&trash,
+	chunk_appendf(&trash_chunk,
 	              "%s</th>"
 	              "<th class=\"%s\" width=\"90%%\">%s</th>"
 	              "</tr>\n"
@@ -2928,17 +2951,17 @@ static void stats_dump_html_px_hdr(struct stconn *sc, struct proxy *px)
 	if (ctx->flags & STAT_ADMIN) {
 		/* Column heading for Enable or Disable server */
 		if ((px->cap & PR_CAP_BE) && px->srv)
-			chunk_appendf(&trash,
+			chunk_appendf(&trash_chunk,
 				      "<th rowspan=2 width=1><input type=\"checkbox\" "
 				      "onclick=\"for(c in document.getElementsByClassName('%s-checkbox')) "
 				      "document.getElementsByClassName('%s-checkbox').item(c).checked = this.checked\"></th>",
 				      px->id,
 				      px->id);
 		else
-			chunk_appendf(&trash, "<th rowspan=2></th>");
+			chunk_appendf(&trash_chunk, "<th rowspan=2></th>");
 	}
 
-	chunk_appendf(&trash,
+	chunk_appendf(&trash_chunk,
 	              "<th rowspan=2></th>"
 	              "<th colspan=3>Queue</th>"
 	              "<th colspan=3>Session rate</th><th colspan=6>Sessions</th>"
@@ -2951,11 +2974,11 @@ static void stats_dump_html_px_hdr(struct stconn *sc, struct proxy *px)
 		list_for_each_entry(mod, &stats_module_list[STATS_DOMAIN_PROXY], list) {
 			++stats_module_len;
 		}
-		chunk_appendf(&trash, "<th colspan=%d>Extra modules</th>",
+		chunk_appendf(&trash_chunk, "<th colspan=%d>Extra modules</th>",
 		              stats_module_len);
 	}
 
-	chunk_appendf(&trash,
+	chunk_appendf(&trash_chunk,
 	              "</tr>\n"
 	              "<tr class=\"titre\">"
 	              "<th>Cur</th><th>Max</th><th>Limit</th>"
@@ -2969,26 +2992,27 @@ static void stats_dump_html_px_hdr(struct stconn *sc, struct proxy *px)
 
 	if (ctx->flags & STAT_SHMODULES) {
 		list_for_each_entry(mod, &stats_module_list[STATS_DOMAIN_PROXY], list) {
-			chunk_appendf(&trash, "<th>%s</th>", mod->name);
+			chunk_appendf(&trash_chunk, "<th>%s</th>", mod->name);
 		}
 	}
 
-	chunk_appendf(&trash, "</tr>");
+	chunk_appendf(&trash_chunk, "</tr>");
 }
 
-/* Dumps the HTML table trailer for proxy <px> to the trash for and uses the state from
- * stream connector <sc>. The caller is responsible for clearing the trash if needed.
+/* Dumps the HTML table trailer for proxy <px> to the local trash buffer for and
+ * uses the state from stream connector <sc>. The caller is responsible for
+ * clearing the local trash buffer if needed.
  */
 static void stats_dump_html_px_end(struct stconn *sc, struct proxy *px)
 {
 	struct appctx *appctx = __sc_appctx(sc);
 	struct show_stat_ctx *ctx = appctx->svcctx;
 
-	chunk_appendf(&trash, "</table>");
+	chunk_appendf(&trash_chunk, "</table>");
 
 	if ((px->cap & PR_CAP_BE) && px->srv && (ctx->flags & STAT_ADMIN)) {
 		/* close the form used to enable/disable this proxy servers */
-		chunk_appendf(&trash,
+		chunk_appendf(&trash_chunk,
 			      "Choose the action to perform on the checked servers : "
 			      "<select name=action>"
 			      "<option value=\"\"></option>"
@@ -3012,7 +3036,7 @@ static void stats_dump_html_px_end(struct stconn *sc, struct proxy *px)
 			      px->uuid);
 	}
 
-	chunk_appendf(&trash, "<p>\n");
+	chunk_appendf(&trash_chunk, "<p>\n");
 }
 
 /*
@@ -3020,19 +3044,25 @@ static void stats_dump_html_px_end(struct stconn *sc, struct proxy *px)
  * input buffer. Returns 0 if it had to stop dumping data because of lack of
  * buffer space, or non-zero if everything completed. This function is used
  * both by the CLI and the HTTP entry points, and is able to dump the output
- * in HTML or CSV formats. If the later, <uri> must be NULL.
+ * in HTML or CSV formats.
  */
 int stats_dump_proxy_to_buffer(struct stconn *sc, struct htx *htx,
-			       struct proxy *px, struct uri_auth *uri)
+			       struct proxy *px)
 {
 	struct appctx *appctx = __sc_appctx(sc);
 	struct show_stat_ctx *ctx = appctx->svcctx;
-	struct stream *s = __sc_strm(sc);
 	struct channel *rep = sc_ic(sc);
 	struct server *sv, *svs;	/* server and server-state, server-state=server or server->track */
 	struct listener *l;
+	struct uri_auth *uri = NULL;
+	int current_field;
+	int px_st = ctx->px_st;
 
-	chunk_reset(&trash);
+	if (ctx->http_px)
+		uri = ctx->http_px->uri_auth;
+	chunk_reset(&trash_chunk);
+more:
+	current_field = ctx->field;
 
 	switch (ctx->px_st) {
 	case STAT_PX_ST_INIT:
@@ -3051,7 +3081,7 @@ int stats_dump_proxy_to_buffer(struct stconn *sc, struct htx *htx,
 					break;
 
 				/* match '.' which means 'self' proxy */
-				if (strcmp(scope->px_id, ".") == 0 && px == s->be)
+				if (strcmp(scope->px_id, ".") == 0 && px == ctx->http_px)
 					break;
 				scope = scope->next;
 			}
@@ -3082,7 +3112,7 @@ int stats_dump_proxy_to_buffer(struct stconn *sc, struct htx *htx,
 	case STAT_PX_ST_TH:
 		if (ctx->flags & STAT_FMT_HTML) {
 			stats_dump_html_px_hdr(sc, px);
-			if (!stats_putchk(rep, htx, &trash))
+			if (!stats_putchk(rep, htx))
 				goto full;
 		}
 
@@ -3092,10 +3122,14 @@ int stats_dump_proxy_to_buffer(struct stconn *sc, struct htx *htx,
 	case STAT_PX_ST_FE:
 		/* print the frontend */
 		if (stats_dump_fe_stats(sc, px)) {
-			if (!stats_putchk(rep, htx, &trash))
+			if (!stats_putchk(rep, htx))
 				goto full;
+			ctx->flags |= STAT_STARTED;
+			if (ctx->field)
+				goto more;
 		}
 
+		current_field = 0;
 		ctx->obj2 = px->conf.listeners.n;
 		ctx->px_st = STAT_PX_ST_LI;
 		/* fall through */
@@ -3126,9 +3160,13 @@ int stats_dump_proxy_to_buffer(struct stconn *sc, struct htx *htx,
 
 			/* print the frontend */
 			if (stats_dump_li_stats(sc, px, l)) {
-				if (!stats_putchk(rep, htx, &trash))
+				if (!stats_putchk(rep, htx))
 					goto full;
+				ctx->flags |= STAT_STARTED;
+				if (ctx->field)
+					goto more;
 			}
+			current_field = 0;
 		}
 
 		ctx->obj2 = px->srv; /* may be NULL */
@@ -3136,11 +3174,28 @@ int stats_dump_proxy_to_buffer(struct stconn *sc, struct htx *htx,
 		/* fall through */
 
 	case STAT_PX_ST_SV:
+		/* check for dump resumption */
+		if (px_st == STAT_PX_ST_SV) {
+			struct server *cur = ctx->obj2;
+
+			/* re-entrant dump */
+			BUG_ON(!cur);
+			if (cur->flags & SRV_F_DELETED) {
+				/* the server could have been marked as deleted
+				 * between two dumping attempts, skip it.
+				 */
+				cur = cur->next;
+			}
+			srv_drop(ctx->obj2); /* drop old srv taken on last dumping attempt */
+			ctx->obj2 = cur; /* could be NULL */
+			/* back to normal */
+		}
+
 		/* obj2 points to servers list as initialized above.
 		 *
 		 * A server may be removed during the stats dumping.
 		 * Temporarily increment its refcount to prevent its
-		 * anticipated cleaning. Call free_server to release it.
+		 * anticipated cleaning. Call srv_drop() to release it.
 		 */
 		for (; ctx->obj2 != NULL;
 		       ctx->obj2 = srv_drop(sv)) {
@@ -3188,9 +3243,13 @@ int stats_dump_proxy_to_buffer(struct stconn *sc, struct htx *htx,
 			}
 
 			if (stats_dump_sv_stats(sc, px, sv)) {
-				if (!stats_putchk(rep, htx, &trash))
+				if (!stats_putchk(rep, htx))
 					goto full;
+				ctx->flags |= STAT_STARTED;
+				if (ctx->field)
+					goto more;
 			}
+			current_field = 0;
 		} /* for sv */
 
 		ctx->px_st = STAT_PX_ST_BE;
@@ -3199,17 +3258,21 @@ int stats_dump_proxy_to_buffer(struct stconn *sc, struct htx *htx,
 	case STAT_PX_ST_BE:
 		/* print the backend */
 		if (stats_dump_be_stats(sc, px)) {
-			if (!stats_putchk(rep, htx, &trash))
+			if (!stats_putchk(rep, htx))
 				goto full;
+			ctx->flags |= STAT_STARTED;
+			if (ctx->field)
+				goto more;
 		}
 
+		current_field = 0;
 		ctx->px_st = STAT_PX_ST_END;
 		/* fall through */
 
 	case STAT_PX_ST_END:
 		if (ctx->flags & STAT_FMT_HTML) {
 			stats_dump_html_px_end(sc, px);
-			if (!stats_putchk(rep, htx, &trash))
+			if (!stats_putchk(rep, htx))
 				goto full;
 		}
 
@@ -3226,18 +3289,25 @@ int stats_dump_proxy_to_buffer(struct stconn *sc, struct htx *htx,
 
   full:
 	sc_need_room(sc);
+	/* restore previous field */
+	ctx->field = current_field;
 	return 0;
 }
 
-/* Dumps the HTTP stats head block to the trash for and uses the per-uri
- * parameters <uri>. The caller is responsible for clearing the trash if needed.
+/* Dumps the HTTP stats head block to the local trash buffer and uses the
+ * per-uri parameters from the parent proxy. The caller is responsible for
+ * clearing the local trash buffer if needed.
  */
-static void stats_dump_html_head(struct appctx *appctx, struct uri_auth *uri)
+static void stats_dump_html_head(struct appctx *appctx)
 {
 	struct show_stat_ctx *ctx = appctx->svcctx;
+	struct uri_auth *uri;
+
+	BUG_ON(!ctx->http_px);
+	uri = ctx->http_px->uri_auth;
 
 	/* WARNING! This must fit in the first buffer !!! */
-	chunk_appendf(&trash,
+	chunk_appendf(&trash_chunk,
 	              "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\"\n"
 	              "\"http://www.w3.org/TR/html4/loose.dtd\">\n"
 	              "<html><head><title>Statistics Report for " PRODUCT_NAME "%s%s</title>\n"
@@ -3397,18 +3467,23 @@ static void stats_dump_html_head(struct appctx *appctx, struct uri_auth *uri)
 	              );
 }
 
-/* Dumps the HTML stats information block to the trash for and uses the state from
- * stream connector <sc> and per-uri parameters <uri>. The caller is responsible
- * for clearing the trash if needed.
+/* Dumps the HTML stats information block to the local trash buffer and uses
+ * the state from stream connector <sc> and per-uri parameter from the parent
+ * proxy. The caller is responsible for clearing the local trash buffer if
+ * needed.
  */
-static void stats_dump_html_info(struct stconn *sc, struct uri_auth *uri)
+static void stats_dump_html_info(struct stconn *sc)
 {
 	struct appctx *appctx = __sc_appctx(sc);
 	struct show_stat_ctx *ctx = appctx->svcctx;
 	unsigned int up = (now.tv_sec - start_date.tv_sec);
 	char scope_txt[STAT_SCOPE_TXT_MAXLEN + sizeof STAT_SCOPE_PATTERN];
 	const char *scope_ptr = stats_scope_ptr(appctx, sc);
+	struct uri_auth *uri;
 	unsigned long long bps = (unsigned long long)read_freq_ctr(&global.out_32bps) * 32;
+
+	BUG_ON(!ctx->http_px);
+	uri = ctx->http_px->uri_auth;
 
 	/* Turn the bytes per second to bits per second and take care of the
 	 * usual ethernet overhead in order to help figure how far we are from
@@ -3425,7 +3500,7 @@ static void stats_dump_html_info(struct stconn *sc, struct uri_auth *uri)
 	 * We are around 3.5 kB, add adding entries will
 	 * become tricky if we want to support 4kB buffers !
 	 */
-	chunk_appendf(&trash,
+	chunk_appendf(&trash_chunk,
 	              "<body><h1><a href=\"" PRODUCT_URL "\" style=\"text-decoration: none;\">"
 	              PRODUCT_NAME "%s</a></h1>\n"
 	              "<h2>Statistics Report for pid %d%s%s%s%s</h2>\n"
@@ -3483,7 +3558,7 @@ static void stats_dump_html_info(struct stconn *sc, struct uri_auth *uri)
 	memcpy(scope_txt, scope_ptr, ctx->scope_len);
 	scope_txt[ctx->scope_len] = '\0';
 
-	chunk_appendf(&trash,
+	chunk_appendf(&trash_chunk,
 		      "<li><form method=\"GET\">Scope : <input value=\"%s\" name=\"" STAT_SCOPE_INPUT_NAME "\" size=\"8\" maxlength=\"%d\" tabindex=\"1\"/></form>\n",
 		      (ctx->scope_len > 0) ? scope_txt : "",
 		      STAT_SCOPE_TXT_MAXLEN);
@@ -3497,14 +3572,14 @@ static void stats_dump_html_info(struct stconn *sc, struct uri_auth *uri)
 	}
 
 	if (ctx->flags & STAT_HIDE_DOWN)
-		chunk_appendf(&trash,
+		chunk_appendf(&trash_chunk,
 		              "<li><a href=\"%s%s%s%s\">Show all servers</a><br>\n",
 		              uri->uri_prefix,
 		              "",
 		              (ctx->flags & STAT_NO_REFRESH) ? ";norefresh" : "",
 			      scope_txt);
 	else
-		chunk_appendf(&trash,
+		chunk_appendf(&trash_chunk,
 		              "<li><a href=\"%s%s%s%s\">Hide 'DOWN' servers</a><br>\n",
 		              uri->uri_prefix,
 		              ";up",
@@ -3513,14 +3588,14 @@ static void stats_dump_html_info(struct stconn *sc, struct uri_auth *uri)
 
 	if (uri->refresh > 0) {
 		if (ctx->flags & STAT_NO_REFRESH)
-			chunk_appendf(&trash,
+			chunk_appendf(&trash_chunk,
 			              "<li><a href=\"%s%s%s%s\">Enable refresh</a><br>\n",
 			              uri->uri_prefix,
 			              (ctx->flags & STAT_HIDE_DOWN) ? ";up" : "",
 			              "",
 				      scope_txt);
 		else
-			chunk_appendf(&trash,
+			chunk_appendf(&trash_chunk,
 			              "<li><a href=\"%s%s%s%s\">Disable refresh</a><br>\n",
 			              uri->uri_prefix,
 			              (ctx->flags & STAT_HIDE_DOWN) ? ";up" : "",
@@ -3528,26 +3603,26 @@ static void stats_dump_html_info(struct stconn *sc, struct uri_auth *uri)
 				      scope_txt);
 	}
 
-	chunk_appendf(&trash,
+	chunk_appendf(&trash_chunk,
 	              "<li><a href=\"%s%s%s%s\">Refresh now</a><br>\n",
 	              uri->uri_prefix,
 	              (ctx->flags & STAT_HIDE_DOWN) ? ";up" : "",
 	              (ctx->flags & STAT_NO_REFRESH) ? ";norefresh" : "",
 		      scope_txt);
 
-	chunk_appendf(&trash,
+	chunk_appendf(&trash_chunk,
 	              "<li><a href=\"%s;csv%s%s\">CSV export</a><br>\n",
 	              uri->uri_prefix,
 	              (uri->refresh > 0) ? ";norefresh" : "",
 		      scope_txt);
 
-	chunk_appendf(&trash,
+	chunk_appendf(&trash_chunk,
 	              "<li><a href=\"%s;json%s%s\">JSON export</a> (<a href=\"%s;json-schema\">schema</a>)<br>\n",
 	              uri->uri_prefix,
 	              (uri->refresh > 0) ? ";norefresh" : "",
 		      scope_txt, uri->uri_prefix);
 
-	chunk_appendf(&trash,
+	chunk_appendf(&trash_chunk,
 	              "</ul></td>"
 	              "<td align=\"left\" valign=\"top\" nowrap width=\"1%%\">"
 	              "<b>External resources:</b><ul style=\"margin-top: 0.25em;\">\n"
@@ -3563,7 +3638,7 @@ static void stats_dump_html_info(struct stconn *sc, struct uri_auth *uri)
 	if (ctx->st_code) {
 		switch (ctx->st_code) {
 		case STAT_STATUS_DONE:
-			chunk_appendf(&trash,
+			chunk_appendf(&trash_chunk,
 			              "<p><div class=active_up>"
 			              "<a class=lfsb href=\"%s%s%s%s\" title=\"Remove this message\">[X]</a> "
 			              "Action processed successfully."
@@ -3573,7 +3648,7 @@ static void stats_dump_html_info(struct stconn *sc, struct uri_auth *uri)
 			              scope_txt);
 			break;
 		case STAT_STATUS_NONE:
-			chunk_appendf(&trash,
+			chunk_appendf(&trash_chunk,
 			              "<p><div class=active_going_down>"
 			              "<a class=lfsb href=\"%s%s%s%s\" title=\"Remove this message\">[X]</a> "
 			              "Nothing has changed."
@@ -3583,7 +3658,7 @@ static void stats_dump_html_info(struct stconn *sc, struct uri_auth *uri)
 			              scope_txt);
 			break;
 		case STAT_STATUS_PART:
-			chunk_appendf(&trash,
+			chunk_appendf(&trash_chunk,
 			              "<p><div class=active_going_down>"
 			              "<a class=lfsb href=\"%s%s%s%s\" title=\"Remove this message\">[X]</a> "
 			              "Action partially processed.<br>"
@@ -3594,7 +3669,7 @@ static void stats_dump_html_info(struct stconn *sc, struct uri_auth *uri)
 			              scope_txt);
 			break;
 		case STAT_STATUS_ERRP:
-			chunk_appendf(&trash,
+			chunk_appendf(&trash_chunk,
 			              "<p><div class=active_down>"
 			              "<a class=lfsb href=\"%s%s%s%s\" title=\"Remove this message\">[X]</a> "
 			              "Action not processed because of invalid parameters."
@@ -3610,7 +3685,7 @@ static void stats_dump_html_info(struct stconn *sc, struct uri_auth *uri)
 			              scope_txt);
 			break;
 		case STAT_STATUS_EXCD:
-			chunk_appendf(&trash,
+			chunk_appendf(&trash_chunk,
 			              "<p><div class=active_down>"
 			              "<a class=lfsb href=\"%s%s%s%s\" title=\"Remove this message\">[X]</a> "
 			              "<b>Action not processed : the buffer couldn't store all the data.<br>"
@@ -3621,7 +3696,7 @@ static void stats_dump_html_info(struct stconn *sc, struct uri_auth *uri)
 			              scope_txt);
 			break;
 		case STAT_STATUS_DENY:
-			chunk_appendf(&trash,
+			chunk_appendf(&trash_chunk,
 			              "<p><div class=active_down>"
 			              "<a class=lfsb href=\"%s%s%s%s\" title=\"Remove this message\">[X]</a> "
 			              "<b>Action denied.</b>"
@@ -3631,7 +3706,7 @@ static void stats_dump_html_info(struct stconn *sc, struct uri_auth *uri)
 			              scope_txt);
 			break;
 		case STAT_STATUS_IVAL:
-			chunk_appendf(&trash,
+			chunk_appendf(&trash_chunk,
 			              "<p><div class=active_down>"
 			              "<a class=lfsb href=\"%s%s%s%s\" title=\"Remove this message\">[X]</a> "
 			              "<b>Invalid requests (unsupported method or chunked encoded request).</b>"
@@ -3641,7 +3716,7 @@ static void stats_dump_html_info(struct stconn *sc, struct uri_auth *uri)
 			              scope_txt);
 			break;
 		default:
-			chunk_appendf(&trash,
+			chunk_appendf(&trash_chunk,
 			              "<p><div class=active_no_check>"
 			              "<a class=lfsb href=\"%s%s%s%s\" title=\"Remove this message\">[X]</a> "
 			              "Unexpected result."
@@ -3650,41 +3725,40 @@ static void stats_dump_html_info(struct stconn *sc, struct uri_auth *uri)
 			              (ctx->flags & STAT_NO_REFRESH) ? ";norefresh" : "",
 			              scope_txt);
 		}
-		chunk_appendf(&trash, "<p>\n");
+		chunk_appendf(&trash_chunk, "<p>\n");
 	}
 }
 
-/* Dumps the HTML stats trailer block to the trash. The caller is responsible
- * for clearing the trash if needed.
+/* Dumps the HTML stats trailer block to the local trash buffer. The caller is
+ * responsible for clearing the local trash buffer if needed.
  */
 static void stats_dump_html_end()
 {
-	chunk_appendf(&trash, "</body></html>\n");
+	chunk_appendf(&trash_chunk, "</body></html>\n");
 }
 
-/* Dumps the stats JSON header to the trash buffer which. The caller is responsible
- * for clearing it if needed.
+/* Dumps the stats JSON header to the local trash buffer buffer which. The
+ * caller is responsible for clearing it if needed.
  */
 static void stats_dump_json_header()
 {
-	chunk_strcat(&trash, "[");
+	chunk_strcat(&trash_chunk, "[");
 }
 
 
-/* Dumps the JSON stats trailer block to the trash. The caller is responsible
- * for clearing the trash if needed.
+/* Dumps the JSON stats trailer block to the local trash buffer. The caller is
+ * responsible for clearing the local trash buffer if needed.
  */
 static void stats_dump_json_end()
 {
-	chunk_strcat(&trash, "]\n");
+	chunk_strcat(&trash_chunk, "]\n");
 }
 
 /* Uses <appctx.ctx.stats.obj1> as a pointer to the current proxy and <obj2> as
  * a pointer to the current server/listener.
  */
 static int stats_dump_proxies(struct stconn *sc,
-                              struct htx *htx,
-                              struct uri_auth *uri)
+                              struct htx *htx)
 {
 	struct appctx *appctx = __sc_appctx(sc);
 	struct show_stat_ctx *ctx = appctx->svcctx;
@@ -3709,12 +3783,13 @@ static int stats_dump_proxies(struct stconn *sc,
 		 */
 		if (!(px->flags & PR_FL_DISABLED) && px->uuid > 0 &&
 		    (px->cap & (PR_CAP_FE | PR_CAP_BE)) && !(px->cap & PR_CAP_INT)) {
-			if (stats_dump_proxy_to_buffer(sc, htx, px, uri) == 0)
+			if (stats_dump_proxy_to_buffer(sc, htx, px) == 0)
 				return 0;
 		}
 
 		ctx->obj1 = px->next;
 		ctx->px_st = STAT_PX_ST_INIT;
+		ctx->field = 0;
 	}
 
 	return 1;
@@ -3725,21 +3800,19 @@ static int stats_dump_proxies(struct stconn *sc,
 }
 
 /* This function dumps statistics onto the stream connector's read buffer in
- * either CSV or HTML format. <uri> contains some HTML-specific parameters that
- * are ignored for CSV format (hence <uri> may be NULL there). It returns 0 if
- * it had to stop writing data and an I/O is needed, 1 if the dump is finished
- * and the stream must be closed, or -1 in case of any error. This function is
- * used by both the CLI and the HTTP handlers.
+ * either CSV or HTML format. It returns 0 if it had to stop writing data and
+ * an I/O is needed, 1 if the dump is finished and the stream must be closed,
+ * or -1 in case of any error. This function is used by both the CLI and the
+ * HTTP handlers.
  */
-static int stats_dump_stat_to_buffer(struct stconn *sc, struct htx *htx,
-				     struct uri_auth *uri)
+static int stats_dump_stat_to_buffer(struct stconn *sc, struct htx *htx)
 {
 	struct appctx *appctx = __sc_appctx(sc);
 	struct show_stat_ctx *ctx = appctx->svcctx;
 	struct channel *rep = sc_ic(sc);
 	enum stats_domain domain = ctx->domain;
 
-	chunk_reset(&trash);
+	chunk_reset(&trash_chunk);
 
 	switch (ctx->state) {
 	case STAT_STATE_INIT:
@@ -3748,15 +3821,15 @@ static int stats_dump_stat_to_buffer(struct stconn *sc, struct htx *htx,
 
 	case STAT_STATE_HEAD:
 		if (ctx->flags & STAT_FMT_HTML)
-			stats_dump_html_head(appctx, uri);
+			stats_dump_html_head(appctx);
 		else if (ctx->flags & STAT_JSON_SCHM)
-			stats_dump_json_schema(&trash);
+			stats_dump_json_schema(&trash_chunk);
 		else if (ctx->flags & STAT_FMT_JSON)
 			stats_dump_json_header();
 		else if (!(ctx->flags & STAT_FMT_TYPED))
 			stats_dump_csv_header(ctx->domain);
 
-		if (!stats_putchk(rep, htx, &trash))
+		if (!stats_putchk(rep, htx))
 			goto full;
 
 		if (ctx->flags & STAT_JSON_SCHM) {
@@ -3768,8 +3841,8 @@ static int stats_dump_stat_to_buffer(struct stconn *sc, struct htx *htx,
 
 	case STAT_STATE_INFO:
 		if (ctx->flags & STAT_FMT_HTML) {
-			stats_dump_html_info(sc, uri);
-			if (!stats_putchk(rep, htx, &trash))
+			stats_dump_html_info(sc);
+			if (!stats_putchk(rep, htx))
 				goto full;
 		}
 
@@ -3777,6 +3850,7 @@ static int stats_dump_stat_to_buffer(struct stconn *sc, struct htx *htx,
 			ctx->obj1 = proxies_list;
 
 		ctx->px_st = STAT_PX_ST_INIT;
+		ctx->field = 0;
 		ctx->state = STAT_STATE_LIST;
 		/* fall through */
 
@@ -3793,7 +3867,7 @@ static int stats_dump_stat_to_buffer(struct stconn *sc, struct htx *htx,
 		case STATS_DOMAIN_PROXY:
 		default:
 			/* dump proxies */
-			if (!stats_dump_proxies(sc, htx, uri))
+			if (!stats_dump_proxies(sc, htx))
 				return 0;
 			break;
 		}
@@ -3807,7 +3881,7 @@ static int stats_dump_stat_to_buffer(struct stconn *sc, struct htx *htx,
 				stats_dump_html_end();
 			else
 				stats_dump_json_end();
-			if (!stats_putchk(rep, htx, &trash))
+			if (!stats_putchk(rep, htx))
 				goto full;
 		}
 
@@ -4173,11 +4247,14 @@ static int stats_process_http_post(struct stconn *sc)
 static int stats_send_http_headers(struct stconn *sc, struct htx *htx)
 {
 	struct stream *s = __sc_strm(sc);
-	struct uri_auth *uri = s->be->uri_auth;
+	struct uri_auth *uri;
 	struct appctx *appctx = __sc_appctx(sc);
 	struct show_stat_ctx *ctx = appctx->svcctx;
 	struct htx_sl *sl;
 	unsigned int flags;
+
+	BUG_ON(!ctx->http_px);
+	uri = ctx->http_px->uri_auth;
 
 	flags = (HTX_SL_F_IS_RESP|HTX_SL_F_VER_11|HTX_SL_F_XFER_ENC|HTX_SL_F_XFER_LEN|HTX_SL_F_CHNK);
 	sl = htx_add_stline(htx, HTX_BLK_RES_SL, flags, ist("HTTP/1.1"), ist("200"), ist("OK"));
@@ -4228,11 +4305,14 @@ static int stats_send_http_redirect(struct stconn *sc, struct htx *htx)
 {
 	char scope_txt[STAT_SCOPE_TXT_MAXLEN + sizeof STAT_SCOPE_PATTERN];
 	struct stream *s = __sc_strm(sc);
-	struct uri_auth *uri = s->be->uri_auth;
+	struct uri_auth *uri;
 	struct appctx *appctx = __sc_appctx(sc);
 	struct show_stat_ctx *ctx = appctx->svcctx;
 	struct htx_sl *sl;
 	unsigned int flags;
+
+	BUG_ON(!ctx->http_px);
+	uri = ctx->http_px->uri_auth;
 
 	/* scope_txt = search pattern + search query, ctx->scope_len is always <= STAT_SCOPE_TXT_MAXLEN */
 	scope_txt[0] = 0;
@@ -4259,7 +4339,7 @@ static int stats_send_http_redirect(struct stconn *sc, struct htx *htx)
 		     (ctx->flags & STAT_NO_REFRESH) ? ";norefresh" : "",
 		     scope_txt);
 
-	flags = (HTX_SL_F_IS_RESP|HTX_SL_F_VER_11|HTX_SL_F_XFER_LEN|HTX_SL_F_CHNK);
+	flags = (HTX_SL_F_IS_RESP|HTX_SL_F_VER_11|HTX_SL_F_XFER_LEN|HTX_SL_F_CLEN|HTX_SL_F_BODYLESS);
 	sl = htx_add_stline(htx, HTX_BLK_RES_SL, flags, ist("HTTP/1.1"), ist("303"), ist("See Other"));
 	if (!sl)
 		goto full;
@@ -4306,6 +4386,11 @@ static void http_stats_io_handler(struct appctx *appctx)
 	if (unlikely(sc->state == SC_ST_DIS || sc->state == SC_ST_CLO))
 		goto out;
 
+	if (appctx->st0 != STAT_HTTP_END) {
+		if (!co_data(req))
+			goto wait_request;
+	}
+
 	/* Check if the input buffer is available. */
 	if (!b_size(&res->buf)) {
 		sc_need_room(sc);
@@ -4327,7 +4412,12 @@ static void http_stats_io_handler(struct appctx *appctx)
 	}
 
 	if (appctx->st0 == STAT_HTTP_DUMP) {
-		if (stats_dump_stat_to_buffer(sc, res_htx, s->be->uri_auth))
+		trash_chunk = b_make(trash.area, res->buf.size, 0, 0);
+		/* adjust buffer size to take htx overhead into account,
+		 * make sure to perform this call on an empty buffer
+		 */
+		trash_chunk.size = buf_room_for_htx_data(&trash_chunk);
+		if (stats_dump_stat_to_buffer(sc, res_htx))
 			appctx->st0 = STAT_HTTP_DONE;
 	}
 
@@ -4367,13 +4457,7 @@ static void http_stats_io_handler(struct appctx *appctx)
 			res->flags |= CF_READ_NULL;
 			sc_shutr(sc);
 		}
-
-		/* eat the whole request */
-		if (co_data(req)) {
-			req_htx = htx_from_buf(&req->buf);
-			co_htx_skip(req, req_htx, co_data(req));
-			htx_to_buf(req_htx, &req->buf);
-		}
+		applet_will_consume(appctx);
 	}
 
  out:
@@ -4385,14 +4469,31 @@ static void http_stats_io_handler(struct appctx *appctx)
 	 * emitting large blocks into small TCP windows.
 	 */
 	htx_to_buf(res_htx, &res->buf);
-	if (!channel_is_empty(res))
+	if (appctx->st0 == STAT_HTTP_END) {
+		/* eat the whole request */
+		if (co_data(req)) {
+			req_htx = htx_from_buf(&req->buf);
+			co_htx_skip(req, req_htx, co_data(req));
+			htx_to_buf(req_htx, &req->buf);
+		}
+	}
+	else if (!channel_is_empty(res))
 		applet_wont_consume(appctx);
+	return;
+
+  wait_request:
+	/* Wait for the request before starting to deliver the response */
+	b_reset(&res->buf);
+	applet_need_more_data(appctx);
+	return;
 }
 
 /* Dump all fields from <info> into <out> using the "show info" format (name: value) */
 static int stats_dump_info_fields(struct buffer *out,
-				  const struct field *info, unsigned int flags)
+                                  const struct field *info,
+                                  struct show_stat_ctx *ctx)
 {
+	int flags = ctx->flags;
 	int field;
 
 	for (field = 0; field < INF_TOTAL_FIELDS; field++) {
@@ -4413,8 +4514,10 @@ static int stats_dump_info_fields(struct buffer *out,
 
 /* Dump all fields from <info> into <out> using the "show info typed" format */
 static int stats_dump_typed_info_fields(struct buffer *out,
-					const struct field *info, unsigned int flags)
+                                        const struct field *info,
+                                        struct show_stat_ctx *ctx)
 {
+	int flags = ctx->flags;
 	int field;
 
 	for (field = 0; field < INF_TOTAL_FIELDS; field++) {
@@ -4481,9 +4584,9 @@ int stats_fill_info(struct field *info, int len, uint flags)
 	info[INF_MEMMAX_MB]                      = mkf_u32(FO_CONFIG|FN_LIMIT, global.rlimit_memmax);
 	info[INF_MEMMAX_BYTES]                   = mkf_u32(FO_CONFIG|FN_LIMIT, global.rlimit_memmax * 1048576L);
 	info[INF_POOL_ALLOC_MB]                  = mkf_u32(0, (unsigned)(pool_total_allocated() / 1048576L));
-	info[INF_POOL_ALLOC_BYTES]               = mkf_u32(0, pool_total_allocated());
+	info[INF_POOL_ALLOC_BYTES]               = mkf_u64(0, pool_total_allocated());
 	info[INF_POOL_USED_MB]                   = mkf_u32(0, (unsigned)(pool_total_used() / 1048576L));
-	info[INF_POOL_USED_BYTES]                = mkf_u32(0, pool_total_used());
+	info[INF_POOL_USED_BYTES]                = mkf_u64(0, pool_total_used());
 	info[INF_POOL_FAILED]                    = mkf_u32(FN_COUNTER, pool_total_failures());
 	info[INF_ULIMIT_N]                       = mkf_u32(FO_CONFIG|FN_LIMIT, global.rlimit_nofile);
 	info[INF_MAXSOCK]                        = mkf_u32(FO_CONFIG|FN_LIMIT, global.maxsock);
@@ -4561,22 +4664,33 @@ static int stats_dump_info_to_buffer(struct stconn *sc)
 {
 	struct appctx *appctx = __sc_appctx(sc);
 	struct show_stat_ctx *ctx = appctx->svcctx;
+	int ret;
+	int current_field;
 
 	if (!stats_fill_info(info, INF_TOTAL_FIELDS, ctx->flags))
 		return 0;
 
-	chunk_reset(&trash);
+	chunk_reset(&trash_chunk);
+more:
+	current_field = ctx->field;
 
 	if (ctx->flags & STAT_FMT_TYPED)
-		stats_dump_typed_info_fields(&trash, info, ctx->flags);
+		ret = stats_dump_typed_info_fields(&trash_chunk, info, ctx);
 	else if (ctx->flags & STAT_FMT_JSON)
-		stats_dump_json_info_fields(&trash, info, ctx->flags);
+		ret = stats_dump_json_info_fields(&trash_chunk, info, ctx);
 	else
-		stats_dump_info_fields(&trash, info, ctx->flags);
+		ret = stats_dump_info_fields(&trash_chunk, info, ctx);
 
-	if (applet_putchk(appctx, &trash) == -1)
+	if (applet_putchk(appctx, &trash_chunk) == -1) {
+		/* restore previous field */
+		ctx->field = current_field;
 		return 0;
-
+	}
+	if (ret && ctx->field) {
+		/* partial dump */
+		goto more;
+	}
+	ctx->field = 0;
 	return 1;
 }
 
@@ -4797,14 +4911,23 @@ static void stats_dump_json_schema(struct buffer *out)
  */
 static int stats_dump_json_schema_to_buffer(struct appctx *appctx)
 {
-	chunk_reset(&trash);
 
-	stats_dump_json_schema(&trash);
+	chunk_reset(&trash_chunk);
 
-	if (applet_putchk(appctx, &trash) == -1)
+	stats_dump_json_schema(&trash_chunk);
+
+	if (applet_putchk(appctx, &trash_chunk) == -1)
 		return 0;
 
 	return 1;
+}
+
+static void http_stats_release(struct appctx *appctx)
+{
+	struct show_stat_ctx *ctx = appctx->svcctx;
+
+	if (ctx->px_st == STAT_PX_ST_SV)
+		srv_drop(ctx->obj2);
 }
 
 static int cli_parse_clear_counters(char **args, char *payload, struct appctx *appctx, void *private)
@@ -4929,6 +5052,7 @@ static int cli_parse_show_info(char **args, char *payload, struct appctx *appctx
 	ctx->scope_str = 0;
 	ctx->scope_len = 0;
 	ctx->flags = 0;
+	ctx->field = 0; /* explicit default value */
 
 	while (*args[arg]) {
 		if (strcmp(args[arg], "typed") == 0)
@@ -4952,6 +5076,7 @@ static int cli_parse_show_stat(char **args, char *payload, struct appctx *appctx
 
 	ctx->scope_str = 0;
 	ctx->scope_len = 0;
+	ctx->http_px = NULL; // not under http context
 	ctx->flags = STAT_SHNODE | STAT_SHDESC;
 
 	if ((strm_li(appctx_strm(appctx))->bind_conf->level & ACCESS_LVL_MASK) >= ACCESS_LVL_OPER)
@@ -5010,6 +5135,7 @@ static int cli_parse_show_stat(char **args, char *payload, struct appctx *appctx
 
 static int cli_io_handler_dump_info(struct appctx *appctx)
 {
+	trash_chunk = b_make(trash.area, trash.size, 0, 0);
 	return stats_dump_info_to_buffer(appctx_sc(appctx));
 }
 
@@ -5018,11 +5144,21 @@ static int cli_io_handler_dump_info(struct appctx *appctx)
  */
 static int cli_io_handler_dump_stat(struct appctx *appctx)
 {
-	return stats_dump_stat_to_buffer(appctx_sc(appctx), NULL, NULL);
+	trash_chunk = b_make(trash.area, trash.size, 0, 0);
+	return stats_dump_stat_to_buffer(appctx_sc(appctx), NULL);
+}
+
+static void cli_io_handler_release_stat(struct appctx *appctx)
+{
+	struct show_stat_ctx *ctx = appctx->svcctx;
+
+	if (ctx->px_st == STAT_PX_ST_SV)
+		srv_drop(ctx->obj2);
 }
 
 static int cli_io_handler_dump_json_schema(struct appctx *appctx)
 {
+	trash_chunk = b_make(trash.area, trash.size, 0, 0);
 	return stats_dump_json_schema_to_buffer(appctx);
 }
 
@@ -5264,7 +5400,7 @@ REGISTER_PER_THREAD_FREE(free_trash_counters);
 static struct cli_kw_list cli_kws = {{ },{
 	{ { "clear", "counters",  NULL },      "clear counters [all]                    : clear max statistics counters (or all counters)", cli_parse_clear_counters, NULL, NULL },
 	{ { "show", "info",  NULL },           "show info [desc|json|typed|float]*      : report information about the running process",    cli_parse_show_info, cli_io_handler_dump_info, NULL },
-	{ { "show", "stat",  NULL },           "show stat [desc|json|no-maint|typed|up]*: report counters for each proxy and server",       cli_parse_show_stat, cli_io_handler_dump_stat, NULL },
+	{ { "show", "stat",  NULL },           "show stat [desc|json|no-maint|typed|up]*: report counters for each proxy and server",       cli_parse_show_stat, cli_io_handler_dump_stat, cli_io_handler_release_stat },
 	{ { "show", "schema",  "json", NULL }, "show schema json                        : report schema used for stats",                    NULL, cli_io_handler_dump_json_schema, NULL },
 	{{},}
 }};
@@ -5275,7 +5411,7 @@ struct applet http_stats_applet = {
 	.obj_type = OBJ_TYPE_APPLET,
 	.name = "<STATS>", /* used for logging */
 	.fct = http_stats_io_handler,
-	.release = NULL,
+	.release = http_stats_release,
 };
 
 /*

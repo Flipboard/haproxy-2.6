@@ -116,7 +116,7 @@ int tcp_inspect_request(struct stream *s, struct channel *req, int an_bit)
 	 * - if one rule returns KO, then return KO
 	 */
 
-	if ((req->flags & (CF_EOI|CF_SHUTR|CF_READ_ERROR)) || channel_full(req, global.tune.maxrewrite) ||
+	if ((req->flags & (CF_SHUTR|CF_READ_ERROR)) || channel_full(req, global.tune.maxrewrite) ||
 	    sc_waiting_room(chn_prod(req)) ||
 	    !s->be->tcp_req.inspect_delay || tick_is_expired(s->rules_exp, now_ms)) {
 		partial = SMP_OPT_FINAL;
@@ -173,6 +173,8 @@ resume_execution:
 							send_log(s->be, LOG_WARNING,
 								 "Internal error: yield not allowed if the inspect-delay expired "
 								 "for the tcp-request content actions.");
+							s->last_rule_file = rule->conf.file;
+							s->last_rule_line = rule->conf.line;
 							goto internal;
 						}
 						goto missing_data;
@@ -299,7 +301,7 @@ int tcp_inspect_response(struct stream *s, struct channel *rep, int an_bit)
 	 * - if one rule returns OK, then return OK
 	 * - if one rule returns KO, then return KO
 	 */
-	if ((rep->flags & (CF_EOI|CF_SHUTR|CF_READ_ERROR)) || channel_full(rep, global.tune.maxrewrite) ||
+	if ((rep->flags & (CF_SHUTR|CF_READ_ERROR)) || channel_full(rep, global.tune.maxrewrite) ||
 	    sc_waiting_room(chn_prod(rep)) ||
 	    !s->be->tcp_rep.inspect_delay || tick_is_expired(s->rules_exp, now_ms)) {
 		partial = SMP_OPT_FINAL;
@@ -356,9 +358,10 @@ resume_execution:
 							send_log(s->be, LOG_WARNING,
 								 "Internal error: yield not allowed if the inspect-delay expired "
 								 "for the tcp-response content actions.");
+							s->last_rule_file = rule->conf.file;
+							s->last_rule_line = rule->conf.line;
 							goto internal;
 						}
-						channel_dont_close(rep);
 						goto missing_data;
 					case ACT_RET_DENY:
 						s->last_rule_file = rule->conf.file;
@@ -420,6 +423,7 @@ resume_execution:
 
  missing_data:
 	/* just set the analyser timeout once at the beginning of the response */
+	channel_dont_close(rep);
 	if (!tick_isset(s->rules_exp) && s->be->tcp_rep.inspect_delay)
 		s->rules_exp = tick_add(now_ms, s->be->tcp_rep.inspect_delay);
 	rep->analyse_exp = tick_first((tick_is_expired(rep->analyse_exp, now_ms) ? 0 : rep->analyse_exp), s->rules_exp);

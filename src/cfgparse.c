@@ -71,6 +71,7 @@
 #include <haproxy/namespace.h>
 #include <haproxy/quic_sock.h>
 #include <haproxy/obj_type-t.h>
+#include <haproxy/openssl-compat.h>
 #include <haproxy/peers-t.h>
 #include <haproxy/peers.h>
 #include <haproxy/pool.h>
@@ -113,7 +114,7 @@ static enum default_path_mode {
 	DEFAULT_PATH_ORIGIN,       /* "origin": paths are relative to default_path_origin */
 } default_path_mode;
 
-static char initial_cwd[PATH_MAX];
+char initial_cwd[PATH_MAX];
 static char current_cwd[PATH_MAX];
 
 /* List head of all known configuration keywords */
@@ -801,8 +802,10 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
-		if (alertif_too_many_args(1, file, linenum, args, &err_code))
+		if (alertif_too_many_args(1, file, linenum, args, &err_code)) {
+			err_code |= ERR_ABORT;
 			goto out;
+		}
 
 		err = invalid_char(args[1]);
 		if (err) {
@@ -840,6 +843,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 	}
 	else if (strcmp(args[0], "peer") == 0 ||
 	         strcmp(args[0], "server") == 0) { /* peer or server definition */
+		struct server *prev_srv;
 		int local_peer, peer;
 		int parse_addr = 0;
 
@@ -890,17 +894,41 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 		 * or if we are parsing a "server" line and the current peer is not the local one.
 		 */
 		parse_addr = (peer || !local_peer) ? SRV_PARSE_PARSE_ADDR : 0;
+		prev_srv = curpeers->peers_fe->srv;
 		err_code |= parse_server(file, linenum, args, curpeers->peers_fe, NULL,
 		                         SRV_PARSE_IN_PEER_SECTION|parse_addr|SRV_PARSE_INITIAL_RESOLVE);
-		if (!curpeers->peers_fe->srv) {
-			/* Remove the newly allocated peer. */
-			if (newpeer != curpeers->local) {
-				struct peer *p;
+		if (curpeers->peers_fe->srv == prev_srv) {
+			/* parse_server didn't add a server:
+			 * Remove the newly allocated peer.
+			 */
+			struct peer *p;
 
-				p = curpeers->remote;
-				curpeers->remote = curpeers->remote->next;
-				free(p->id);
-				free(p);
+			/* while it is tolerated to have a "server" line without address, it isn't
+			 * the case for a "peer" line
+			 */
+			if (peer) {
+				ha_warning("parsing [%s:%d] : '%s %s' : ignoring invalid peer definition (missing address:port)\n",
+				           file, linenum, args[0], args[1]);
+				err_code |= ERR_WARN;
+			}
+			else {
+				ha_diag_warning("parsing [%s:%d] : '%s %s' : ignoring server (not a local peer, valid address:port is expected)\n",
+				                file, linenum, args[0], args[1]);
+			}
+
+			p = curpeers->remote;
+			curpeers->remote = curpeers->remote->next;
+			free(p->id);
+			free(p);
+			if (local_peer) {
+				/* we only get there with incomplete "peer"
+				 * line for local peer (missing address):
+				 *
+				 * reset curpeers and curpeers fields
+				 * that are local peer related
+				 */
+				curpeers->local = NULL;
+				ha_free(&curpeers->peers_fe->id);
 			}
 			goto out;
 		}
@@ -977,17 +1005,6 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
-		other = stktable_find_by_name(args[1]);
-		if (other) {
-			ha_alert("parsing [%s:%d] : stick-table name '%s' conflicts with table declared in %s '%s' at %s:%d.\n",
-				 file, linenum, args[1],
-				 other->proxy ? proxy_cap_str(other->proxy->cap) : "peers",
-				 other->proxy ? other->id : other->peers.p->id,
-				 other->conf.file, other->conf.line);
-			err_code |= ERR_ALERT | ERR_FATAL;
-			goto out;
-		}
-
 		/* Build the stick-table name, concatenating the "peers" section name
 		 * followed by a '/' character and the table name argument.
 		 */
@@ -1017,6 +1034,18 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
+
+		other = stktable_find_by_name(trash.area);
+		if (other) {
+			ha_alert("parsing [%s:%d] : stick-table name '%s' conflicts with table declared in %s '%s' at %s:%d.\n",
+			         file, linenum, args[1],
+			         other->proxy ? proxy_cap_str(other->proxy->cap) : "peers",
+			         other->proxy ? other->id : other->peers.p->id,
+			         other->conf.file, other->conf.line);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
 
 		err_code |= parse_stick_table(file, linenum, args, t, id, id + prefix_len, curpeers);
 		if (err_code & ERR_FATAL) {
@@ -1371,6 +1400,15 @@ cfg_parse_users(const char *file, int linenum, char **args, int kwm)
 
 		while (*args[cur_arg]) {
 			if (strcmp(args[cur_arg], "users") == 0) {
+				if (ag->groupusers) {
+					ha_alert("parsing [%s:%d]: 'users' option already defined in '%s' name '%s'.\n",
+						 file, linenum, args[0], args[1]);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					free(ag->groupusers);
+					free(ag->name);
+					free(ag);
+					goto out;
+				}
 				ag->groupusers = strdup(args[cur_arg + 1]);
 				cur_arg += 2;
 				continue;
@@ -2205,11 +2243,6 @@ next_line:
 		err_code |= ERR_ALERT | ERR_FATAL | ERR_ABORT;
 	}
 
-	if (*initial_cwd && chdir(initial_cwd) == -1) {
-		ha_alert("Impossible to get back to initial directory '%s' : %s\n", initial_cwd, strerror(errno));
-		err_code |= ERR_ALERT | ERR_FATAL;
-	}
-
 err:
 	ha_free(&cfg_scope);
 	cursection = NULL;
@@ -2402,6 +2435,9 @@ static int numa_detect_topology()
 	BUG_ON(ndomains > MAXMEMDOM);
 	ha_cpuset_zero(&node_cpu_set);
 
+	if (ndomains < 2)
+		goto leave;
+
 	/*
 	 * We retrieve the first active valid CPU domain
 	 * with active cpu and binding it, we returns
@@ -2427,7 +2463,7 @@ static int numa_detect_topology()
 		}
 		break;
 	}
-
+ leave:
 	return ha_cpuset_count(&node_cpu_set);
 }
 
@@ -2456,6 +2492,7 @@ int check_config_validity()
 	struct proxy *init_proxies_list = NULL;
 	struct stktable *t;
 	struct server *newsrv = NULL;
+	struct mt_list *back1, back2;
 	int err_code = 0;
 	unsigned int next_pxid = 1;
 	struct bind_conf *bind_conf;
@@ -2463,15 +2500,11 @@ int check_config_validity()
 	struct cfg_postparser *postparser;
 	struct resolvers *curr_resolvers = NULL;
 	int i;
-	int diag_no_cluster_secret = 0;
 
 	bind_conf = NULL;
 	/*
 	 * Now, check for the integrity of all that we have collected.
 	 */
-
-	/* will be needed further to delay some tasks */
-	clock_update_date(0,1);
 
 	if (!global.tune.max_http_hdr)
 		global.tune.max_http_hdr = MAX_HTTP_HDR;
@@ -2499,6 +2532,12 @@ int check_config_validity()
 #endif
 			global.nbthread = numa_cores ? numa_cores :
 			                               thread_cpus_enabled_at_boot;
+
+			if (global.nbthread > MAX_THREADS) {
+				ha_diag_warning("nbthread not set, found %d CPUs, limiting to %d threads. Please set nbthreads in the global section to silence this warning.\n",
+					   global.nbthread, MAX_THREADS);
+				global.nbthread = MAX_THREADS;
+			}
 		}
 		all_threads_mask = nbits(global.nbthread);
 #endif
@@ -2806,7 +2845,7 @@ init_proxies_list_stage1:
 				ha_warning("'%s' will be ignored for %s '%s' (requires 'option httpchk').\n",
 					   "send-state", proxy_type_str(curproxy), curproxy->id);
 				err_code |= ERR_WARN;
-				curproxy->options &= ~PR_O2_CHK_SNDST;
+				curproxy->options2 &= ~PR_O2_CHK_SNDST;
 			}
 		}
 
@@ -3264,12 +3303,12 @@ out_uri_auth_compat:
 			                            LOG_OPT_MANDATORY|LOG_OPT_MERGE_SPACES,
 			                            SMP_VAL_FE_LOG_END, &err)) {
 				ha_alert("Parsing [%s:%d]: failed to parse log-format-sd : %s.\n",
-					 curproxy->conf.lfs_file, curproxy->conf.lfs_line, err);
+					 curproxy->conf.lfsd_file, curproxy->conf.lfsd_line, err);
 				free(err);
 				cfgerr++;
 			} else if (!add_to_logformat_list(NULL, NULL, LF_SEPARATOR, &curproxy->logformat_sd, &err)) {
 				ha_alert("Parsing [%s:%d]: failed to parse log-format-sd : %s.\n",
-					 curproxy->conf.lfs_file, curproxy->conf.lfs_line, err);
+					 curproxy->conf.lfsd_file, curproxy->conf.lfsd_line, err);
 				free(err);
 				cfgerr++;
 			}
@@ -3501,16 +3540,7 @@ out_uri_auth_compat:
 		while (newsrv != NULL) {
 			set_usermsgs_ctx(newsrv->conf.file, newsrv->conf.line, &newsrv->obj_type);
 
-			if (newsrv->minconn > newsrv->maxconn) {
-				/* Only 'minconn' was specified, or it was higher than or equal
-				 * to 'maxconn'. Let's turn this into maxconn and clean it, as
-				 * this will avoid further useless expensive computations.
-				 */
-				newsrv->maxconn = newsrv->minconn;
-			} else if (newsrv->maxconn && !newsrv->minconn) {
-				/* minconn was not specified, so we set it to maxconn */
-				newsrv->minconn = newsrv->maxconn;
-			}
+			srv_minmax_conn_apply(newsrv);
 
 			/* this will also properly set the transport layer for
 			 * prod and checks
@@ -3796,7 +3826,7 @@ out_uri_auth_compat:
 		/* Check the mux protocols, if any, for each listener and server
 		 * attached to the current proxy */
 		list_for_each_entry(bind_conf, &curproxy->conf.bind, by_fe) {
-			int mode = (1 << (curproxy->mode == PR_MODE_HTTP));
+			int mode = conn_pr_mode_to_proto_mode(curproxy->mode);
 			const struct mux_proto_list *mux_ent;
 
 			if (!bind_conf->mux_proto) {
@@ -3847,7 +3877,7 @@ out_uri_auth_compat:
 			bind_conf->mux_proto = mux_ent;
 		}
 		for (newsrv = curproxy->srv; newsrv; newsrv = newsrv->next) {
-			int mode = (1 << (curproxy->mode == PR_MODE_HTTP));
+			int mode = conn_pr_mode_to_proto_mode(curproxy->mode);
 			const struct mux_proto_list *mux_ent;
 
 			if (!newsrv->mux_proto)
@@ -3923,7 +3953,7 @@ out_uri_auth_compat:
 
 	/* we must finish to initialize certain things on the servers */
 
-	list_for_each_entry(newsrv, &servers_list, global_list) {
+	mt_list_for_each_entry_safe(newsrv, &servers_list, global_list, back1, back2) {
 		/* initialize idle conns lists */
 		if (srv_init_per_thr(newsrv) == -1) {
 			ha_alert("parsing [%s:%d] : failed to allocate per-thread lists for server '%s'.\n",
@@ -4008,25 +4038,14 @@ init_proxies_list_stage2:
 					memprintf(&listener->name, "sock-%d", listener->luid);
 			}
 
-			if (curproxy->options & PR_O_TCP_NOLING)
-				listener->options |= LI_O_NOLINGER;
-			if (!listener->maxaccept)
-				listener->maxaccept = global.tune.maxaccept ? global.tune.maxaccept : MAX_ACCEPT;
-
 			/* listener accept callback */
 			listener->accept = session_accept_fd;
 #ifdef USE_QUIC
 			/* override the accept callback for QUIC listeners. */
 			if (listener->flags & LI_F_QUIC_LISTENER) {
-				if (!global.cluster_secret) {
-					diag_no_cluster_secret = 1;
-					if (listener->bind_conf->options & BC_O_QUIC_FORCE_RETRY) {
-						ha_alert("QUIC listener with quic-force-retry requires global cluster-secret to be set.\n");
-						cfgerr++;
-					}
-				}
-
 				li_init_per_thr(listener);
+				/* quic_conn are counted against maxconn. */
+				listener->bind_conf->options |= BC_O_XPRT_MAXCONN;
 			}
 #endif
 
@@ -4074,12 +4093,6 @@ init_proxies_list_stage2:
 		/* check if list is not null to avoid infinite loop */
 		if (init_proxies_list)
 			goto init_proxies_list_stage2;
-	}
-
-	if (diag_no_cluster_secret) {
-		ha_diag_warning("Generating a random cluster secret. "
-		                "You should define your own one in the configuration to ensure consistency "
-		                "after reload/restart or across your whole cluster.\n");
 	}
 
 	/*
@@ -4200,7 +4213,7 @@ init_proxies_list_stage2:
 		if (t->proxy)
 			continue;
 		if (!stktable_init(t)) {
-			ha_alert("Proxy '%s': failed to initialize stick-table.\n", t->id);
+			ha_alert("Parsing [%s:%d]: failed to initialize '%s' stick-table.\n", t->conf.file, t->conf.line, t->id);
 			cfgerr++;
 		}
 	}
@@ -4391,7 +4404,8 @@ void cfg_restore_sections(struct list *backup_sections)
 /* dumps all registered keywords by section on stdout */
 void cfg_dump_registered_keywords()
 {
-	const char* sect_names[] = { "", "global", "listen", "userlist", "peers", 0 };
+	/*                             CFG_GLOBAL, CFG_LISTEN, CFG_USERLIST, CFG_PEERS, CFG_CRTLIST */
+	const char* sect_names[] = { "", "global", "listen", "userlist", "peers", "crt-list", 0 };
 	int section;
 	int index;
 
@@ -4418,22 +4432,24 @@ void cfg_dump_registered_keywords()
 			extern struct list tcp_req_conn_keywords, tcp_req_sess_keywords,
 				tcp_req_cont_keywords, tcp_res_cont_keywords;
 			extern struct bind_kw_list bind_keywords;
-			extern struct ssl_bind_kw ssl_bind_kws[] __maybe_unused;
 			extern struct srv_kw_list srv_keywords;
 			struct bind_kw_list *bkwl;
 			struct srv_kw_list *skwl;
 			const struct bind_kw *bkwp, *bkwn;
 			const struct srv_kw *skwp, *skwn;
-			const struct ssl_bind_kw *sbkwp __maybe_unused, *sbkwn __maybe_unused;
 			const struct cfg_opt *coptp, *coptn;
 
+			/* display the non-ssl keywords */
 			for (bkwn = bkwp = NULL;; bkwp = bkwn) {
 				list_for_each_entry(bkwl, &bind_keywords.list, list) {
-					for (index = 0; bkwl->kw[index].kw != NULL; index++)
+					if (strcmp(bkwl->scope, "SSL") == 0) /* skip SSL keywords */
+						continue;
+					for (index = 0; bkwl->kw[index].kw != NULL; index++) {
 						if (strordered(bkwp ? bkwp->kw : NULL,
 							       bkwl->kw[index].kw,
 							       bkwn != bkwp ? bkwn->kw : NULL))
 							bkwn = &bkwl->kw[index];
+					}
 				}
 				if (bkwn == bkwp)
 					break;
@@ -4443,24 +4459,31 @@ void cfg_dump_registered_keywords()
 				else
 					printf("\tbind <addr> %s +%d\n", bkwn->kw, bkwn->skip);
 			}
-
 #if defined(USE_OPENSSL)
-			for (sbkwn = sbkwp = NULL;; sbkwp = sbkwn) {
-				for (index = 0; ssl_bind_kws[index].kw != NULL; index++) {
-					if (strordered(sbkwp ? sbkwp->kw : NULL,
-						       ssl_bind_kws[index].kw,
-						       sbkwn != sbkwp ? sbkwn->kw : NULL))
-						sbkwn = &ssl_bind_kws[index];
+			/* displays the "ssl" keywords */
+			for (bkwn = bkwp = NULL;; bkwp = bkwn) {
+				list_for_each_entry(bkwl, &bind_keywords.list, list) {
+					if (strcmp(bkwl->scope, "SSL") != 0) /* skip non-SSL keywords */
+						continue;
+					for (index = 0; bkwl->kw[index].kw != NULL; index++) {
+						if (strordered(bkwp ? bkwp->kw : NULL,
+						               bkwl->kw[index].kw,
+						               bkwn != bkwp ? bkwn->kw : NULL))
+							bkwn = &bkwl->kw[index];
+					}
 				}
-				if (sbkwn == sbkwp)
+				if (bkwn == bkwp)
 					break;
-				if (!sbkwn->skip)
-					printf("\tbind <addr> ssl %s\n", sbkwn->kw);
+
+				if (strcmp(bkwn->kw, "ssl") == 0) /* skip "bind <addr> ssl ssl" */
+					continue;
+
+				if (!bkwn->skip)
+					printf("\tbind <addr> ssl %s\n", bkwn->kw);
 				else
-					printf("\tbind <addr> ssl %s +%d\n", sbkwn->kw, sbkwn->skip);
+					printf("\tbind <addr> ssl %s +%d\n", bkwn->kw, bkwn->skip);
 			}
 #endif
-
 			for (skwn = skwp = NULL;; skwp = skwn) {
 				list_for_each_entry(skwl, &srv_keywords.list, list) {
 					for (index = 0; skwl->kw[index].kw != NULL; index++)
@@ -4510,6 +4533,29 @@ void cfg_dump_registered_keywords()
 			dump_act_rules(&http_req_keywords.list,       "\thttp-request ");
 			dump_act_rules(&http_res_keywords.list,       "\thttp-response ");
 			dump_act_rules(&http_after_res_keywords.list, "\thttp-after-response ");
+		}
+		if (section == CFG_CRTLIST) {
+			/* displays the keyword available for the crt-lists */
+			extern struct ssl_crtlist_kw ssl_crtlist_kws[] __maybe_unused;
+			const struct ssl_crtlist_kw *sbkwp __maybe_unused, *sbkwn __maybe_unused;
+
+#if defined(USE_OPENSSL)
+			for (sbkwn = sbkwp = NULL;; sbkwp = sbkwn) {
+				for (index = 0; ssl_crtlist_kws[index].kw != NULL; index++) {
+					if (strordered(sbkwp ? sbkwp->kw : NULL,
+						       ssl_crtlist_kws[index].kw,
+						       sbkwn != sbkwp ? sbkwn->kw : NULL))
+						sbkwn = &ssl_crtlist_kws[index];
+				}
+				if (sbkwn == sbkwp)
+					break;
+				if (!sbkwn->skip)
+					printf("\t%s\n", sbkwn->kw);
+				else
+					printf("\t%s +%d\n", sbkwn->kw, sbkwn->skip);
+			}
+#endif
+
 		}
 	}
 }

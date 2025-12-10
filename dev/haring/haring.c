@@ -23,6 +23,8 @@
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
  * OTHER DEALINGS IN THE SOFTWARE.
  */
+/* we do not implement BUG_ON() */
+#undef DEBUG_STRICT
 
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -37,6 +39,7 @@
 
 int force = 0; // force access to a different layout
 int lfremap = 0; // remap LF in traces
+int repair = 0; // repair file
 
 
 /* display the message and exit with the code */
@@ -61,6 +64,7 @@ __attribute__((noreturn)) void usage(int code, const char *arg0)
 	    "options :\n"
 	    "  -f           : force accessing a non-matching layout for 'ring struct'\n"
 	    "  -l           : replace LF in contents with CR VT\n"
+	    "  -r           : \"repair\" corrupted file (actively search for message boundaries)\n"
 	    "\n"
 	    "", arg0);
 }
@@ -146,6 +150,14 @@ int dump_ring(struct ring *ring, size_t ofs, int flags)
 		 * stop before the end.
 		 */
 		while (ofs + 1 < b_data(&buf)) {
+			if (unlikely(repair && *b_peek(&buf, ofs))) {
+				/* in repair mode we consider that we could have landed
+				 * in the middle of a message so we skip all bytes till
+				 * the next zero.
+				 */
+				ofs++;
+				continue;
+			}
 			cnt = 1;
 			len = b_peek_varint(&buf, ofs + cnt, &msg_len);
 			if (!len)
@@ -219,6 +231,8 @@ int main(int argc, char **argv)
 			force = 1;
 		else if (strcmp(argv[0], "-l") == 0)
 			lfremap = 1;
+		else if (strcmp(argv[0], "-r") == 0)
+			repair = 1;
 		else if (strcmp(argv[0], "--") == 0)
 			break;
 		else

@@ -42,9 +42,16 @@ void quic_tls_keys_hexdump(struct buffer *buf,
                            const struct quic_tls_secrets *secs)
 {
 	int i;
-	size_t aead_keylen = (size_t)EVP_CIPHER_key_length(secs->aead);
-	size_t aead_ivlen = (size_t)EVP_CIPHER_iv_length(secs->aead);
-	size_t hp_len = (size_t)EVP_CIPHER_key_length(secs->hp);
+	size_t aead_keylen;
+	size_t aead_ivlen;
+	size_t hp_len;
+
+	if (!secs->aead || !secs->hp)
+		return;
+
+	aead_keylen = (size_t)EVP_CIPHER_key_length(secs->aead);
+	aead_ivlen = (size_t)EVP_CIPHER_iv_length(secs->aead);
+	hp_len = (size_t)EVP_CIPHER_key_length(secs->hp);
 
 	chunk_appendf(buf, "\n          key=");
 	for (i = 0; i < aead_keylen; i++)
@@ -608,16 +615,14 @@ int quic_tls_derive_retry_token_secret(const EVP_MD *md,
                                        const unsigned char *secret, size_t secretlen)
 {
 	unsigned char tmpkey[QUIC_TLS_KEY_LEN];
-	const unsigned char tmpkey_label[] = "retry token";
 	const unsigned char key_label[] = "retry token key";
 	const unsigned char iv_label[] = "retry token iv";
 
-	if (!quic_hkdf_extract_and_expand(md, tmpkey, sizeof tmpkey,
-	                                  secret, secretlen, salt, saltlen,
-	                                  tmpkey_label, sizeof tmpkey_label - 1) ||
+	if (!quic_hkdf_extract(md, tmpkey, sizeof tmpkey,
+	                       secret, secretlen, salt, saltlen) ||
 	    !quic_hkdf_expand(md, key, keylen, tmpkey, sizeof tmpkey,
 	                      key_label, sizeof key_label - 1) ||
-	    !quic_hkdf_expand(md, iv, ivlen, secret, secretlen,
+	    !quic_hkdf_expand(md, iv, ivlen, tmpkey, sizeof tmpkey,
 	                      iv_label, sizeof iv_label - 1))
 		return 0;
 

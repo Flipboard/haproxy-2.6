@@ -178,7 +178,11 @@ static int h1_postparse_req_hdrs(struct h1m *h1m, union h1_sl *h1sl, struct htx 
 
 
 	flags = h1m_htx_sl_flags(h1m);
-	if ((flags & (HTX_SL_F_CONN_UPG|HTX_SL_F_BODYLESS)) == HTX_SL_F_CONN_UPG) {
+
+	/* Remove Upgrade header in problematic cases :
+	 * - "h2c" or "h2" token specified as token
+	 */
+	if ((h1m->flags & (H1_MF_CONN_UPG|H1_MF_UPG_H2C)) == (H1_MF_CONN_UPG|H1_MF_UPG_H2C)) {
 		int i;
 
 		for (i = 0; hdrs[i].n.len; i++) {
@@ -188,6 +192,7 @@ static int h1_postparse_req_hdrs(struct h1m *h1m, union h1_sl *h1sl, struct htx 
 		h1m->flags &=~ H1_MF_CONN_UPG;
 		flags &= ~HTX_SL_F_CONN_UPG;
 	}
+
 	sl = htx_add_stline(htx, HTX_BLK_REQ_SL, flags, meth, uri, vsn);
 	if (!sl || !htx_add_all_headers(htx, hdrs))
 		goto error;
@@ -256,10 +261,10 @@ static int h1_postparse_res_hdrs(struct h1m *h1m, union h1_sl *h1sl, struct htx 
 			if (isteqi(hdrs[hdr].n, ist("status"))) {
 				code = http_parse_status_val(hdrs[hdr].v, &status, &reason);
 			}
-			else if (isteqi(hdrs[hdr].n, ist("location"))) {
+			else if (isteqi(hdrs[hdr].n, ist("location")) && !code) {
 				code = 302;
 				status = ist("302");
-				reason = ist("Moved Temporarily");
+				reason = ist("Found");
 			}
 		}
 		if (!code) {
@@ -278,6 +283,9 @@ static int h1_postparse_res_hdrs(struct h1m *h1m, union h1_sl *h1sl, struct htx 
 			goto error;
 		goto output_full;
 	}
+
+	if ((h1m->flags & (H1_MF_CONN_UPG|H1_MF_UPG_WEBSOCKET)) && code != 101)
+		h1m->flags &= ~(H1_MF_CONN_UPG|H1_MF_UPG_WEBSOCKET);
 
 	if (((h1m->flags & H1_MF_METH_CONNECT) && code >= 200 && code < 300) || code == 101) {
 		h1m->flags &= ~(H1_MF_CLEN|H1_MF_CHNK);
@@ -414,6 +422,8 @@ static size_t h1_copy_msg_data(struct htx **dsthtx, struct buffer *srcbuf, size_
 	/* Be prepared to create at least one HTX block by reserving its size
 	 * and adjust <count> accordingly.
 	 */
+	if (max <= sizeof(struct htx_blk))
+		goto end;
 	max -= sizeof(struct htx_blk);
 	if (count > max)
 		count = max;
@@ -504,8 +514,7 @@ static size_t h1_parse_chunk(struct h1m *h1m, struct htx **dsthtx,
 	case H1_MSG_DATA:
 	  new_chunk:
 		used = htx_used_space(*dsthtx);
-
-		if (b_data(srcbuf) == ofs || !lmax)
+		if (b_data(srcbuf) == ofs || lmax <= sizeof(struct htx_blk))
 			break;
 
 		sz =  b_data(srcbuf) - ofs;
@@ -585,6 +594,10 @@ static size_t h1_parse_full_contig_chunks(struct h1m *h1m, struct htx **dsthtx,
 	uint64_t chksz;
 	struct htx_ret htxret;
 
+	lmax = *max;
+	if (lmax <= sizeof(struct htx_blk))
+		goto out;
+
 	/* source info :
 	 *  start : pointer at <ofs> position
 	 *  end   : pointer marking the end of data to parse
@@ -613,7 +626,6 @@ static size_t h1_parse_full_contig_chunks(struct h1m *h1m, struct htx **dsthtx,
 	 * from <max>. Then we must adjust it if it exceeds the free size in the
 	 * block.
 	 */
-	lmax = *max;
 	if (!dpos)
 		lmax -= sizeof(struct htx_blk);
 	if (lmax > htx_get_blksz(htxret.blk) - dpos)
@@ -683,11 +695,6 @@ static size_t h1_parse_full_contig_chunks(struct h1m *h1m, struct htx **dsthtx,
 				++ridx;
 				break;
 			}
-			else if (end[ridx] == '\n') {
-				/* Parse LF only, nothing more to do */
-				++ridx;
-				break;
-			}
 			else if (likely(end[ridx] == ';')) {
 				/* chunk extension, ends at next CRLF */
 				if (!++ridx)
@@ -700,7 +707,7 @@ static size_t h1_parse_full_contig_chunks(struct h1m *h1m, struct htx **dsthtx,
 				continue;
 			}
 			else {
-				/* all other characters are unexpected */
+				/* all other characters are unexpected, especially LF alone */
 				goto parsing_error;
 			}
 		}
@@ -730,9 +737,12 @@ static size_t h1_parse_full_contig_chunks(struct h1m *h1m, struct htx **dsthtx,
 		dpos += chksz;
 		ridx += chksz;
 
-		/* Parse CRLF or LF (always present) */
-		if (likely(end[ridx] == '\r'))
-			++ridx;
+		/* Parse CRLF */
+		if (unlikely(end[ridx] != '\r')) {
+			h1m->state = H1_MSG_CHUNK_CRLF;
+			goto parsing_error;
+		}
+		++ridx;
 		if (end[ridx] != '\n') {
 			h1m->state = H1_MSG_CHUNK_CRLF;
 			goto parsing_error;
@@ -826,7 +836,7 @@ size_t h1_parse_msg_data(struct h1m *h1m, struct htx **dsthtx,
 {
 	size_t sz, total = 0;
 
-	if (b_data(srcbuf) == ofs || !max)
+	if (b_data(srcbuf) == ofs)
 		return 0;
 
 	if (h1m->flags & H1_MF_CLEN) {
@@ -892,6 +902,7 @@ int h1_parse_msg_tlrs(struct h1m *h1m, struct htx *dsthtx,
 		b_slow_realign_ofs(srcbuf, trash.area, 0);
 
 	tlr_h1m.flags = (H1_MF_NO_PHDR|H1_MF_HDRS_ONLY);
+	tlr_h1m.err_pos = h1m->err_pos;
 	ret = h1_headers_to_hdr_list(b_peek(srcbuf, ofs), b_tail(srcbuf),
 				     hdrs, sizeof(hdrs)/sizeof(hdrs[0]), &tlr_h1m, NULL);
 	if (ret <= 0) {
@@ -968,6 +979,7 @@ int h1_format_htx_reqline(const struct htx_sl *sl, struct buffer *chk)
 int h1_format_htx_stline(const struct htx_sl *sl, struct buffer *chk)
 {
 	size_t sz = chk->data;
+	struct ist reason;
 
 	if (HTX_SL_LEN(sl) + 4 > b_room(chk))
 		return 0;
@@ -980,10 +992,15 @@ int h1_format_htx_stline(const struct htx_sl *sl, struct buffer *chk)
 		if (!chunk_memcat(chk, HTX_SL_RES_VPTR(sl), HTX_SL_RES_VLEN(sl)))
 			goto full;
 	}
+
+	reason = htx_sl_res_reason(sl);
+	if (istlen(reason) == 0)
+		reason = ist(http_get_reason(sl->info.res.status));
+
 	if (!chunk_memcat(chk, " ", 1) ||
 	    !chunk_memcat(chk, HTX_SL_RES_CPTR(sl), HTX_SL_RES_CLEN(sl)) ||
 	    !chunk_memcat(chk, " ", 1) ||
-	    !chunk_memcat(chk, HTX_SL_RES_RPTR(sl), HTX_SL_RES_RLEN(sl)) ||
+	    !chunk_memcat(chk, istptr(reason), istlen(reason)) ||
 	    !chunk_memcat(chk, "\r\n", 2))
 		goto full;
 

@@ -46,18 +46,20 @@ struct appctx *appctx_new(struct applet *applet, struct sedesc *sedesc, unsigned
 	appctx->obj_type = OBJ_TYPE_APPCTX;
 	appctx->applet = applet;
 	appctx->sess = NULL;
-	if (!sedesc) {
-		sedesc = sedesc_new();
-		if (!sedesc)
-			goto fail_endp;
-		sedesc->se = appctx;
-		se_fl_set(sedesc, SE_FL_T_APPLET | SE_FL_ORPHAN);
-	}
-	appctx->sedesc = sedesc;
 
 	appctx->t = task_new(thread_mask);
 	if (unlikely(!appctx->t))
 		goto fail_task;
+
+	if (!sedesc) {
+		sedesc = sedesc_new();
+		if (unlikely(!sedesc))
+			goto fail_endp;
+		sedesc->se = appctx;
+		se_fl_set(sedesc, SE_FL_T_APPLET | SE_FL_ORPHAN);
+	}
+
+	appctx->sedesc = sedesc;
 	appctx->t->process = task_run_applet;
 	appctx->t->context = appctx;
 
@@ -68,9 +70,9 @@ struct appctx *appctx_new(struct applet *applet, struct sedesc *sedesc, unsigned
 	_HA_ATOMIC_INC(&nb_applets);
 	return appctx;
 
-  fail_task:
-	sedesc_free(appctx->sedesc);
   fail_endp:
+	task_destroy(appctx->t);
+  fail_task:
 	pool_free(pool_head_appctx, appctx);
   fail_appctx:
 	return NULL;
@@ -118,7 +120,7 @@ void appctx_free_on_early_error(struct appctx *appctx)
 		stream_free(appctx_strm(appctx));
 		return;
 	}
-	appctx_free(appctx);
+	__appctx_free(appctx);
 }
 
 /* reserves a command context of at least <size> bytes in the <appctx>, for
@@ -159,6 +161,9 @@ void appctx_shut(struct appctx *appctx)
 
 	if (appctx->applet->release)
 		appctx->applet->release(appctx);
+
+	if (LIST_INLIST(&appctx->buffer_wait.list))
+		LIST_DEL_INIT(&appctx->buffer_wait.list);
 
 	se_fl_set(appctx->sedesc, SE_FL_SHRR | SE_FL_SHWN);
 }

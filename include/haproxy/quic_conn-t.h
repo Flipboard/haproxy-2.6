@@ -90,9 +90,11 @@ typedef unsigned long long ull;
 /* Salt length used to derive retry token secret */
 #define QUIC_RETRY_TOKEN_SALTLEN       16 /* bytes */
 /* Retry token duration */
-#define QUIC_RETRY_DURATION_MS      10000
+#define QUIC_RETRY_DURATION_SEC       10
 /* Default Retry threshold */
 #define QUIC_DFLT_RETRY_THRESHOLD     100 /* in connection openings */
+/* Default ratio value applied to a dynamic Packet reorder threshold. */
+#define QUIC_DFLT_REORDER_RATIO        50 /* in percent */
 
 /*
  *  0                   1                   2                   3
@@ -170,8 +172,15 @@ enum quic_pkt_type {
  */
 #define QUIC_CONN_MAX_PACKET  64
 
-#define QUIC_STATELESS_RESET_PACKET_HEADER_LEN 5
-#define QUIC_STATELESS_RESET_PACKET_MINLEN     (22 + QUIC_HAP_CID_LEN)
+/* RFC 9000 10.3. Stateless Reset
+ *
+ * To entities other than its intended recipient, a Stateless Reset will
+ * appear to be a packet with a short header. For the Stateless Reset to
+ * appear as a valid QUIC packet, the Unpredictable Bits field needs to
+ * include at least 38 bits of data (or 5 bytes, less the two fixed
+ * bits).
+ */
+#define QUIC_STATELESS_RESET_PACKET_MINLEN     (5 + QUIC_STATELESS_RESET_TOKEN_LEN)
 
 #define           QUIC_EV_CONN_NEW       (1ULL << 0)
 #define           QUIC_EV_CONN_INIT      (1ULL << 1)
@@ -221,6 +230,7 @@ enum quic_pkt_type {
 #define           QUIC_EV_CONN_IDLE_TIMER (1ULL << 45)
 #define           QUIC_EV_CONN_SUB       (1ULL << 46)
 #define           QUIC_EV_CONN_ELEVELSEL (1ULL << 47)
+#define           QUIC_EV_CONN_KILL      (1ULL << 49)
 
 /* Similar to kernel min()/max() definitions. */
 #define QUIC_MIN(a, b) ({ \
@@ -310,16 +320,6 @@ struct quic_arng_node {
 	uint64_t last;
 };
 
-/* Structure to maintain a set of ACK ranges to be used to build ACK frames. */
-struct quic_arngs {
-	/* ebtree of ACK ranges organized by their first value. */
-	struct eb_root root;
-	/* The number of ACK ranges is this tree */
-	size_t sz;
-	/* The number of bytes required to encode this ACK ranges lists. */
-	size_t enc_sz;
-};
-
 /* Flag the packet number space as having received a packet */
 #define QUIC_FL_PKTNS_PKT_RECEIVED  (1UL << 0)
 /* Flag the packet number space as requiring an ACK frame to be sent. */
@@ -333,39 +333,6 @@ struct quic_arngs {
 
 /* The maximum number of dgrams which may be sent upon PTO expirations. */
 #define QUIC_MAX_NB_PTO_DGRAMS         2
-
-/* QUIC packet number space */
-struct quic_pktns {
-	struct {
-		/* List of frames to send. */
-		struct list frms;
-		/* Next packet number to use for transmissions. */
-		int64_t next_pn;
-		/* The packet which has been sent. */
-		struct eb_root pkts;
-		/* The time the most recent ack-eliciting packer was sent. */
-		unsigned int time_of_last_eliciting;
-		/* The time this packet number space has experienced packet loss. */
-		unsigned int loss_time;
-		/* Boolean to denote if we must send probe packet. */
-		unsigned int pto_probe;
-		/* In flight bytes for this packet number space. */
-		size_t in_flight;
-		/* The acknowledgement delay of the packet with the largest packet number */
-		uint64_t ack_delay;
-	} tx;
-	struct {
-		/* Largest packet number */
-		int64_t largest_pn;
-		/* Largest acked sent packet. */
-		int64_t largest_acked_pn;
-		struct quic_arngs arngs;
-		unsigned int nb_aepkts_since_last_ack;
-		/* The time the packet with the largest packet number was received */
-		uint64_t largest_time_received;
-	} rx;
-	unsigned int flags;
-};
 
 /* QUIC datagram */
 struct quic_dgram {
@@ -536,32 +503,6 @@ struct quic_cstream {
 	struct qc_stream_desc *desc;
 };
 
-struct quic_enc_level {
-	enum ssl_encryption_level_t level;
-	struct quic_tls_ctx tls_ctx;
-	struct {
-		/* The packets received by the listener I/O handler
-		   with header protection removed. */
-		struct eb_root pkts;
-		/* Liste of QUIC packets with protected header. */
-		struct list pqpkts;
-	} rx;
-	struct {
-		struct {
-			struct quic_crypto_buf **bufs;
-			/* The number of element in use in the previous array. */
-			size_t nb_buf;
-			/* The total size of the CRYPTO data stored in the CRYPTO buffers. */
-			size_t sz;
-			/* The offset of the CRYPT0 data stream. */
-			uint64_t offset;
-		} crypto;
-	} tx;
-	/* Crypto data stream */
-	struct quic_cstream *cstream;
-	struct quic_pktns *pktns;
-};
-
 struct quic_path {
 	/* Control congestion. */
 	struct quic_cc cc;
@@ -572,6 +513,7 @@ struct quic_path {
 	size_t mtu;
 	/* Congestion window. */
 	uint64_t cwnd;
+	uint64_t mcwnd;
 	/* Minimum congestion window. */
 	uint64_t min_cwnd;
 	/* Prepared data to be sent (in bytes). */
@@ -604,7 +546,6 @@ enum qc_mux_state {
 
 /* Flags at connection level */
 #define QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED  (1U << 0)
-#define QUIC_FL_CONN_IO_CB_WAKEUP                (1U << 1)
 #define QUIC_FL_CONN_POST_HANDSHAKE_FRAMES_BUILT (1U << 2)
 #define QUIC_FL_CONN_LISTENER                    (1U << 3)
 #define QUIC_FL_CONN_ACCEPT_REGISTERED           (1U << 4)
@@ -616,11 +557,15 @@ enum qc_mux_state {
 /* gap here */
 #define QUIC_FL_CONN_HALF_OPEN_CNT_DECREMENTED   (1U << 11) /* The half-open connection counter was decremented */
 #define QUIC_FL_CONN_HANDSHAKE_SPEED_UP          (1U << 12) /* Handshake speeding up was done */
+#define QUIC_FL_CONN_TO_KILL                     (1U << 24) /* Unusable connection, to be killed */
+#define QUIC_FL_CONN_TX_TP_RECEIVED              (1U << 25) /* Peer transport parameters have been received (used for the transmitting part) */
+#define QUIC_FL_CONN_FINALIZED                   (1U << 26) /* QUIC connection finalized (functional, ready to send/receive) */
 #define QUIC_FL_CONN_NOTIFY_CLOSE                (1U << 27) /* MUX notified about quic-conn imminent closure (idle-timeout or CONNECTION_CLOSE emission/reception) */
 #define QUIC_FL_CONN_EXP_TIMER                   (1U << 28) /* timer has expired, quic-conn can be freed */
 #define QUIC_FL_CONN_CLOSING                     (1U << 29)
 #define QUIC_FL_CONN_DRAINING                    (1U << 30)
 #define QUIC_FL_CONN_IMMEDIATE_CLOSE             (1U << 31)
+
 struct quic_conn {
 	const struct quic_version *original_version;
 	const struct quic_version *negotiated_version;

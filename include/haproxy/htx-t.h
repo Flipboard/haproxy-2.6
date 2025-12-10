@@ -138,7 +138,15 @@
 #define HTX_SL_F_NORMALIZED_URI 0x00000800 /* The received URI is normalized (an implicit absolute-uri form) */
 #define HTX_SL_F_CONN_UPG       0x00001000 /* The message contains "connection: upgrade" header */
 
-/* HTX flags */
+/* Overhead induced by HTX on buffers during transfers. In addition to the size
+ * of the HTX structure itself, and meta data for one block, another block is
+ * accounted to favored zero-copy xfer.
+ */
+#define HTX_BUF_OVERHEAD     (sizeof(struct htx) + 2 * sizeof(struct htx_blk))
+
+/* HTX flags.
+ * Please also update the htx_show_flags() function below in case of changes.
+ */
 #define HTX_FL_NONE              0x00000000
 #define HTX_FL_PARSING_ERROR     0x00000001 /* Set when a parsing error occurred */
 #define HTX_FL_PROCESSING_ERROR  0x00000002 /* Set when a processing error occurred */
@@ -173,7 +181,9 @@ struct htx_ret {
 	struct htx_blk *blk; /* An HTX block */
 };
 
-/* HTX start-line */
+/* HTX start-line. This is almost always aligned except in rare cases where
+ * parts of the URI are rewritten, hence the packed attribute.
+ */
 struct htx_sl {
 	unsigned int flags; /* HTX_SL_F_* */
 	union {
@@ -185,11 +195,16 @@ struct htx_sl {
 		} res;
 	} info;
 
-	/* XXX 2 bytes unused */
+	/* XXX 2 bytes unused, must be present to keep the rest aligned
+	 * (check with "pahole -C htx_sl" that len[] is aligned in case
+	 * of doubt).
+	 */
+	char __pad_1;
+	char __pad_2;
 
 	unsigned int len[3]; /* length of different parts of the start-line */
 	char         l[VAR_ARRAY];
-};
+} __attribute__((packed));
 
 /* Internal representation of an HTTP message */
 struct htx {

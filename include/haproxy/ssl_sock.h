@@ -37,7 +37,7 @@ extern struct eb_root crtlists_tree;
 extern struct eb_root cafile_tree;
 extern int sctl_ex_index;
 extern struct global_ssl global_ssl;
-extern struct ssl_bind_kw ssl_bind_kws[];
+extern struct ssl_crtlist_kw ssl_crtlist_kws[];
 extern struct methodVersions methodVersions[];
 __decl_thread(extern HA_SPINLOCK_T ckch_lock);
 extern struct pool_head *pool_head_ssl_capture;
@@ -116,6 +116,7 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg);
 int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *priv);
 #endif
 
+int increment_sslconn();
 SSL_CTX *ssl_sock_assign_generated_cert(unsigned int key, struct bind_conf *bind_conf, SSL *ssl);
 SSL_CTX *ssl_sock_get_generated_cert(unsigned int key, struct bind_conf *bind_conf);
 int ssl_sock_set_generated_cert(SSL_CTX *ctx, unsigned int key, struct bind_conf *bind_conf);
@@ -158,6 +159,29 @@ int ssl_sock_register_msg_callback(ssl_sock_msg_callback_func func);
 
 SSL *ssl_sock_get_ssl_object(struct connection *conn);
 
+static inline int cert_ignerr_bitfield_get(const unsigned long long *bitfield, int bit_index)
+{
+	int byte_index = bit_index >> 6;
+	int val = 0;
+
+	if (byte_index < IGNERR_BF_SIZE)
+		val = bitfield[byte_index] & (1ULL << (bit_index & 0x3F));
+
+	return val != 0;
+}
+
+static inline void cert_ignerr_bitfield_set(unsigned long long *bitfield, int bit_index)
+{
+	int byte_index = bit_index >> 6;
+
+	if (byte_index < IGNERR_BF_SIZE)
+		bitfield[byte_index] |= (1ULL << (bit_index & 0x3F));
+}
+
+static inline void cert_ignerr_bitfield_set_all(unsigned long long *bitfield)
+{
+	memset(bitfield, -1, IGNERR_BF_SIZE*sizeof(*bitfield));
+}
 
 #endif /* USE_OPENSSL */
 #endif /* _HAPROXY_SSL_SOCK_H */

@@ -74,13 +74,18 @@ enum srv_state {
 enum srv_admin {
 	SRV_ADMF_FMAINT    = 0x01,        /* the server was explicitly forced into maintenance */
 	SRV_ADMF_IMAINT    = 0x02,        /* the server has inherited the maintenance status from a tracked server */
-	SRV_ADMF_MAINT     = 0x23,        /* mask to check if any maintenance flag is present */
 	SRV_ADMF_CMAINT    = 0x04,        /* the server is in maintenance because of the configuration */
 	SRV_ADMF_FDRAIN    = 0x08,        /* the server was explicitly forced into drain state */
 	SRV_ADMF_IDRAIN    = 0x10,        /* the server has inherited the drain status from a tracked server */
 	SRV_ADMF_DRAIN     = 0x18,        /* mask to check if any drain flag is present */
 	SRV_ADMF_RMAINT    = 0x20,        /* the server is down because of an IP address resolution failure */
-	SRV_ADMF_HMAINT    = 0x40,        /* the server FQDN has been set from socket stats */
+
+	SRV_ADMF_MAINT     = 0x23,        /* mask to check if any maintenance flag except CMAINT is present */
+
+	SRV_ADMF_FQDN_CHANGED = 0x40,     /* Special value: set (and never removed) if the server fqdn has
+	                                   * changed (from cli or resolvers) since its initial value from
+	                                   * config. This flag is exported and restored through state-file
+					   */
 } __attribute__((packed));
 
 /* options for servers' "init-addr" parameter
@@ -149,10 +154,12 @@ enum srv_initaddr {
 #define SRV_F_DYNAMIC      0x1000        /* dynamic server instantiated at runtime */
 #define SRV_F_NON_PURGEABLE 0x2000       /* this server cannot be removed at runtime */
 #define SRV_F_DEFSRV_USE_SSL 0x4000      /* default-server uses SSL */
+#define SRV_F_DELETED 0x8000             /* srv is deleted but not yet purged */
 
 /* configured server options for send-proxy (server->pp_opts) */
 #define SRV_PP_V1               0x0001   /* proxy protocol version 1 */
 #define SRV_PP_V2               0x0002   /* proxy protocol version 2 */
+#define SRV_PP_ENABLED          0x0003   /* proxy protocol version 1 or version 2 */
 #define SRV_PP_V2_SSL           0x0004   /* proxy protocol version 2 with SSL */
 #define SRV_PP_V2_SSL_CN        0x0008   /* proxy protocol version 2 with CN */
 #define SRV_PP_V2_SSL_KEY_ALG   0x0010   /* proxy protocol version 2 with cert key algorithm */
@@ -228,8 +235,9 @@ struct server {
 	signed char use_ssl;		        /* ssl enabled (1: on, 0: disabled, -1 forced off)  */
 	unsigned int flags;                     /* server flags (SRV_F_*) */
 	unsigned int pp_opts;                   /* proxy protocol options (SRV_PP_*) */
-	struct list global_list;                /* attach point in the global servers_list */
+	struct mt_list global_list;             /* attach point in the global servers_list */
 	struct server *next;
+	struct mt_list prev_deleted;            /* deleted servers with 'next' ptr pointing to us */
 	int cklen;				/* the len of the cookie, to speed up checks */
 	int rdr_len;				/* the length of the redirection prefix */
 	char *cookie;				/* the id set in the cookie */
@@ -284,6 +292,8 @@ struct server {
 	unsigned int next_takeover;             /* thread ID to try to steal connections from next time */
 
 	struct queue queue;			/* pending connections */
+	struct mt_list sess_conns;		/* list of private conns managed by a session on this server */
+	unsigned int dequeuing;                 /* non-zero = dequeuing in progress (atomic) */
 
 	/* Element below are usd by LB algorithms and must be doable in
 	 * parallel to other threads reusing connections above.
@@ -364,10 +374,6 @@ struct server {
 		char *alpn_str;                 /* ALPN protocol string */
 		int alpn_len;                   /* ALPN protocol string length */
 	} ssl_ctx;
-#ifdef USE_QUIC
-	struct quic_transport_params quic_params; /* QUIC transport parameters */
-	struct eb_root cids;        /* QUIC connections IDs. */
-#endif
 	struct resolv_srvrq *srvrq;		/* Pointer representing the DNS SRV requeest, if any */
 	struct list srv_rec_item;		/* to attach server to a srv record item */
 	struct list ip_rec_item;		/* to attach server to a A or AAAA record item */

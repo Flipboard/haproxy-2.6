@@ -35,6 +35,7 @@ struct acl_cond;
 #define CFG_LISTEN	2
 #define CFG_USERLIST	3
 #define CFG_PEERS	4
+#define CFG_CRTLIST	5
 
 /* various keyword modifiers */
 enum kw_mod {
@@ -94,6 +95,8 @@ extern int cfg_maxconn;
 extern char *cfg_scope;
 extern struct cfg_kw_list cfg_keywords;
 extern char *cursection;
+
+extern char initial_cwd[PATH_MAX];
 
 int cfg_parse_global(const char *file, int linenum, char **args, int inv);
 int cfg_parse_listen(const char *file, int linenum, char **args, int inv);

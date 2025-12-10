@@ -11,6 +11,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <import/sha1.h>
+
 #include <haproxy/buf.h>
 #include <haproxy/cfgparse.h>
 #ifdef USE_CPU_AFFINITY
@@ -21,6 +23,8 @@
 #include <haproxy/log.h>
 #include <haproxy/peers.h>
 #include <haproxy/tools.h>
+
+int cluster_secret_isset;
 
 /* some keywords that are still being parsed using strcmp() and are not
  * registered anywhere. They are used as suggestions for mistyped words.
@@ -487,6 +491,9 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 		}
 	}
 	else if (strcmp(args[0], "cluster-secret") == 0) {
+		blk_SHA_CTX sha1_ctx;
+		unsigned char sha1_out[20];
+
 		if (alertif_too_many_args(1, file, linenum, args, &err_code))
 			goto out;
 		if (*args[1] == 0) {
@@ -494,13 +501,18 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
-		if (global.cluster_secret != NULL) {
+		if (cluster_secret_isset) {
 			ha_alert("parsing [%s:%d] : '%s' already specified. Continuing.\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT;
 			goto out;
 		}
-		ha_free(&global.cluster_secret);
-		global.cluster_secret = strdup(args[1]);
+
+		blk_SHA1_Init(&sha1_ctx);
+		blk_SHA1_Update(&sha1_ctx, args[1], strlen(args[1]));
+		blk_SHA1_Final(sha1_out, &sha1_ctx);
+		BUG_ON(sizeof sha1_out < sizeof global.cluster_secret);
+		memcpy(global.cluster_secret, sha1_out, sizeof global.cluster_secret);
+		cluster_secret_isset = 1;
 	}
 	else if (strcmp(args[0], "uid") == 0) {
 		if (alertif_too_many_args(1, file, linenum, args, &err_code))
@@ -542,9 +554,16 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 		}
 	}
 	else if (strcmp(args[0], "external-check") == 0) {
-		if (alertif_too_many_args(0, file, linenum, args, &err_code))
+		if (alertif_too_many_args(1, file, linenum, args, &err_code))
 			goto out;
 		global.external_check = 1;
+		if (strcmp(args[1], "preserve-env") == 0) {
+			global.external_check = 2;
+		} else if (*args[1]) {
+			ha_alert("parsing [%s:%d] : '%s' only supports 'preserve-env' as an argument, found '%s'.\n", file, linenum, args[0], args[1]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+	                goto out;
+		}
 	}
 	/* user/group name handling */
 	else if (strcmp(args[0], "user") == 0) {
@@ -1143,7 +1162,7 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 #endif /* ! USE_CPU_AFFINITY */
 	}
 	else if (strcmp(args[0], "setenv") == 0 || strcmp(args[0], "presetenv") == 0) {
-		if (alertif_too_many_args(3, file, linenum, args, &err_code))
+		if (alertif_too_many_args(2, file, linenum, args, &err_code))
 			goto out;
 
 		if (*(args[2]) == 0) {
@@ -1302,3 +1321,59 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 	return err_code;
 }
 
+/* Parser for harden.reject-privileged-ports.{tcp|quic}. */
+static int cfg_parse_reject_privileged_ports(char **args, int section_type,
+                                             struct proxy *curpx,
+                                             const struct proxy *defpx,
+                                             const char *file, int line, char **err)
+{
+	struct ist proto;
+	char onoff;
+
+	if (!*(args[1])) {
+		memprintf(err, "'%s' expects either 'on' or 'off'.", args[0]);
+		return -1;
+	}
+
+	proto = ist(args[0]);
+	while (istlen(istfind(proto, '.')))
+		proto = istadv(istfind(proto, '.'), 1);
+
+	if (strcmp(args[1], "on") == 0) {
+		onoff = 1;
+	}
+	else if (strcmp(args[1], "off") == 0) {
+		onoff = 0;
+	}
+	else {
+		memprintf(err, "'%s' expects either 'on' or 'off'.", args[0]);
+		return -1;
+	}
+
+	if (istmatch(proto, ist("tcp"))) {
+		if (!onoff)
+			global.clt_privileged_ports |= HA_PROTO_TCP;
+		else
+			global.clt_privileged_ports &= ~HA_PROTO_TCP;
+	}
+	else if (istmatch(proto, ist("quic"))) {
+		if (!onoff)
+			global.clt_privileged_ports |= HA_PROTO_QUIC;
+		else
+			global.clt_privileged_ports &= ~HA_PROTO_QUIC;
+	}
+	else {
+		memprintf(err, "invalid protocol for '%s'.", args[0]);
+		return -1;
+	}
+
+	return 0;
+}
+
+static struct cfg_kw_list cfg_kws = {ILH, {
+	{ CFG_GLOBAL, "harden.reject-privileged-ports.tcp",  cfg_parse_reject_privileged_ports },
+	{ CFG_GLOBAL, "harden.reject-privileged-ports.quic", cfg_parse_reject_privileged_ports },
+	{ 0, NULL, NULL },
+}};
+
+INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);

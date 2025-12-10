@@ -1410,7 +1410,7 @@ static int fcgi_set_default_param(struct fcgi_conn *fconn, struct fcgi_strm *fst
 		 * captured
 		 */
 		params->scriptname = ist2(path.ptr + pmatch[1].rm_so, pmatch[1].rm_eo - pmatch[1].rm_so);
-		if (!(params->mask & FCGI_SP_PATH_INFO) &&  (pmatch[2].rm_so == -1 || pmatch[2].rm_eo == -1))
+		if (!(params->mask & FCGI_SP_PATH_INFO) && !(pmatch[2].rm_so == -1 || pmatch[2].rm_eo == -1))
 			params->pathinfo = ist2(path.ptr + pmatch[2].rm_so, pmatch[2].rm_eo - pmatch[2].rm_so);
 
 	  check_index:
@@ -2467,7 +2467,7 @@ static int fcgi_strm_handle_stderr(struct fcgi_conn *fconn, struct fcgi_strm *fs
 		goto fail; // incomplete record
 
 	chunk_reset(&trash);
-	ret = b_xfer(&trash, dbuf, MIN(b_room(&trash), fconn->drl));
+	ret = b_force_xfer(&trash, dbuf, MIN(b_room(&trash), fconn->drl));
 	if (!ret)
 		goto fail;
 	fconn->drl -= ret;
@@ -3043,7 +3043,7 @@ struct task *fcgi_io_cb(struct task *t, void *ctx, unsigned int state)
 		conn = fconn->conn;
 		TRACE_POINT(FCGI_EV_FCONN_WAKE, conn);
 
-		conn_in_list = conn->flags & CO_FL_LIST_MASK;
+		conn_in_list = conn_get_idle_flag(conn);
 		if (conn_in_list)
 			conn_delete_from_tree(&conn->hash_node->node);
 
@@ -3694,7 +3694,7 @@ static void fcgi_detach(struct sedesc *sd)
 			}
 			else if (!fconn->conn->hash_node->node.node.leaf_p &&
 				 fcgi_avail_streams(fconn->conn) > 0 && objt_server(fconn->conn->target) &&
-				 !LIST_INLIST(&fconn->conn->session_list)) {
+				 !LIST_INLIST(&fconn->conn->sess_el)) {
 				eb64_insert(&__objt_server(fconn->conn->target)->per_thr[tid].avail_conns,
 				            &fconn->conn->hash_node->node);
 			}
@@ -3963,8 +3963,15 @@ static size_t fcgi_rcv_buf(struct stconn *sc, struct buffer *buf, size_t count, 
 	else
 		TRACE_STATE("fstrm rxbuf not allocated", FCGI_EV_STRM_RECV|FCGI_EV_FSTRM_BLK, fconn->conn, fstrm);
 
-	if (b_data(&fstrm->rxbuf))
-		se_fl_set(fstrm->sd, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
+	if (b_data(&fstrm->rxbuf)) {
+		/* If the channel buffer is not empty, consider the mux is
+		 * blocked because it needs more room. But if the channel buffer
+		 * is empty, it means partial data were received and the mux
+		 * needs to receive more data to be able to parse it.
+		 */
+		if (b_data(buf))
+			se_fl_set(fstrm->sd, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
+	}
 	else {
 		se_fl_clr(fstrm->sd, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
 		if (fstrm->state == FCGI_SS_ERROR || (fstrm->h1m.state == H1_MSG_DONE)) {
@@ -4105,6 +4112,15 @@ static size_t fcgi_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, 
 				}
 				break;
 
+			case HTX_BLK_EOT:
+				if (htx_is_unique_blk(htx, blk) && (htx->flags & HTX_FL_EOM)) {
+					TRACE_PROTO("sending FCGI STDIN record", FCGI_EV_TX_RECORD|FCGI_EV_TX_STDIN, fconn->conn, fstrm, htx);
+					ret = fcgi_strm_send_empty_stdin(fconn, fstrm);
+					if (!ret)
+						goto done;
+				}
+				/* fall through */
+
 			default:
 			  remove_blk:
 				htx_remove_blk(htx, blk);
@@ -4224,9 +4240,19 @@ static int fcgi_takeover(struct connection *conn, int orig_tid)
 {
 	struct fcgi_conn *fcgi = conn->ctx;
 	struct task *task;
+	struct task *new_task;
+	struct tasklet *new_tasklet;
+
+	/* Pre-allocate tasks so that we don't have to roll back after the xprt
+	 * has been migrated.
+	 */
+	new_task = task_new_here();
+	new_tasklet = tasklet_new();
+	if (!new_task || !new_tasklet)
+		goto fail;
 
 	if (fd_takeover(conn->handle.fd, conn) != 0)
-		return -1;
+		goto fail;
 
 	if (conn->xprt->takeover && conn->xprt->takeover(conn, conn->xprt_ctx, orig_tid) != 0) {
 		/* We failed to takeover the xprt, even if the connection may
@@ -4236,44 +4262,49 @@ static int fcgi_takeover(struct connection *conn, int orig_tid)
 		 */
 		conn->flags |= CO_FL_ERROR;
 		tasklet_wakeup_on(fcgi->wait_event.tasklet, orig_tid);
-		return -1;
+		goto fail;
 	}
 
 	if (fcgi->wait_event.events)
 		fcgi->conn->xprt->unsubscribe(fcgi->conn, fcgi->conn->xprt_ctx,
 		    fcgi->wait_event.events, &fcgi->wait_event);
+
+	task = fcgi->task;
+	if (task) {
+		/* only assign a task if there was already one, otherwise
+		 * the preallocated new task will be released.
+		 */
+		task->context = NULL;
+		fcgi->task = NULL;
+		__ha_barrier_store();
+		task_kill(task);
+
+		fcgi->task = new_task;
+		new_task = NULL;
+		fcgi->task->process = fcgi_timeout_task;
+		fcgi->task->context = fcgi;
+	}
+
 	/* To let the tasklet know it should free itself, and do nothing else,
 	 * set its context to NULL;
 	 */
 	fcgi->wait_event.tasklet->context = NULL;
 	tasklet_wakeup_on(fcgi->wait_event.tasklet, orig_tid);
 
-	task = fcgi->task;
-	if (task) {
-		task->context = NULL;
-		fcgi->task = NULL;
-		__ha_barrier_store();
-		task_kill(task);
-
-		fcgi->task = task_new_here();
-		if (!fcgi->task) {
-			fcgi_release(fcgi);
-			return -1;
-		}
-		fcgi->task->process = fcgi_timeout_task;
-		fcgi->task->context = fcgi;
-	}
-	fcgi->wait_event.tasklet = tasklet_new();
-	if (!fcgi->wait_event.tasklet) {
-		fcgi_release(fcgi);
-		return -1;
-	}
+	fcgi->wait_event.tasklet = new_tasklet;
 	fcgi->wait_event.tasklet->process = fcgi_io_cb;
 	fcgi->wait_event.tasklet->context = fcgi;
 	fcgi->conn->xprt->subscribe(fcgi->conn, fcgi->conn->xprt_ctx,
 		                    SUB_RETRY_RECV, &fcgi->wait_event);
 
+	if (new_task)
+		__task_free(new_task);
 	return 0;
+ fail:
+	if (new_task)
+		__task_free(new_task);
+	tasklet_free(new_tasklet);
+	return -1;
 }
 
 /****************************************/

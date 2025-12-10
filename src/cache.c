@@ -155,7 +155,7 @@ struct cache_st {
 struct cache_entry {
 	unsigned int complete;    /* An entry won't be valid until complete is not null. */
 	unsigned int latest_validation;     /* latest validation date */
-	unsigned int expire;      /* expiration date */
+	unsigned int expire;      /* expiration date (wall clock time) */
 	unsigned int age;         /* Origin server "Age" header value */
 
 	struct eb32_node eb;     /* ebtree node used to hold the cache object */
@@ -207,7 +207,7 @@ struct cache_entry *entry_exist(struct cache *cache, char *hash)
 	if (memcmp(entry->hash, hash, sizeof(entry->hash)))
 		return NULL;
 
-	if (entry->expire > now.tv_sec) {
+	if (entry->expire > date.tv_sec) {
 		return entry;
 	} else {
 		delete_entry(entry);
@@ -268,7 +268,7 @@ struct cache_entry *secondary_entry_exist(struct cache *cache, struct cache_entr
 		 * when we find them. Calling delete_entry would be too costly
 		 * so we simply call eb32_delete. The secondary_entry count will
 		 * be updated when we try to insert a new entry to this list. */
-		if (entry->expire <= now.tv_sec) {
+		if (entry->expire <= date.tv_sec) {
 			eb32_delete(&entry->eb);
 			entry->eb.key = 0;
 		}
@@ -277,7 +277,7 @@ struct cache_entry *secondary_entry_exist(struct cache *cache, struct cache_entr
 	}
 
 	/* Expired entry */
-	if (entry && entry->expire <= now.tv_sec) {
+	if (entry && entry->expire <= date.tv_sec) {
 		eb32_delete(&entry->eb);
 		entry->eb.key = 0;
 		entry = NULL;
@@ -302,7 +302,7 @@ static unsigned int clear_expired_duplicates(struct eb32_node **dup_tail)
 	while (prev) {
 		entry = container_of(prev, struct cache_entry, eb);
 		prev = eb32_prev_dup(prev);
-		if (entry->expire <= now.tv_sec) {
+		if (entry->expire <= date.tv_sec) {
 			eb32_delete(&entry->eb);
 			entry->eb.key = 0;
 		}
@@ -334,7 +334,7 @@ static struct eb32_node *insert_entry(struct cache *cache, struct cache_entry *n
 	struct eb32_node *prev = NULL;
 	struct cache_entry *entry = NULL;
 	unsigned int entry_count = 0;
-	unsigned int last_clear_ts = now.tv_sec;
+	unsigned int last_clear_ts = date.tv_sec;
 
 	struct eb32_node *node = eb32_insert(&cache->entries, &new_entry->eb);
 
@@ -357,7 +357,7 @@ static struct eb32_node *insert_entry(struct cache *cache, struct cache_entry *n
 			 * space. In order to avoid going over the same list too
 			 * often, we first check the timestamp of the last check
 			 * performed. */
-			if (last_clear_ts == now.tv_sec) {
+			if (last_clear_ts == date.tv_sec) {
 				/* Too many entries for this primary key, clear the
 				 * one that was inserted. */
 				eb32_delete(node);
@@ -370,7 +370,7 @@ static struct eb32_node *insert_entry(struct cache *cache, struct cache_entry *n
 				/* Still too many entries for this primary key, delete
 				 * the newly inserted one. */
 				entry = container_of(prev, struct cache_entry, eb);
-				entry->last_clear_ts = now.tv_sec;
+				entry->last_clear_ts = date.tv_sec;
 				eb32_delete(node);
 				node->key = 0;
 				return NULL;
@@ -536,7 +536,17 @@ cache_store_strm_deinit(struct stream *s, struct filter *filter)
 	/* Everything should be released in the http_end filter, but we need to do it
 	 * there too, in case of errors */
 	if (st && st->first_block) {
+		struct cache_entry *object = (struct cache_entry *)st->first_block->data;
+
 		shctx_lock(shctx);
+		if (!object->complete) {
+			/* The stream was closed but the 'complete' flag was not
+			 * set which means that cache_store_http_end was not
+			 * called. The stream must have been closed before we
+			 * could store the full answer in the cache.
+			 */
+			delete_entry(object);
+		}
 		shctx_row_dec_hot(shctx, st->first_block);
 		shctx_unlock(shctx);
 	}
@@ -829,8 +839,8 @@ int http_calc_maxage(struct stream *s, struct cache *cache, int *true_maxage)
 				/* A request having an expiring date earlier
 				 * than the current date should be considered as
 				 * stale. */
-				expires = (expires_val >= now.tv_sec) ?
-					(expires_val - now.tv_sec) : 0;
+				expires = (expires_val >= date.tv_sec) ?
+					(expires_val - date.tv_sec) : 0;
 			}
 			else {
 				/* Following RFC 7234#5.3, an invalid date
@@ -904,7 +914,7 @@ static time_t get_last_modified_time(struct htx *htx)
 	/* Fallback on the current time if no "Last-Modified" or "Date" header
 	 * was found. */
 	if (!last_modified)
-		last_modified = now.tv_sec;
+		last_modified = date.tv_sec;
 
 	return last_modified;
 }
@@ -950,7 +960,7 @@ static int http_check_vary_header(struct htx *htx, unsigned int *vary_signature)
  * "vary" on the accept-encoding value.
  * Returns 0 if we found a known encoding in the response, -1 otherwise.
  */
-static int set_secondary_key_encoding(struct htx *htx, char *secondary_key)
+static int set_secondary_key_encoding(struct htx *htx, unsigned int vary_signature, char *secondary_key)
 {
 	unsigned int resp_encoding_bitmap = 0;
 	const struct vary_hashing_information *info = vary_information;
@@ -959,6 +969,11 @@ static int set_secondary_key_encoding(struct htx *htx, char *secondary_key)
 	unsigned int hash_info_count = sizeof(vary_information)/sizeof(*vary_information);
 	unsigned int encoding_value;
 	struct http_hdr_ctx ctx = { .blk = NULL };
+
+	/* We must not set the accept encoding part of the secondary signature
+	 * if the response does not vary on 'Accept Encoding'. */
+	if (!(vary_signature & VARY_ACCEPT_ENCODING))
+		return 0;
 
 	/* Look for the accept-encoding part of the secondary_key. */
 	while (count < hash_info_count && info->value != VARY_ACCEPT_ENCODING) {
@@ -1101,7 +1116,7 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 
 	http_check_response_for_cacheability(s, &s->res);
 
-	if (!(txn->flags & TX_CACHEABLE) || !(txn->flags & TX_CACHE_COOK) || (txn->flags & TX_CACHE_IGNORE))
+	if (!(txn->flags & TX_CACHEABLE) || !(txn->flags & TX_CACHE_COOK))
 		goto out;
 
 	shctx_lock(shctx);
@@ -1138,7 +1153,7 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	 * is set by the end of this function (in case of concurrent accesses to
 	 * the same resource). This way the second access will find an existing
 	 * but not yet usable entry in the tree and will avoid storing its data. */
-	object->expire = now.tv_sec + 2;
+	object->expire = date.tv_sec + 2;
 
 	memcpy(object->hash, txn->cache_hash, sizeof(object->hash));
 	if (vary_signature)
@@ -1218,7 +1233,7 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	 * We will not cache a response that has an unknown encoding (not
 	 * explicitly supported in parse_encoding_value function). */
 	if (cache->vary_processing_enabled && vary_signature)
-		if (set_secondary_key_encoding(htx, object->secondary_key))
+		if (set_secondary_key_encoding(htx, vary_signature, object->secondary_key))
 		    goto out;
 
 	shctx_lock(shctx);
@@ -1242,8 +1257,8 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	if (cache_ctx) {
 		cache_ctx->first_block = first;
 		/* store latest value and expiration time */
-		object->latest_validation = now.tv_sec;
-		object->expire = now.tv_sec + effective_maxage;
+		object->latest_validation = date.tv_sec;
+		object->expire = date.tv_sec + effective_maxage;
 		return ACT_RET_CONT;
 	}
 
@@ -1440,7 +1455,7 @@ static int htx_cache_add_age_hdr(struct appctx *appctx, struct htx *htx)
 	char *end;
 
 	chunk_reset(&trash);
-	age = MAX(0, (int)(now.tv_sec - cache_ptr->latest_validation)) + cache_ptr->age;
+	age = MAX(0, (int)(date.tv_sec - cache_ptr->latest_validation)) + cache_ptr->age;
 	if (unlikely(age > CACHE_ENTRY_MAX_AGE))
 		age = CACHE_ENTRY_MAX_AGE;
 	end = ultoa_o(age, b_head(&trash), b_size(&trash));
@@ -1469,21 +1484,23 @@ static void http_cache_io_handler(struct appctx *appctx)
 	if (unlikely(sc->state == SC_ST_DIS || sc->state == SC_ST_CLO))
 		goto out;
 
-	/* Check if the input buffer is available. */
-	if (!b_size(&res->buf)) {
-		sc_need_room(sc);
-		goto out;
-	}
-
 	if (res->flags & (CF_SHUTW|CF_SHUTR|CF_SHUTW_NOW))
 		appctx->st0 = HTX_CACHE_END;
 
 	if (appctx->st0 == HTX_CACHE_INIT) {
+		if (!co_data(req))
+			goto wait_request;
 		ctx->next = block_ptr(cache_ptr);
 		ctx->offset = sizeof(*cache_ptr);
 		ctx->sent = 0;
 		ctx->rem_data = 0;
 		appctx->st0 = HTX_CACHE_HEADER;
+	}
+
+	/* Check if the input buffer is available. */
+	if (!b_size(&res->buf)) {
+		sc_need_room(sc);
+		goto out;
 	}
 
 	if (appctx->st0 == HTX_CACHE_HEADER) {
@@ -1549,6 +1566,12 @@ static void http_cache_io_handler(struct appctx *appctx)
 		co_htx_skip(req, req_htx, co_data(req));
 		htx_to_buf(req_htx, &req->buf);
 	}
+	return;
+
+  wait_request:
+	/* Wait for the request before starting to deliver the response */
+	b_reset(&res->buf);
+	applet_need_more_data(appctx);
 	return;
 
   error:
@@ -1802,8 +1825,10 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 
 	shctx_lock(shctx_ptr(cache));
 	res = entry_exist(cache, s->txn->cache_hash);
-	/* We must not use an entry that is not complete. */
-	if (res && res->complete) {
+	/* We must not use an entry that is not complete but the check will be
+	 * performed after we look for a potential secondary entry (in case of
+	 * Vary). */
+	if (res) {
 		struct appctx *appctx;
 		entry_block = block_ptr(res);
 		shctx_row_inc_hot(shctx_ptr(cache), entry_block);
@@ -1830,9 +1855,11 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 				res = NULL;
 		}
 
-		/* We looked for a valid secondary entry and could not find one,
-		 * the request must be forwarded to the server. */
-		if (!res) {
+		/* We either looked for a valid secondary entry and could not
+		 * find one, or the entry we want to use is not complete. We
+		 * can't use the cache's entry and must forward the request to
+		 * the server. */
+		if (!res || !res->complete) {
 			shctx_lock(shctx_ptr(cache));
 			shctx_row_dec_hot(shctx_ptr(cache), entry_block);
 			shctx_unlock(shctx_ptr(cache));
@@ -2629,13 +2656,13 @@ static int cli_io_handler_show_cache(struct appctx *appctx)
 			entry = container_of(node, struct cache_entry, eb);
 			next_key = node->key + 1;
 
-			if (entry->expire > now.tv_sec) {
+			if (entry->expire > date.tv_sec) {
 				chunk_printf(&trash, "%p hash:%u vary:0x", entry, read_u32(entry->hash));
 				for (i = 0; i < HTTP_CACHE_SEC_KEY_LEN; ++i)
 					chunk_appendf(&trash, "%02x", (unsigned char)entry->secondary_key[i]);
 				chunk_appendf(&trash, " size:%u (%u blocks), refcount:%u, expire:%d\n",
 					      block_ptr(entry)->len, block_ptr(entry)->block_count,
-					      block_ptr(entry)->refcount, entry->expire - (int)now.tv_sec);
+					      block_ptr(entry)->refcount, entry->expire - (int)date.tv_sec);
 			} else {
 				/* time to remove that one */
 				delete_entry(entry);

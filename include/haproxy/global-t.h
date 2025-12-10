@@ -76,6 +76,8 @@
 #define GTUNE_DISABLE_H2_WEBSOCKET (1<<21)
 #define GTUNE_DISABLE_ACTIVE_CLOSE (1<<22)
 
+extern int cluster_secret_isset; /* non zero means a cluster secret was initiliazed */
+
 /* SSL server verify mode */
 enum {
 	SSL_SERVER_VERIFY_NONE = 0,
@@ -94,7 +96,7 @@ struct proxy;
 struct global {
 	int uid;
 	int gid;
-	int external_check;
+	int external_check;             /* 0=disabled, 1=enabled, 2=enabled with env */
 	int nbthread;
 	int mode;
 	unsigned int hard_stop_after;	/* maximum time allowed to perform a soft-stop */
@@ -130,7 +132,7 @@ struct global {
 	char *log_send_hostname;   /* set hostname in syslog header */
 	char *server_state_base;   /* path to a directory where server state files can be found */
 	char *server_state_file;   /* path to the file where server states are loaded from */
-	char *cluster_secret;      /* Secret defined as ASCII string */
+	unsigned char cluster_secret[16]; /* 128 bits of an SHA1 digest of a secret defined as ASCII string */
 	struct {
 		int maxpollevents; /* max number of poll events at once */
 		int maxaccept;     /* max number of consecutive accept() */
@@ -162,6 +164,7 @@ struct global {
 		unsigned int quic_frontend_max_idle_timeout;
 		unsigned int quic_frontend_max_streams_bidi;
 		unsigned int quic_retry_threshold;
+		unsigned int quic_reorder_ratio;
 		unsigned int quic_streams_buf;
 #endif /* USE_QUIC */
 	} tune;
@@ -175,6 +178,8 @@ struct global {
 	} unix_bind;
 	struct proxy *cli_fe;           /* the frontend holding the stats settings */
 	int numa_cpu_mapping;
+	uchar clt_privileged_ports;     /* bitmask to allow client privileged ports exchanges per protocol */
+	/* bytes hole here */
 	int cfg_curr_line;              /* line number currently being parsed */
 	const char *cfg_curr_file;      /* config file currently being parsed or NULL */
 	char *cfg_curr_section;         /* config section name currently being parsed or NULL */

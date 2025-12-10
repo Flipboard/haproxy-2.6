@@ -121,6 +121,7 @@ enum li_status {
 #define BC_O_USE_SOCK_STREAM    0x00000010 /* at least one stream-type listener is used */
 #define BC_O_USE_XPRT_DGRAM     0x00000020 /* at least one dgram-only xprt listener is used */
 #define BC_O_USE_XPRT_STREAM    0x00000040 /* at least one stream-only xprt listener is used */
+#define BC_O_XPRT_MAXCONN       0x00010000 /* transport layer allocates its own resource prior to accept and is responsible to check maxconn limit */
 
 
 /* flags used with bind_conf->ssl_options */
@@ -158,12 +159,21 @@ struct ssl_bind_conf {
 #endif
 };
 
+/*
+ * In OpenSSL 3.0.0, the biggest verify error code's value is 94 and on the
+ * latest 1.1.1 it already reaches 79 so we need to size the ca/crt-ignore-err
+ * arrays accordingly. If the max error code increases, the arrays might need to
+ * be resized.
+ */
+#define SSL_MAX_VFY_ERROR_CODE 94
+#define IGNERR_BF_SIZE ((SSL_MAX_VFY_ERROR_CODE >> 6) + 1)
+
 /* "bind" line settings */
 struct bind_conf {
 #ifdef USE_OPENSSL
 	struct ssl_bind_conf ssl_conf; /* ssl conf for ctx setting */
-	unsigned long long ca_ignerr;  /* ignored verify errors in handshake if depth > 0 */
-	unsigned long long crt_ignerr; /* ignored verify errors in handshake if depth == 0 */
+	unsigned long long ca_ignerr_bitfield[IGNERR_BF_SIZE];   /* ignored verify errors in handshake if depth > 0 */
+	unsigned long long crt_ignerr_bitfield[IGNERR_BF_SIZE];  /* ignored verify errors in handshake if depth == 0 */
 	void *initial_ctx;             /* SSL context for initial negotiation */
 	void *default_ctx;             /* SSL context of first/default certificate */
 	struct ckch_inst *default_inst;
@@ -212,6 +222,9 @@ struct li_per_thread {
 };
 
 #define LI_F_QUIC_LISTENER       0x00000001  /* listener uses proto quic */
+#define LI_F_FINALIZED           0x00000002  /* listener made it to the READY||LIMITED||FULL state at least once, may be suspended/resumed safely */
+#define LI_F_SUSPENDED           0x00000004  /* listener has been suspended using suspend_listener(), it is either is LI_PAUSED or LI_ASSIGNED state */
+
 
 /* The listener will be directly referenced by the fdtab[] which holds its
  * socket. The listener provides the protocol-specific accept() function to
@@ -270,7 +283,9 @@ struct bind_kw {
 	int (*parse)(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err);
 	int skip; /* nb of args to skip */
 };
-struct ssl_bind_kw {
+
+/* same as bind_kw but for crtlist keywords */
+struct ssl_crtlist_kw {
 	const char *kw;
 	int (*parse)(char **args, int cur_arg, struct proxy *px, struct ssl_bind_conf *conf, int from_cli, char **err);
 	int skip; /* nb of args to skip */

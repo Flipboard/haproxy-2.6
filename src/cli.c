@@ -647,30 +647,27 @@ int listeners_setenv(struct proxy *frontend, const char *varname)
 				char addr[46];
 				char port[6];
 
-				/* separate listener by semicolons */
-				if (trash->data)
-					chunk_appendf(trash, ";");
-
 				if (l->rx.addr.ss_family == AF_UNIX) {
 					const struct sockaddr_un *un;
 
 					un = (struct sockaddr_un *)&l->rx.addr;
 					if (un->sun_path[0] == '\0') {
-						chunk_appendf(trash, "abns@%s", un->sun_path+1);
+						chunk_appendf(trash, "%sabns@%s", (trash->data ? ";" : ""), un->sun_path+1);
 					} else {
-						chunk_appendf(trash, "unix@%s", un->sun_path);
+						chunk_appendf(trash, "%sunix@%s", (trash->data ? ";" : ""), un->sun_path);
 					}
 				} else if (l->rx.addr.ss_family == AF_INET) {
 					addr_to_str(&l->rx.addr, addr, sizeof(addr));
 					port_to_str(&l->rx.addr, port, sizeof(port));
-					chunk_appendf(trash, "ipv4@%s:%s", addr, port);
+					chunk_appendf(trash, "%sipv4@%s:%s", (trash->data ? ";" : ""), addr, port);
 				} else if (l->rx.addr.ss_family == AF_INET6) {
 					addr_to_str(&l->rx.addr, addr, sizeof(addr));
 					port_to_str(&l->rx.addr, port, sizeof(port));
-					chunk_appendf(trash, "ipv6@[%s]:%s", addr, port);
-				} else if (l->rx.addr.ss_family == AF_CUST_SOCKPAIR) {
-					chunk_appendf(trash, "sockpair@%d", ((struct sockaddr_in *)&l->rx.addr)->sin_addr.s_addr);
+					chunk_appendf(trash, "%sipv6@[%s]:%s", (trash->data ? ";" : ""), addr, port);
 				}
+				/* AF_CUST_SOCKPAIR is explicitly skipped, we don't want to show reload and shared
+				 * master CLI sockpairs in HAPROXY_CLI and HAPROXY_MASTER_CLI
+				 */
 			}
 		}
 		trash->area[trash->data++] = '\0';
@@ -789,7 +786,8 @@ static int cli_parse_request(struct appctx *appctx)
 				break;
 			}
 		}
-		*p++ = 0;
+		if (p < end)
+			*p++ = 0;
 
 		/* unescape backslashes (\) */
 		for (j = 0, k = 0; args[i][k]; k++) {
@@ -808,8 +806,32 @@ static int cli_parse_request(struct appctx *appctx)
 	}
 	/* fill unused slots */
 	p = appctx->chunk->area + appctx->chunk->data;
+
+	/* throw an error if too many args are provided */
+	if (*p && i == MAX_CLI_ARGS) {
+		char *err = NULL;
+
+		cli_err(appctx, memprintf(&err, "Too many arguments. Commands must have at most %d arguments.\n", MAX_CLI_ARGS));
+		return 0;
+	}
+
 	for (; i < MAX_CLI_ARGS + 1; i++)
 		args[i] = p;
+
+	if (appctx->st1 & APPCTX_CLI_ST1_SHUT_EXPECTED) {
+		/* The previous command line was finished by a \n in non-interactive mode.
+		 * It should not be followed by another command line. In non-interactive mode,
+		 * only one line should be processed. Because of a bug, it is not respected.
+		 * So emit a warning, only once in the process life, to warn users their script
+		 * must be updated.
+		 */
+		appctx->st1 &= ~APPCTX_CLI_ST1_SHUT_EXPECTED;
+		if (ONLY_ONCE()) {
+			ha_warning("Commands sent to the CLI were chained using a new line character while in non-interactive mode."
+				   " This is not reliable, not officially supported and will not be supported anymore in future versions. "
+				   "Please use ';' to delimit commands instead.");
+		}
+	}
 
 	kw = cli_find_kw(args);
 	if (!kw ||
@@ -859,12 +881,13 @@ fail:
 static int cli_output_msg(struct channel *chn, const char *msg, int severity, int severity_output)
 {
 	struct buffer *tmp;
-
-	if (likely(severity_output == CLI_SEVERITY_NONE))
-		return ci_putblk(chn, msg, strlen(msg));
+	struct ist imsg;
 
 	tmp = get_trash_chunk();
 	chunk_reset(tmp);
+
+	if (likely(severity_output == CLI_SEVERITY_NONE))
+		goto send_it;
 
 	if (severity < 0 || severity > 7) {
 		ha_warning("socket command feedback with invalid severity %d", severity);
@@ -882,9 +905,19 @@ static int cli_output_msg(struct channel *chn, const char *msg, int severity, in
 				ha_warning("Unrecognized severity output %d", severity_output);
 		}
 	}
-	chunk_appendf(tmp, "%s", msg);
+ send_it:
+	/* the vast majority of messages have their trailing LF but a few are
+	 * still missing it, and very rare ones might even have two. For this
+	 * reason, we'll first delete the trailing LFs if present, then
+	 * systematically append one.
+	 */
+	for (imsg = ist(msg); imsg.len > 0 && imsg.ptr[imsg.len - 1] == '\n'; imsg.len--)
+		;
 
-	return ci_putblk(chn, tmp->area, strlen(tmp->area));
+	chunk_istcat(tmp, imsg);
+	chunk_istcat(tmp, ist("\n"));
+
+	return ci_putchk(chn, tmp);
 }
 
 /* This I/O handler runs as an applet embedded in a stream connector. It is
@@ -895,7 +928,7 @@ static int cli_output_msg(struct channel *chn, const char *msg, int severity, in
  * CLI_ST_* constants. appctx->st1 is used to indicate whether prompt is enabled
  * or not.
  */
-static void cli_io_handler(struct appctx *appctx)
+void cli_io_handler(struct appctx *appctx)
 {
 	struct stconn *sc = appctx_sc(appctx);
 	struct channel *req = sc_oc(sc);
@@ -903,6 +936,7 @@ static void cli_io_handler(struct appctx *appctx)
 	struct bind_conf *bind_conf = strm_li(__sc_strm(sc))->bind_conf;
 	int reql;
 	int len;
+	int lf = 0;
 
 	if (unlikely(sc->state == SC_ST_DIS || sc->state == SC_ST_CLO))
 		goto out;
@@ -977,29 +1011,15 @@ static void cli_io_handler(struct appctx *appctx)
 				continue;
 			}
 
-			if (!(appctx->st1 & APPCTX_CLI_ST1_PAYLOAD)) {
-				/* seek for a possible unescaped semi-colon. If we find
-				 * one, we replace it with an LF and skip only this part.
-				 */
-				for (len = 0; len < reql; len++) {
-					if (str[len] == '\\') {
-						len++;
-						continue;
-					}
-					if (str[len] == ';') {
-						str[len] = '\n';
-						reql = len + 1;
-						break;
-					}
-				}
-			}
+			if (str[reql-1] == '\n')
+				lf = 1;
 
 			/* now it is time to check that we have a full line,
 			 * remove the trailing \n and possibly \r, then cut the
 			 * line.
 			 */
 			len = reql - 1;
-			if (str[len] != '\n') {
+			if (str[len] != '\n' && str[len] != ';') {
 				appctx->st0 = CLI_ST_END;
 				continue;
 			}
@@ -1029,8 +1049,9 @@ static void cli_io_handler(struct appctx *appctx)
 					/* NB: cli_sock_parse_request() may have put
 					 * another CLI_ST_O_* into appctx->st0.
 					 */
-
 					appctx->st1 &= ~APPCTX_CLI_ST1_PAYLOAD;
+					if (!(appctx->st1 & APPCTX_CLI_ST1_PROMPT) && lf)
+						appctx->st1 |= APPCTX_CLI_ST1_SHUT_EXPECTED;
 				}
 			}
 			else {
@@ -1047,6 +1068,8 @@ static void cli_io_handler(struct appctx *appctx)
 					/* no payload, the command is complete: parse the request */
 					cli_parse_request(appctx);
 					chunk_reset(appctx->chunk);
+					if (!(appctx->st1 & APPCTX_CLI_ST1_PROMPT) && lf)
+						appctx->st1 |= APPCTX_CLI_ST1_SHUT_EXPECTED;
 				}
 			}
 
@@ -1296,6 +1319,7 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 		const void *ctx = NULL;
 		const void *xprt_ctx = NULL;
 		uint32_t conn_flags = 0;
+		uint8_t conn_err = 0;
 		int is_back = 0;
 		int suspicious = 0;
 
@@ -1313,6 +1337,7 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 		else if (fdt.iocb == sock_conn_iocb) {
 			conn = (const struct connection *)fdt.owner;
 			conn_flags = conn->flags;
+			conn_err   = conn->err_code;
 			mux        = conn->mux;
 			ctx        = conn->ctx;
 			xprt       = conn->xprt;
@@ -1333,7 +1358,7 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 			suspicious = 1;
 
 		chunk_printf(&trash,
-			     "  %5d : st=0x%06x(%c%c %c%c%c%c%c W:%c%c%c R:%c%c%c) tmask=0x%lx umask=0x%lx owner=%p iocb=%p(",
+			     "  %5d : st=0x%06x(%c%c %c%c%c%c%c W:%c%c%c R:%c%c%c) ref=%#x gid=%d tmask=0x%lx umask=0x%lx prmsk=0x%lx pwmsk=0x%lx owner=%p iocb=%p(",
 			     fd,
 			     fdt.state,
 			     (fdt.state & FD_CLONED) ? 'C' : 'c',
@@ -1349,7 +1374,11 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 			     (fdt.state & FD_EV_SHUT_R) ? 'S' : 's',
 			     (fdt.state & FD_EV_READY_R)  ? 'R' : 'r',
 			     (fdt.state & FD_EV_ACTIVE_R) ? 'A' : 'a',
+			     (fdt.refc_tgid >> 4) & 0xffff,
+			     (fdt.refc_tgid) & 0xffff,
 			     fdt.thread_mask, fdt.update_mask,
+			     polled_mask[fd].poll_recv,
+			     polled_mask[fd].poll_send,
 			     fdt.owner,
 			     fdt.iocb);
 		resolve_sym_name(&trash, NULL, fdt.iocb);
@@ -1358,7 +1387,7 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 			chunk_appendf(&trash, ")");
 		}
 		else if (fdt.iocb == sock_conn_iocb) {
-			chunk_appendf(&trash, ") back=%d cflg=0x%08x", is_back, conn_flags);
+			chunk_appendf(&trash, ") back=%d cflg=0x%08x cerr=%d", is_back, conn_flags, conn_err);
 
 			if (conn->handle.fd != fd) {
 				chunk_appendf(&trash, " fd=%d(BOGUS)", conn->handle.fd);
@@ -1762,6 +1791,10 @@ static int set_severity_output(int *target, char *argument)
 /* parse a "set severity-output" command. */
 static int cli_parse_set_severity_output(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	/* this will ask the applet to not output a \n after the command */
+	if (strcmp(args[3], "-") == 0)
+		appctx->st1 |= APPCTX_CLI_ST1_NOLF;
+
 	if (*args[2] && set_severity_output(&appctx->cli_severity_output, args[2]))
 		return 0;
 
@@ -2074,6 +2107,9 @@ static int _getsocks(char **args, char *payload, struct appctx *appctx, void *pr
 		if (!(fdtab[cur_fd].state & FD_EXPORTED))
 			continue;
 
+		/* this FD is now shared between processes */
+		HA_ATOMIC_OR(&fdtab[cur_fd].state, FD_CLONED);
+
 		ns_name = if_name = "";
 		ns_nlen = if_nlen = 0;
 
@@ -2120,7 +2156,7 @@ static int _getsocks(char **args, char *payload, struct appctx *appctx, void *pr
 			iov.iov_len = curoff;
 			if (sendmsg(fd, &msghdr, 0) != curoff) {
 				ha_warning("Failed to transfer sockets\n");
-				return -1;
+				goto out;
 			}
 
 			/* Wait for an ack */
@@ -2130,7 +2166,7 @@ static int _getsocks(char **args, char *payload, struct appctx *appctx, void *pr
 
 			if (ret <= 0) {
 				ha_warning("Unexpected error while transferring sockets\n");
-				return -1;
+				goto out;
 			}
 			curoff = 0;
 			nb_queued = 0;
@@ -2146,13 +2182,21 @@ static int _getsocks(char **args, char *payload, struct appctx *appctx, void *pr
 			ha_warning("Failed to transfer sockets\n");
 			goto out;
 		}
+
+		/* Wait for an ack */
+		do {
+			ret = recv(fd, &tot_fd_nb, sizeof(tot_fd_nb), 0);
+		} while (ret == -1 && errno == EINTR);
+
+		if (ret <= 0) {
+			ha_warning("Unexpected error while transferring sockets\n");
+			goto out;
+		}
 	}
 
 out:
-	if (fd >= 0 && old_fcntl >= 0 && fcntl(fd, F_SETFL, old_fcntl) == -1) {
+	if (fd >= 0 && old_fcntl >= 0 && fcntl(fd, F_SETFL, old_fcntl) == -1)
 		ha_warning("Cannot make the unix socket non-blocking\n");
-		goto out;
-	}
 	appctx->st0 = CLI_ST_END;
 	free(cmsgbuf);
 	free(tmpbuf);
@@ -2310,7 +2354,6 @@ static int pcli_prefix_to_pid(const char *prefix)
  *  >= 0 : number of words to escape
  *  = -1 : error
  */
-
 int pcli_find_and_exec_kw(struct stream *s, char **args, int argl, char **errmsg, int *next_pid)
 {
 	if (argl < 1)
@@ -2386,6 +2429,21 @@ int pcli_find_and_exec_kw(struct stream *s, char **args, int argl, char **errmsg
 		if ((argl > 1) && (strcmp(args[1], "on") == 0))
 			s->pcli_flags |= ACCESS_MCLI_DEBUG;
 		return argl;
+	} else if (strcmp(args[0], "set") == 0) {
+		if ((argl > 1) && (strcmp(args[1], "severity-output") == 0)) {
+			if ((argl > 2) &&strcmp(args[2], "none") == 0) {
+				s->pcli_flags &= ~(ACCESS_MCLI_SEVERITY_NB|ACCESS_MCLI_SEVERITY_STR);
+			} else if ((argl > 2) && strcmp(args[2], "string") == 0) {
+				s->pcli_flags |= ACCESS_MCLI_SEVERITY_STR;
+			} else if ((argl > 2) && strcmp(args[2], "number") == 0) {
+				s->pcli_flags |= ACCESS_MCLI_SEVERITY_NB;
+			} else {
+				memprintf(errmsg, "one of 'none', 'number', 'string' is a required argument\n");
+				return -1;
+			}
+			/* only skip argl if we have "set severity-output" not only "set" */
+			return argl;
+		}
 	}
 
 	return 0;
@@ -2547,6 +2605,16 @@ int pcli_parse_request(struct stream *s, struct channel *req, char **errmsg, int
 		if (s->pcli_flags & ACCESS_EXPERT) {
 			ci_insert_line2(req, 0, "expert-mode on -", strlen("expert-mode on -"));
 			ret += strlen("expert-mode on -") + 2;
+		}
+		if (s->pcli_flags & ACCESS_MCLI_SEVERITY_STR) {
+			const char *cmd = "set severity-output string -";
+			ci_insert_line2(req, 0, cmd, strlen(cmd));
+			ret += strlen(cmd) + 2;
+		}
+		if (s->pcli_flags & ACCESS_MCLI_SEVERITY_NB) {
+			const char *cmd = "set severity-output number -";
+			ci_insert_line2(req, 0, cmd, strlen(cmd));
+			ret += strlen(cmd) + 2;
 		}
 
 		if (pcli_has_level(s, ACCESS_LVL_ADMIN)) {
@@ -2774,20 +2842,16 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 
 		s->target = NULL;
 
-		/* only release our endpoint if we don't intend to reuse the
-		 * connection.
-		 */
-		if (!sc_conn_ready(s->scb)) {
-			s->srv_conn = NULL;
-			if (sc_reset_endp(s->scb) < 0) {
-				if (!s->conn_err_type)
-					s->conn_err_type = STRM_ET_CONN_OTHER;
-				if (s->srv_error)
-					s->srv_error(s, s->scb);
-				return 1;
-			}
-			se_fl_clr(s->scb->sedesc, ~SE_FL_DETACHED);
+		/* Always release our endpoint */
+		s->srv_conn = NULL;
+		if (sc_reset_endp(s->scb) < 0) {
+			if (!s->conn_err_type)
+				s->conn_err_type = STRM_ET_CONN_OTHER;
+			if (s->srv_error)
+				s->srv_error(s, s->scb);
+			return 1;
 		}
+		se_fl_clr(s->scb->sedesc, ~SE_FL_DETACHED);
 
 		sockaddr_free(&s->scb->dst);
 
@@ -2813,7 +2877,7 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		s->target = NULL;
 		/* re-init store persistence */
 		s->store_count = 0;
-		s->uniq_id = global.req_count++;
+		s->uniq_id = _HA_ATOMIC_FETCH_ADD(&global.req_count, 1);
 
 		s->req.flags |= CF_READ_DONTWAIT; /* one read is usually enough */
 

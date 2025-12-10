@@ -334,6 +334,7 @@ static const struct trace_event peers_trace_events[] = {
 	{ .mask = PEERS_EV_SESSREL,    .name = "sessrl",       .desc = "peer session releasing" },
 #define PEERS_EV_PROTOERR        (1 << 6)
 	{ .mask = PEERS_EV_PROTOERR,   .name = "protoerr",     .desc = "protocol error" },
+	{ }
 };
 
 static const struct name_desc peers_trace_lockon_args[4] = {
@@ -1057,7 +1058,7 @@ void __peer_session_deinit(struct peer *peer)
 	flush_dcache(peer);
 
 	/* Re-init current table pointers to force announcement on re-connect */
-	peer->remote_table = peer->last_local_table = NULL;
+	peer->remote_table = peer->last_local_table = peer->stop_local_table = NULL;
 	peer->appctx = NULL;
 	if (peer->flags & PEER_F_LEARN_ASSIGN) {
 		/* unassign current peer for learning */
@@ -1620,10 +1621,7 @@ static inline int peer_send_teachmsgs(struct appctx *appctx, struct peer *p,
 
 		updates_sent++;
 		if (updates_sent >= peers_max_updates_at_once) {
-			/* pretend we're full so that we get back ASAP */
-			struct stconn *sc = appctx_sc(appctx);
-
-			sc_need_room(sc);
+			applet_have_more_data(appctx);
 			ret = -1;
 			break;
 		}
@@ -1699,6 +1697,7 @@ static int peer_treat_updatemsg(struct appctx *appctx, struct peer *p, int updt,
                                 char **msg_cur, char *msg_end, int msg_len, int totl)
 {
 	struct shared_table *st = p->remote_table;
+	struct stktable *table;
 	struct stksess *ts, *newts;
 	uint32_t update;
 	int expire;
@@ -1710,7 +1709,9 @@ static int peer_treat_updatemsg(struct appctx *appctx, struct peer *p, int updt,
 	if (!st)
 		goto ignore_msg;
 
-	expire = MS_TO_TICKS(st->table->expire);
+	table = st->table;
+
+	expire = MS_TO_TICKS(table->expire);
 
 	if (updt) {
 		if (msg_len < sizeof(update)) {
@@ -1740,6 +1741,11 @@ static int peer_treat_updatemsg(struct appctx *appctx, struct peer *p, int updt,
 		memcpy(&expire, *msg_cur, expire_sz);
 		*msg_cur += expire_sz;
 		expire = ntohl(expire);
+		/* Protocol contains expire in MS, check if value is less than table config */
+		if (expire > table->expire)
+			expire = table->expire;
+		/* the rest of the code considers expire as ticks and not MS */
+		expire = MS_TO_TICKS(expire);
 	}
 
 	newts = stksess_new(st->table, NULL);
@@ -2534,7 +2540,25 @@ static inline int peer_treat_awaited_msg(struct appctx *appctx, struct peer *pee
  * Returns 1 if succeeded, or -1 or 0 if failed.
  * -1 means an internal error occurred, 0 is for a peer protocol error leading
  * to a peer state change (from the peer I/O handler point of view).
+ *
+ *   - peer->last_local_table is the last table for which we send an update
+ *                            messages.
+ *
+ *   - peer->stop_local_table is the last evaluated table. It is unset when the
+ *                            teaching process starts. But we use it as a
+ *                            restart point when the loop is interrupted. It is
+ *                            especially useful whe the number of tables exceeds
+ *                            peers_max_updates_at_once value.
+ *
+ * When a teaching lopp is started, the peer's last_local_table is saved in a
+ * local variable. This variable is used as a finish point. When the crrent
+ * table is equal to it, it means all tables were evaluated, all updates where
+ * sent and the teaching process is finished.
+ *
+ * peer->stop_local_table is always NULL when the teaching process begins. It is
+ * only reset at the end. In the mean time, it always point on a table.
  */
+
 static inline int peer_send_msgs(struct appctx *appctx,
                                  struct peer *peer, struct peers *peers)
 {
@@ -2556,17 +2580,18 @@ static inline int peer_send_msgs(struct appctx *appctx,
 	if (peer->tables) {
 		struct shared_table *st;
 		struct shared_table *last_local_table;
-		int updates_sent = 0;
+		int updates = 0;
 
 		last_local_table = peer->last_local_table;
 		if (!last_local_table)
 			last_local_table = peer->tables;
-		st = last_local_table->next;
+		if (!peer->stop_local_table)
+			peer->stop_local_table = last_local_table;
+		st = peer->stop_local_table->next;
 
 		while (1) {
 			if (!st)
 				st = peer->tables;
-
 			/* It remains some updates to ack */
 			if (st->last_get != st->last_acked) {
 				repl = peer_send_ackmsg(st, appctx);
@@ -2584,6 +2609,7 @@ static inline int peer_send_msgs(struct appctx *appctx,
 					repl = peer_send_teach_process_msgs(appctx, peer, st);
 					if (repl <= 0) {
 						HA_SPIN_UNLOCK(STK_TABLE_LOCK, &st->table->lock);
+						peer->stop_local_table = peer->last_local_table;
 						return repl;
 					}
 				}
@@ -2592,29 +2618,40 @@ static inline int peer_send_msgs(struct appctx *appctx,
 			else if (!(peer->flags & PEER_F_TEACH_FINISHED)) {
 				if (!(st->flags & SHTABLE_F_TEACH_STAGE1)) {
 					repl = peer_send_teach_stage1_msgs(appctx, peer, st);
-					if (repl <= 0)
+					if (repl <= 0) {
+						peer->stop_local_table = peer->last_local_table;
 						return repl;
+					}
 				}
 
 				if (!(st->flags & SHTABLE_F_TEACH_STAGE2)) {
 					repl = peer_send_teach_stage2_msgs(appctx, peer, st);
-					if (repl <= 0)
+					if (repl <= 0) {
+						peer->stop_local_table = peer->last_local_table;
 						return repl;
+					}
 				}
 			}
 
-			if (st == last_local_table)
+			if (st == last_local_table) {
+				peer->stop_local_table = NULL;
 				break;
-			st = st->next;
+			}
 
-			updates_sent++;
-			if (updates_sent >= peers_max_updates_at_once) {
-				/* pretend we're full so that we get back ASAP */
-				struct stconn *sc = appctx_sc(appctx);
+			/* This one is to be sure to restart from <st->next> if we are interrupted
+			 * because of peer_send_teach_stage2_msgs or because buffer is full
+			 * when sedning an ackmsg. In both cases current <st> was evaluated and
+			 * we must restart from <st->next>
+			 */
+			peer->stop_local_table = st;
 
-				sc_need_room(sc);
+			updates++;
+			if (updates >= peers_max_updates_at_once) {
+				applet_have_more_data(appctx);
 				return -1;
 			}
+
+			st = st->next;
 		}
 	}
 
@@ -3358,6 +3395,9 @@ struct task *process_peer_sync(struct task * task, void *context, unsigned int s
 								ps->flags &= ~PEER_F_HEARTBEAT;
 								/* Re-schedule another one later. */
 								ps->heartbeat = tick_add(now_ms, MS_TO_TICKS(PEER_HEARTBEAT_TIMEOUT));
+								/* Refresh reconnect if necessary */
+								if (tick_is_expired(ps->reconnect, now_ms))
+									ps->reconnect = tick_add(now_ms, MS_TO_TICKS(PEER_RECONNECT_TIMEOUT));
 								/* We are going to send updates, let's ensure we will
 								 * come back to send heartbeat messages or to reconnect.
 								 */
@@ -3444,7 +3484,7 @@ struct task *process_peer_sync(struct task * task, void *context, unsigned int s
 
 				/* Set resync timeout for the local peer and request a immediate reconnect */
 				peers->resync_timeout = tick_add(now_ms, MS_TO_TICKS(PEER_RESYNC_TIMEOUT));
-				peers->local->reconnect = now_ms;
+				peers->local->reconnect = tick_add(now_ms, 0);
 			}
 		}
 
@@ -3859,6 +3899,14 @@ static int peers_dump_peer(struct buffer *msg, struct appctx *appctx, struct pee
 	              peer->appctx->t ? peer->appctx->t->calls : 0);
 
 	peer_cs = appctx_sc(peer->appctx);
+	if (!peer_cs) {
+		/* the appctx might exist but not yet be initialized due to
+		 * deferred initialization used to balance applets across
+		 * threads.
+		 */
+		goto table_info;
+	}
+
 	peer_s = __sc_strm(peer_cs);
 
 	chunk_appendf(&trash, " state=%s", sc_state_str(sc_opposite(peer_cs)->state));

@@ -161,16 +161,25 @@ struct mworker_proc *mworker_proc_new()
 
 /*
  * unserialize the proc list from the environment
+ * Return < 0 upon error.
  */
 int mworker_env_to_proc_list()
 {
-	char *msg, *token = NULL, *s1;
+	char *env, *msg, *omsg = NULL, *token = NULL, *s1;
 	struct mworker_proc *child;
 	int minreloads = INT_MAX; /* minimum number of reloads to chose which processes are "current" ones */
+	int err = 0;
 
-	msg = getenv("HAPROXY_PROCESSES");
-	if (!msg)
-		return 0;
+	env = getenv("HAPROXY_PROCESSES");
+	if (!env)
+		goto no_env;
+
+	omsg = msg = strdup(env);
+	if (!msg) {
+		ha_alert("Out of memory while trying to allocate a worker process structure.");
+		err = -1;
+		goto out;
+	}
 
 	while ((token = strtok_r(msg, "|", &s1))) {
 		char *subtoken = NULL;
@@ -180,8 +189,9 @@ int mworker_env_to_proc_list()
 
 		child = mworker_proc_new();
 		if (!child) {
-			ha_alert("Out of memory while trying to allocate a worker process structure.");
-			return -1;
+			ha_alert("out of memory while trying to allocate a worker process structure.");
+			err = -1;
+			goto out;
 		}
 
 		while ((subtoken = strtok_r(token, ";", &s2))) {
@@ -203,6 +213,8 @@ int mworker_env_to_proc_list()
 
 			} else if (strncmp(subtoken, "fd=", 3) == 0) {
 				child->ipc_fd[0] = atoi(subtoken+3);
+				if (child->ipc_fd[0] > -1)
+					global.maxsock++;
 			} else if (strncmp(subtoken, "pid=", 4) == 0) {
 				child->pid = atoi(subtoken+4);
 			} else if (strncmp(subtoken, "reloads=", 8) == 0) {
@@ -237,7 +249,27 @@ int mworker_env_to_proc_list()
 
 	unsetenv("HAPROXY_PROCESSES");
 
-	return 0;
+no_env:
+
+	if (!proc_self) {
+
+		proc_self = mworker_proc_new();
+		if (!proc_self) {
+			ha_alert("Cannot allocate process structures.\n");
+			err = -1;
+			goto out;
+		}
+		proc_self->options |= PROC_O_TYPE_MASTER;
+		proc_self->pid = pid;
+		proc_self->timestamp = 0; /* we don't know the startime anymore */
+
+		LIST_APPEND(&proc_list, &proc_self->list);
+		ha_warning("The master internals are corrupted or it was started with a too old version (< 1.9). Please restart the master process.\n");
+	}
+
+out:
+	free(omsg);
+	return err;
 }
 
 /* Signal blocking and unblocking */
@@ -433,6 +465,9 @@ static int mworker_pipe_register_per_thread()
 	if (tid != 0)
 		return 1;
 
+	if (proc_self->ipc_fd[1] < 0) /* proc_self was incomplete and we can't find the socketpair */
+		return 1;
+
 	fd_set_nonblock(proc_self->ipc_fd[1]);
 	/* In multi-tread, we need only one thread to process
 	 * events on the pipe with master
@@ -462,8 +497,10 @@ void mworker_cleanlisteners()
 
 		stop_proxy(curpeers->peers_fe);
 		/* disable this peer section so that it kills itself */
-		signal_unregister_handler(curpeers->sighandler);
-		task_destroy(curpeers->sync_task);
+		if (curpeers->sighandler)
+			signal_unregister_handler(curpeers->sighandler);
+		if (curpeers->sync_task)
+			task_destroy(curpeers->sync_task);
 		curpeers->sync_task = NULL;
 		task_destroy(curpeers->peers_fe->task);
 		curpeers->peers_fe->task = NULL;
@@ -499,14 +536,11 @@ void mworker_cleanup_proc()
 	list_for_each_entry_safe(child, it, &proc_list, list) {
 
 		if (child->pid == -1) {
-			/* Close the socketpair master side.  We don't need to
-			 * close the worker side, because it's stored in the
-			 * GLOBAL cli listener which was supposed to be in the
-			 * worker and which will be closed in
-			 * mworker_cleanlisteners()
-			 */
+			/* Close the socketpairs. */
 			if (child->ipc_fd[0] > -1)
 				close(child->ipc_fd[0]);
+			if (child->ipc_fd[1] > -1)
+				close(child->ipc_fd[1]);
 			if (child->srv) {
 				/* only exists if we created a master CLI listener */
 				srv_drop(child->srv);
@@ -524,12 +558,15 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
 	struct stconn *sc = appctx_sc(appctx);
 	struct mworker_proc *child;
 	int old = 0;
-	int up = now.tv_sec - proc_self->timestamp;
+	int up = date.tv_sec - proc_self->timestamp;
 	char *uptime = NULL;
 	char *reloadtxt = NULL;
 
 	if (unlikely(sc_ic(sc)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
 		return 1;
+
+	if (up < 0) /* must never be negative because of clock drift */
+		up = 0;
 
 	chunk_reset(&trash);
 
@@ -544,7 +581,9 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
 
 	chunk_appendf(&trash, "# workers\n");
 	list_for_each_entry(child, &proc_list, list) {
-		up = now.tv_sec - child->timestamp;
+		up = date.tv_sec - child->timestamp;
+		if (up < 0) /* must never be negative because of clock drift */
+			up = 0;
 
 		if (!(child->options & PROC_O_TYPE_WORKER))
 			continue;
@@ -565,7 +604,9 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
 
 		chunk_appendf(&trash, "# old workers\n");
 		list_for_each_entry(child, &proc_list, list) {
-			up = now.tv_sec - child->timestamp;
+			up = date.tv_sec - child->timestamp;
+			if (up <= 0) /* must never be negative because of clock drift */
+				up = 0;
 
 			if (!(child->options & PROC_O_TYPE_WORKER))
 				continue;
@@ -583,7 +624,9 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
 	chunk_appendf(&trash, "# programs\n");
 	old = 0;
 	list_for_each_entry(child, &proc_list, list) {
-		up = now.tv_sec - child->timestamp;
+		up = date.tv_sec - child->timestamp;
+		if (up < 0) /* must never be negative because of clock drift */
+			up = 0;
 
 		if (!(child->options & PROC_O_TYPE_PROG))
 			continue;
@@ -600,7 +643,9 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
 	if (old) {
 		chunk_appendf(&trash, "# old programs\n");
 		list_for_each_entry(child, &proc_list, list) {
-			up = now.tv_sec - child->timestamp;
+			up = date.tv_sec - child->timestamp;
+			if (up < 0) /* must never be negative because of clock drift */
+				up = 0;
 
 			if (!(child->options & PROC_O_TYPE_PROG))
 				continue;
@@ -637,27 +682,26 @@ static int cli_parse_reload(char **args, char *payload, struct appctx *appctx, v
 static int mworker_parse_global_max_reloads(char **args, int section_type, struct proxy *curpx,
            const struct proxy *defpx, const char *file, int linenum, char **err)
 {
+	if (strcmp(args[0], "mworker-max-reloads") == 0) {
+		if (too_many_args(1, args, err, NULL))
+			return -1;
 
-	int err_code = 0;
+		if (*(args[1]) == 0) {
+			memprintf(err, "'%s' expects an integer argument.", args[0]);
+			return -1;
+		}
 
-	if (alertif_too_many_args(1, file, linenum, args, &err_code))
-		goto out;
-
-	if (*(args[1]) == 0) {
-		memprintf(err, "%sparsing [%s:%d] : '%s' expects an integer argument.\n", *err, file, linenum, args[0]);
-		err_code |= ERR_ALERT | ERR_FATAL;
-		goto out;
+		max_reloads = atol(args[1]);
+		if (max_reloads < 0) {
+			memprintf(err, "'%s' expects a positive value or zero.", args[0]);
+			return -1;
+		}
+	} else {
+		BUG_ON(1);
+		return -1;
 	}
 
-	max_reloads = atol(args[1]);
-	if (max_reloads < 0) {
-		memprintf(err, "%sparsing [%s:%d] '%s' : invalid value %d, must be >= 0", *err, file, linenum, args[0], max_reloads);
-		err_code |= ERR_ALERT | ERR_FATAL;
-		goto out;
-	}
-
-out:
-	return err_code;
+	return 0;
 }
 
 void mworker_free_child(struct mworker_proc *child)

@@ -37,6 +37,30 @@
 #endif
 #endif
 
+/* This is used to test if a macro is defined and equals 1. The principle is
+ * that the macro is passed as a value and its value concatenated to the word
+ * "comma_for_one" to form a new macro name. The macro "comma_for_one1" equals
+ * one comma, which, once used in an argument, will shift all of them by one,
+ * so that we can use this to concatenate both a 1 and a 0 and always pick the
+ * second one.
+ */
+#define comma_for_one1 ,
+#define _____equals_1(x, y, ...) (y)
+#define ____equals_1(x, ...) _____equals_1(x, 0)
+#define ___equals_1(x)       ____equals_1(comma_for_one ## x 1)
+#define __equals_1(x)        ___equals_1(x)
+
+/* gcc 5 and clang 3 brought __has_attribute(), which is not well documented in
+ * the case of gcc, but is convenient since handled at the preprocessor level.
+ * In both cases it's possible to test for __has_attribute() using ifdef. When
+ * not defined we remap this to the __has_attribute_<name> macro so that we'll
+ * later be able to implement on a per-compiler basis those which are missing,
+ * by defining __has_attribute_<name> to 1.
+ */
+#ifndef __has_attribute
+#define __has_attribute(x) __equals_1(__has_attribute_ ## x)
+#endif
+
 #if !defined(__GNUC__)
 /* Some versions of glibc irresponsibly redefine __attribute__() to empty for
  * non-gcc compilers, and as such, silently break all constructors with other
@@ -129,6 +153,20 @@
 #define my_unreachable() do { } while (1)
 #endif
 #endif
+
+/* This prevents the compiler from folding multiple identical code paths into a
+ * single one, by adding a dependency on the line number in the path. This may
+ * typically happen on function tails, or purposely placed abort() before an
+ * unreachable() statement, due to the compiler performing an Identical Code
+ * Folding optimization. This macro is aimed at helping with code tracing in
+ * crash dumps and may also be used for specific optimizations. One known case
+ * is gcc-4.7 and 4.8 which aggressively fold multiple ABORT_NOW() exit points
+ * and which causes wrong line numbers to be reported by the debugger (note
+ * that even newer compilers do this when using abort()). Please keep in mind
+ * that nothing prevents the compiler from folding the code after that point,
+ * but at least it will not fold the code before.
+ */
+#define DO_NOT_FOLD() do { asm volatile("" :: "i"(__LINE__)); } while (0)
 
 /* This macro may be used to block constant propagation that lets the compiler
  * detect a possible NULL dereference on a variable resulting from an explicit
@@ -374,6 +412,17 @@
  */
 #ifndef __has_feature
 #define __has_feature(x) 0
+#endif
+
+/* gcc 15 throws warning if fixed-size char array does not contain a terminating
+ * NUL. gcc has an attribute 'nonstring', which allows to suppress this warning
+ * for such array declarations. But it's not the case for clang and other
+ * compilers.
+ */
+#if __has_attribute(nonstring)
+#define __nonstring __attribute__ ((nonstring))
+#else
+#define __nonstring
 #endif
 
 #endif /* _HAPROXY_COMPILER_H */

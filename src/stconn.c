@@ -14,6 +14,7 @@
 #include <haproxy/applet.h>
 #include <haproxy/connection.h>
 #include <haproxy/check.h>
+#include <haproxy/filters.h>
 #include <haproxy/http_ana.h>
 #include <haproxy/pipe.h>
 #include <haproxy/pool.h>
@@ -169,8 +170,12 @@ struct stconn *sc_new_from_endp(struct sedesc *sd, struct session *sess, struct 
 	if (unlikely(!sc))
 		return NULL;
 	if (unlikely(!stream_new(sess, sc, input))) {
-		pool_free(pool_head_connstream, sc);
 		sd->sc = NULL;
+		if (sc->sedesc != sd) {
+			/* none was provided so sc_new() allocated one */
+			sedesc_free(sc->sedesc);
+		}
+		pool_free(pool_head_connstream, sc);
 		se_fl_set(sd, SE_FL_ORPHAN);
 		return NULL;
 	}
@@ -254,12 +259,6 @@ int sc_attach_mux(struct stconn *sc, void *sd, void *ctx)
 	struct connection *conn = ctx;
 	struct sedesc *sedesc = sc->sedesc;
 
-	sedesc->se = sd;
-	sedesc->conn = ctx;
-	se_fl_set(sedesc, SE_FL_T_MUX);
-	se_fl_clr(sedesc, SE_FL_DETACHED);
-	if (!conn->ctx)
-		conn->ctx = sc;
 	if (sc_strm(sc)) {
 		if (!sc->wait_event.tasklet) {
 			sc->wait_event.tasklet = tasklet_new();
@@ -284,6 +283,13 @@ int sc_attach_mux(struct stconn *sc, void *sd, void *ctx)
 
 		sc->app_ops = &sc_app_check_ops;
 	}
+
+	sedesc->se = sd;
+	sedesc->conn = ctx;
+	se_fl_set(sedesc, SE_FL_T_MUX);
+	se_fl_clr(sedesc, SE_FL_DETACHED);
+	if (!conn->ctx)
+		conn->ctx = sc;
 	return 0;
 }
 
@@ -498,6 +504,31 @@ struct appctx *sc_applet_create(struct stconn *sc, struct applet *app)
 	return appctx;
 }
 
+/* Conditionnaly forward the close to the wirte side. It return 1 if it can be
+ * forwarded. It is the caller responsibility to forward the close to the write
+ * side. Otherwise, 0 is returned. In this case, CF_SHUTW_NOW flag may be set on
+ * the channel if we are only waiting for the outgoing data to be flushed.
+ */
+static inline int sc_cond_forward_shutw(struct stconn *sc)
+{
+
+	/* The close must not be forwarded */
+	if (!(sc_ic(sc)->flags & CF_SHUTR) || !(sc->flags & SC_FL_NOHALF))
+		return 0;
+
+	if (!channel_is_empty(sc_ic(sc)) && !(sc_ic(sc)->flags & CF_WRITE_TIMEOUT)) {
+		/* the close to the write side cannot be forwarded now because
+		 * we should flush outgoing data first. But instruct the output
+		 * channel it should be done ASAP.
+		 */
+		channel_shutw_now(sc_oc(sc));
+		return 0;
+	}
+
+	/* the close can be immediately forwarded to the write side */
+	return 1;
+}
+
 /*
  * This function performs a shutdown-read on a detached stream connector in a
  * connected or init state (it does nothing for other states). It either shuts
@@ -522,10 +553,8 @@ static void sc_app_shutr(struct stconn *sc)
 		if (sc->flags & SC_FL_ISBACK)
 			__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 	}
-	else if (sc->flags & SC_FL_NOHALF) {
-		/* we want to immediately forward this close to the write side */
+	else if (sc_cond_forward_shutw(sc))
 		return sc_app_shutw(sc);
-	}
 
 	/* note that if the task exists, it must unregister itself once it runs */
 	if (!(sc->flags & SC_FL_DONT_WAKE))
@@ -666,10 +695,8 @@ static void sc_app_shutr_conn(struct stconn *sc)
 		if (sc->flags & SC_FL_ISBACK)
 			__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 	}
-	else if (sc->flags & SC_FL_NOHALF) {
-		/* we want to immediately forward this close to the write side */
+	else if (sc_cond_forward_shutw(sc))
 		return sc_app_shutw_conn(sc);
-	}
 }
 
 /*
@@ -894,10 +921,8 @@ static void sc_app_shutr_applet(struct stconn *sc)
 		if (sc->flags & SC_FL_ISBACK)
 			__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 	}
-	else if (sc->flags & SC_FL_NOHALF) {
-		/* we want to immediately forward this close to the write side */
+	else if (sc_cond_forward_shutw(sc))
 		return sc_app_shutw_applet(sc);
-	}
 }
 
 /*
@@ -990,8 +1015,10 @@ static void sc_app_chk_snd_applet(struct stconn *sc)
 	if (unlikely(sc->state != SC_ST_EST || (oc->flags & CF_SHUTW)))
 		return;
 
-	/* we only wake the applet up if it was waiting for some data  and is ready to consume it */
-	if (!sc_ep_test(sc, SE_FL_WAIT_DATA) || sc_ep_test(sc, SE_FL_WONT_CONSUME))
+	/* we only wake the applet up if it was waiting for some data  and is ready to consume it
+	 * or if there is a pending shutdown
+	 */
+	if (!sc_ep_test(sc, SE_FL_WAIT_DATA|SE_FL_WONT_CONSUME) && !(oc->flags & CF_SHUTW_NOW))
 		return;
 
 	if (!tick_isset(oc->wex))
@@ -1160,7 +1187,8 @@ static void sc_notify(struct stconn *sc)
 	 */
 	if (!channel_is_empty(ic) &&
 	    sc_ep_test(sco, SE_FL_WAIT_DATA) &&
-	    (!(ic->flags & CF_EXPECT_MORE) || c_full(ic) || ci_data(ic) == 0 || ic->pipe)) {
+	     (!HAS_DATA_FILTERS(__sc_strm(sc), ic) || channel_input_data(ic) == 0) &&
+	    (!(ic->flags & CF_EXPECT_MORE) || channel_full(ic, co_data(ic)) || channel_input_data(ic) == 0)) {
 		int new_len, last_len;
 
 		last_len = co_data(ic);
@@ -1247,13 +1275,13 @@ static void sc_conn_read0(struct stconn *sc)
 	ic->flags |= CF_SHUTR;
 	ic->rex = TICK_ETERNITY;
 
-	if (!sc_state_in(sc->state, SC_SB_CON|SC_SB_RDY|SC_SB_EST))
+	if (sc->state != SC_ST_EST)
 		return;
 
 	if (oc->flags & CF_SHUTW)
 		goto do_close;
 
-	if (sc->flags & SC_FL_NOHALF) {
+	if (sc_cond_forward_shutw(sc)) {
 		/* we want to immediately forward this close to the write side */
 		/* force flag on ssl to keep stream in cache */
 		sc_conn_shutw(sc, CO_SHW_SILENT);
@@ -1346,7 +1374,7 @@ static int sc_conn_recv(struct stconn *sc)
 	if (sc_ep_test(sc, SE_FL_MAY_SPLICE) &&
 	    (ic->pipe || ic->to_forward >= MIN_SPLICE_FORWARD) &&
 	    ic->flags & CF_KERN_SPLICING) {
-		if (c_data(ic)) {
+		if (channel_data(ic)) {
 			/* We're embarrassed, there are already data pending in
 			 * the buffer and we don't want to have them at two
 			 * locations at a time. Let's indicate we need some
@@ -1426,7 +1454,10 @@ static int sc_conn_recv(struct stconn *sc)
 	}
 
 	/* Instruct the mux it must subscribed for read events */
-	flags |= ((!conn_is_back(conn) && (__sc_strm(sc)->be->options & PR_O_ABRT_CLOSE)) ? CO_RFL_KEEP_RECV : 0);
+	if (!conn_is_back(conn) &&                                 /* for frontend conns only */
+	    (sc_opposite(sc)->state != SC_ST_INI) &&               /* before backend connection setup */
+	    (__sc_strm(sc)->be->options & PR_O_ABRT_CLOSE))        /* if abortonclose option is set for the current backend */
+		flags |= CO_RFL_KEEP_RECV;
 
 	/* Important note : if we're called with POLL_IN|POLL_HUP, it means the read polling
 	 * was enabled, which implies that the recv buffer was not full. So we have a guarantee
@@ -1556,8 +1587,7 @@ static int sc_conn_recv(struct stconn *sc)
 				ic->flags &= ~CF_STREAMER_FAST;
 			}
 		}
-		else if (!(ic->flags & CF_STREAMER_FAST) &&
-			 (cur_read >= ic->buf.size - global.tune.maxrewrite)) {
+		else if (!(ic->flags & CF_STREAMER_FAST) && (cur_read >= channel_data_limit(ic))) {
 			/* we read a full buffer at once */
 			ic->xfer_small = 0;
 			ic->xfer_large++;
@@ -1582,6 +1612,12 @@ static int sc_conn_recv(struct stconn *sc)
 	 * view. */
 	if (sc_ep_test(sc, SE_FL_EOI) && !(ic->flags & CF_EOI)) {
 		ic->flags |= (CF_EOI|CF_READ_PARTIAL);
+		ret = 1;
+	}
+
+	/* Ensure sc_conn_process() is called if waiting on handshake. */
+	if (!(conn->flags & (CO_FL_WAIT_XPRT | CO_FL_EARLY_SSL_HS)) &&
+	    sc_ep_test(sc, SE_FL_WAIT_FOR_HS)) {
 		ret = 1;
 	}
 
@@ -1801,6 +1837,22 @@ void sc_conn_sync_send(struct stconn *sc)
 		return;
 
 	sc_conn_send(sc);
+
+	if (likely(oc->flags & CF_WRITE_ACTIVITY)) {
+		struct channel *ic = sc_ic(sc);
+
+		if (tick_isset(ic->rex) && !(sc->flags & SC_FL_INDEP_STR)) {
+			/* Note: to prevent the client from expiring read timeouts
+			 * during writes, we refresh it. We only do this if the
+			 * interface is not configured for "independent streams",
+			 * because for some applications it's better not to do this,
+			 * for instance when continuously exchanging small amounts
+			 * of data which can full the socket buffers long before a
+			 * write timeout is detected.
+			 */
+			ic->rex = tick_add_ifset(now_ms, ic->rto);
+		}
+	}
 }
 
 /* Called by I/O handlers after completion.. It propagates

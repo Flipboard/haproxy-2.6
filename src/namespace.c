@@ -54,6 +54,7 @@ static void netns_sig_stop(struct sig_handler *sh)
 		entry = container_of(node, struct netns_entry, node);
 		free(entry->node.key);
 		close(entry->fd);
+		free(entry);
 		node = next;
 	}
 }
@@ -88,12 +89,22 @@ struct netns_entry* netns_store_insert(const char *ns_name)
 
 	entry = calloc(1, sizeof(*entry));
 	if (!entry)
-		goto out;
+		goto err_close_fd;
 	entry->fd = fd;
 	entry->node.key = strdup(ns_name);
+	if (!entry->node.key)
+		goto err_free_entry;
+
 	entry->name_len = strlen(ns_name);
 	ebis_insert(&namespace_tree_root, &entry->node);
 out:
+	return entry;
+
+/* free all allocated stuff and return entry */
+err_free_entry:
+	ha_free(&entry);
+err_close_fd:
+	close(fd);
 	return entry;
 }
 

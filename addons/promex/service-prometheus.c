@@ -302,6 +302,8 @@ const struct promex_metric promex_st_metrics[ST_F_TOTAL_FIELDS] = {
 	[ST_F_NEED_CONN_EST]        = { .n = IST("need_connections_current"),         .type = PROMEX_MT_GAUGE,    .flags = (                                                                       PROMEX_FL_SRV_METRIC) },
 	[ST_F_UWEIGHT]              = { .n = IST("uweight"),                          .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
 	[ST_F_AGG_SRV_CHECK_STATUS] = { .n = IST("agg_server_check_status"),	      .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC                       ) },
+	[ST_F_AGG_SRV_STATUS ]      = { .n = IST("agg_server_status"),	              .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC                       ) },
+	[ST_F_AGG_CHECK_STATUS]     = { .n = IST("agg_check_status"),	              .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC                       ) },
 };
 
 /* Description of overridden stats fields */
@@ -408,6 +410,15 @@ enum promex_srv_state promex_srv_status(struct server *sv)
 		state = PROMEX_SRV_STATE_MAINT;
 
 	return state;
+}
+
+/* Store <sv> in <ctx> safely by using refcount to prevent server deletion. */
+static void promex_set_ctx_sv(struct promex_ctx *ctx, struct server *sv)
+{
+	srv_drop(ctx->sv);
+	ctx->sv = sv;
+	if (ctx->sv)
+		srv_take(ctx->sv);
 }
 
 /* Convert a field to its string representation and write it in <out>, followed
@@ -811,6 +822,7 @@ static int promex_dump_back_metrics(struct appctx *appctx, struct htx *htx)
 	double secs;
 	enum promex_back_state bkd_state;
 	enum promex_srv_state srv_state;
+	enum healthcheck_status srv_check_status;
 
 	for (;ctx->field_num < ST_F_TOTAL_FIELDS; ctx->field_num++) {
 		if (!(promex_st_metrics[ctx->field_num].flags & ctx->flags))
@@ -819,6 +831,8 @@ static int promex_dump_back_metrics(struct appctx *appctx, struct htx *htx)
 		while (ctx->px) {
 			struct promex_label labels[PROMEX_MAX_LABELS-1] = {};
 			unsigned int srv_state_count[PROMEX_SRV_STATE_COUNT] = { 0 };
+			unsigned int srv_check_count[HCHK_STATUS_SIZE] = { 0 };
+			const char *check_state;
 
 			px = ctx->px;
 
@@ -833,7 +847,8 @@ static int promex_dump_back_metrics(struct appctx *appctx, struct htx *htx)
 				return -1;
 
 			switch (ctx->field_num) {
-				case ST_F_AGG_SRV_CHECK_STATUS:
+				case ST_F_AGG_SRV_CHECK_STATUS: // DEPRECATED
+				case ST_F_AGG_SRV_STATUS:
 					if (!px->srv)
 						goto next_px;
 					sv = px->srv;
@@ -846,6 +861,30 @@ static int promex_dump_back_metrics(struct appctx *appctx, struct htx *htx)
 						val = mkf_u32(FN_GAUGE, srv_state_count[ctx->obj_state]);
 						labels[1].name = ist("state");
 						labels[1].value = promex_srv_st[ctx->obj_state];
+						if (!promex_dump_metric(appctx, htx, prefix, &promex_st_metrics[ctx->field_num],
+									&val, labels, &out, max))
+							goto full;
+					}
+					ctx->obj_state = 0;
+					goto next_px;
+				case ST_F_AGG_CHECK_STATUS:
+					if (!px->srv)
+						goto next_px;
+					sv = px->srv;
+					while (sv) {
+						if ((sv->check.state & (CHK_ST_ENABLED|CHK_ST_PAUSED)) == CHK_ST_ENABLED) {
+							srv_check_status = sv->check.status;
+							srv_check_count[srv_check_status] += 1;
+						}
+						sv = sv->next;
+					}
+					for (; ctx->obj_state < HCHK_STATUS_SIZE; ctx->obj_state++) {
+						if (get_check_status_result(ctx->obj_state) < CHK_RES_FAILED)
+								continue;
+						val = mkf_u32(FO_STATUS, srv_check_count[ctx->obj_state]);
+						check_state = get_check_status_info(ctx->obj_state);
+						labels[1].name = ist("state");
+						labels[1].value = ist(check_state);
 						if (!promex_dump_metric(appctx, htx, prefix, &promex_st_metrics[ctx->field_num],
 									&val, labels, &out, max))
 							goto full;
@@ -1095,16 +1134,16 @@ static int promex_dump_srv_metrics(struct appctx *appctx, struct htx *htx)
 							&val, labels, &out, max))
 					goto full;
 			  next_sv:
-				ctx->sv = sv->next;
+				promex_set_ctx_sv(ctx, sv->next);
 			}
 
 		  next_px:
 			ctx->px = px->next;
-			ctx->sv = (ctx->px ? ctx->px->srv : NULL);
+			promex_set_ctx_sv(ctx, ctx->px ? ctx->px->srv : NULL);
 		}
 		ctx->flags |= PROMEX_FL_METRIC_HDR;
 		ctx->px = proxies_list;
-		ctx->sv = (ctx->px ? ctx->px->srv : NULL);
+		promex_set_ctx_sv(ctx, ctx->px ? ctx->px->srv : NULL);
 	}
 
 
@@ -1199,7 +1238,7 @@ static int promex_dump_metrics(struct appctx *appctx, struct stconn *sc, struct 
 			ctx->px = NULL;
 			ctx->st = NULL;
 			ctx->li = NULL;
-			ctx->sv = NULL;
+			promex_set_ctx_sv(ctx, NULL);
 			ctx->flags |= (PROMEX_FL_METRIC_HDR|PROMEX_FL_INFO_METRIC);
 			ctx->obj_state = 0;
 			ctx->field_num = INF_NAME;
@@ -1219,7 +1258,7 @@ static int promex_dump_metrics(struct appctx *appctx, struct stconn *sc, struct 
 			ctx->px = proxies_list;
 			ctx->st = NULL;
 			ctx->li = NULL;
-			ctx->sv = NULL;
+			promex_set_ctx_sv(ctx, NULL);
 			ctx->flags &= ~PROMEX_FL_INFO_METRIC;
 			ctx->flags |= (PROMEX_FL_METRIC_HDR|PROMEX_FL_FRONT_METRIC);
 			ctx->obj_state = 0;
@@ -1240,7 +1279,7 @@ static int promex_dump_metrics(struct appctx *appctx, struct stconn *sc, struct 
 			ctx->px = proxies_list;
 			ctx->st = NULL;
 			ctx->li = LIST_NEXT(&proxies_list->conf.listeners, struct listener *, by_fe);
-			ctx->sv = NULL;
+			promex_set_ctx_sv(ctx, NULL);
 			ctx->flags &= ~PROMEX_FL_FRONT_METRIC;
 			ctx->flags |= (PROMEX_FL_METRIC_HDR|PROMEX_FL_LI_METRIC);
 			ctx->obj_state = 0;
@@ -1261,7 +1300,7 @@ static int promex_dump_metrics(struct appctx *appctx, struct stconn *sc, struct 
 			ctx->px = proxies_list;
 			ctx->st = NULL;
 			ctx->li = NULL;
-			ctx->sv = NULL;
+			promex_set_ctx_sv(ctx, NULL);
 			ctx->flags &= ~PROMEX_FL_LI_METRIC;
 			ctx->flags |= (PROMEX_FL_METRIC_HDR|PROMEX_FL_BACK_METRIC);
 			ctx->obj_state = 0;
@@ -1282,7 +1321,7 @@ static int promex_dump_metrics(struct appctx *appctx, struct stconn *sc, struct 
 			ctx->px = proxies_list;
 			ctx->st = NULL;
 			ctx->li = NULL;
-			ctx->sv = ctx->px ? ctx->px->srv : NULL;
+			promex_set_ctx_sv(ctx, ctx->px ? ctx->px->srv : NULL);
 			ctx->flags &= ~PROMEX_FL_BACK_METRIC;
 			ctx->flags |= (PROMEX_FL_METRIC_HDR|PROMEX_FL_SRV_METRIC);
 			ctx->obj_state = 0;
@@ -1303,7 +1342,7 @@ static int promex_dump_metrics(struct appctx *appctx, struct stconn *sc, struct 
 			ctx->px = NULL;
 			ctx->st = stktables_list;
 			ctx->li = NULL;
-			ctx->sv = NULL;
+			promex_set_ctx_sv(ctx, NULL);
 			ctx->flags &= ~(PROMEX_FL_METRIC_HDR|PROMEX_FL_SRV_METRIC);
 			ctx->flags |= (PROMEX_FL_METRIC_HDR|PROMEX_FL_STICKTABLE_METRIC);
 			ctx->field_num = STICKTABLE_SIZE;
@@ -1323,7 +1362,7 @@ static int promex_dump_metrics(struct appctx *appctx, struct stconn *sc, struct 
 			ctx->px = NULL;
 			ctx->st = NULL;
 			ctx->li = NULL;
-			ctx->sv = NULL;
+			promex_set_ctx_sv(ctx, NULL);
 			ctx->flags &= ~(PROMEX_FL_METRIC_HDR|PROMEX_FL_STICKTABLE_METRIC);
 			ctx->field_num = 0;
 			appctx->st1 = PROMEX_DUMPER_DONE;
@@ -1344,7 +1383,7 @@ static int promex_dump_metrics(struct appctx *appctx, struct stconn *sc, struct 
 	ctx->px = NULL;
 	ctx->st = NULL;
 	ctx->li = NULL;
-	ctx->sv = NULL;
+	promex_set_ctx_sv(ctx, NULL);
 	ctx->flags = 0;
 	ctx->field_num = 0;
 	appctx->st1 = PROMEX_DUMPER_DONE;
@@ -1500,6 +1539,16 @@ static int promex_appctx_init(struct appctx *appctx)
 	return 0;
 }
 
+/* Callback function that releases a promex applet. This happens when the
+ * connection with the agent is closed. */
+static void promex_appctx_release(struct appctx *appctx)
+{
+	struct promex_ctx *ctx = appctx->svcctx;
+
+	if (appctx->st1 == PROMEX_DUMPER_SRV)
+		srv_drop(ctx->sv);
+}
+
 /* The main I/O handler for the promex applet. */
 static void promex_appctx_handle_io(struct appctx *appctx)
 {
@@ -1522,6 +1571,10 @@ static void promex_appctx_handle_io(struct appctx *appctx)
 
 	switch (appctx->st0) {
 		case PROMEX_ST_INIT:
+			if (!co_data(req)) {
+				applet_need_more_data(appctx);
+				goto out;
+			}
 			ret = promex_parse_uri(appctx, sc);
 			if (ret <= 0) {
 				if (ret == -1)
@@ -1589,6 +1642,7 @@ static void promex_appctx_handle_io(struct appctx *appctx)
 	res->flags |= CF_READ_NULL;
 	sc_shutr(sc);
 	sc_shutw(sc);
+	goto out;
 }
 
 struct applet promex_applet = {
@@ -1596,6 +1650,7 @@ struct applet promex_applet = {
 	.name = "<PROMEX>", /* used for logging */
 	.init = promex_appctx_init,
 	.fct = promex_appctx_handle_io,
+	.release = promex_appctx_release,
 };
 
 static enum act_parse_ret service_parse_prometheus_exporter(const char **args, int *cur_arg, struct proxy *px,

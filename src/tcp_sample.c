@@ -176,7 +176,7 @@ int smp_fetch_dst_is_local(const struct arg *args, struct sample *smp, const cha
 	if (kw[0] == 'f') { /* fc_dst_is_local */
 		struct connection *conn = objt_conn(smp->sess->origin);
 
-		if (conn && conn_get_src(conn))
+		if (conn && conn_get_dst(conn))
 			dst = conn_dst(conn);
 	}
 	else /* dst_is_local */
@@ -232,10 +232,10 @@ smp_fetch_dport(const struct arg *args, struct sample *smp, const char *kw, void
 		if (conn && conn_get_dst(conn))
 			dst = conn_dst(conn);
 	}
-	else if (kw[0] == 'f') { /* fc_dst_post */
+	else if (kw[0] == 'f') { /* fc_dst_port */
 		struct connection *conn = objt_conn(smp->sess->origin);
 
-		if (conn && conn_get_src(conn))
+		if (conn && conn_get_dst(conn))
 			dst = conn_dst(conn);
 	}
         else /* dst_port */
@@ -474,9 +474,9 @@ smp_fetch_fc_reordering(const struct arg *args, struct sample *smp, const char *
  * instance v4/v6 must be declared v4.
  */
 static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
-	{ "bc_dst",      smp_fetch_dst,   0, NULL, SMP_T_SINT, SMP_USE_L4SRV },
+	{ "bc_dst",      smp_fetch_dst,   0, NULL, SMP_T_IPV4, SMP_USE_L4SRV },
 	{ "bc_dst_port", smp_fetch_dport, 0, NULL, SMP_T_SINT, SMP_USE_L4SRV },
-	{ "bc_src",      smp_fetch_src,   0, NULL, SMP_T_SINT, SMP_USE_L4SRV },
+	{ "bc_src",      smp_fetch_src,   0, NULL, SMP_T_IPV4, SMP_USE_L4SRV },
 	{ "bc_src_port", smp_fetch_sport, 0, NULL, SMP_T_SINT, SMP_USE_L4SRV },
 
 	{ "dst",      smp_fetch_dst,   0, NULL, SMP_T_IPV4, SMP_USE_L4CLI },

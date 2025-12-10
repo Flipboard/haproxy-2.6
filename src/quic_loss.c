@@ -25,9 +25,8 @@ void quic_loss_srtt_update(struct quic_loss *ql,
 	ql->latest_rtt = rtt;
 	if (!ql->rtt_min) {
 		/* No previous measurement. */
-		ql->srtt = rtt << 3;
-		/* rttval <- rtt / 2 or 4*rttval <- 2*rtt. */
-		ql->rtt_var = rtt << 1;
+		ql->srtt = rtt;
+		ql->rtt_var = rtt / 2;
 		ql->rtt_min = rtt;
 	}
 	else {
@@ -35,15 +34,13 @@ void quic_loss_srtt_update(struct quic_loss *ql,
 
 		ql->rtt_min = QUIC_MIN(rtt, ql->rtt_min);
 		/* Specific to QUIC (RTT adjustment). */
-		if (ack_delay && rtt > ql->rtt_min + ack_delay)
+		if (ack_delay && rtt >= ql->rtt_min + ack_delay)
 			rtt -= ack_delay;
 		diff = ql->srtt - rtt;
 		if (diff < 0)
 			diff = -diff;
-		/* 4*rttvar = 3*rttvar + |diff| */
-		ql->rtt_var += diff - (ql->rtt_var >> 2);
-		/* 8*srtt = 7*srtt + rtt */
-		ql->srtt += rtt - (ql->srtt >> 3);
+		ql->rtt_var = (3 * ql->rtt_var + diff) / 4;
+		ql->srtt = (7 * ql->srtt + rtt) / 8;
 	}
 
 	TRACE_DEVEL("Loss info update", QUIC_EV_CONN_RTTUPDT, qc,,, ql);
@@ -66,7 +63,7 @@ struct quic_pktns *quic_loss_pktns(struct quic_conn *qc)
 	for (i = QUIC_TLS_PKTNS_HANDSHAKE; i < QUIC_TLS_PKTNS_MAX; i++) {
 		TRACE_DEVEL("pktns", QUIC_EV_CONN_SPTO, qc, &qc->pktns[i]);
 		if (!tick_isset(pktns->tx.loss_time) ||
-		    qc->pktns[i].tx.loss_time < pktns->tx.loss_time)
+		    tick_is_lt(qc->pktns[i].tx.loss_time, pktns->tx.loss_time))
 			pktns = &qc->pktns[i];
 	}
 
@@ -80,7 +77,7 @@ struct quic_pktns *quic_loss_pktns(struct quic_conn *qc)
  * as PTO value if not.
  */
 struct quic_pktns *quic_pto_pktns(struct quic_conn *qc,
-                                  int handshake_completed,
+                                  int handshake_confirmed,
                                   unsigned int *pto)
 {
 	int i;
@@ -90,22 +87,21 @@ struct quic_pktns *quic_pto_pktns(struct quic_conn *qc,
 
 	TRACE_ENTER(QUIC_EV_CONN_SPTO, qc);
 	duration =
-		(ql->srtt >> 3) +
-		(QUIC_MAX(ql->rtt_var, QUIC_TIMER_GRANULARITY) << ql->pto_count);
+		ql->srtt +
+		(QUIC_MAX(4 * ql->rtt_var, QUIC_TIMER_GRANULARITY) << ql->pto_count);
 
-	if (!qc->path->in_flight) {
-		struct quic_enc_level *hel;
-
-		hel = &qc->els[QUIC_TLS_ENC_LEVEL_HANDSHAKE];
-		if (quic_tls_has_tx_sec(hel)) {
-			pktns = &qc->pktns[QUIC_TLS_PKTNS_HANDSHAKE];
-		}
-		else {
-			pktns = &qc->pktns[QUIC_TLS_PKTNS_INITIAL];
-		}
-		lpto = tick_add(now_ms, duration);
-		goto out;
-	}
+	/* RFC 9002 6.2.2.1. Before Address Validation
+	 *
+	 * the client MUST set the PTO timer if the client has not received an
+	 * acknowledgment for any of its Handshake packets and the handshake is
+	 * not confirmed (see Section 4.1.2 of [QUIC-TLS]), even if there are no
+	 * packets in flight.
+	 *
+	 * TODO implement the above paragraph for QUIC on backend side. Note
+	 * that if now_ms is used this function is not reentrant anymore and can
+	 * not be used anytime without side-effect (for example after QUIC
+	 * connection migration).
+	 */
 
 	lpto = TICK_ETERNITY;
 	pktns = p = &qc->pktns[QUIC_TLS_PKTNS_INITIAL];
@@ -117,8 +113,8 @@ struct quic_pktns *quic_pto_pktns(struct quic_conn *qc,
 			continue;
 
 		if (i == QUIC_TLS_PKTNS_01RTT) {
-			if (!handshake_completed) {
-				TRACE_STATE("handshake not already completed", QUIC_EV_CONN_SPTO, qc);
+			if (!handshake_confirmed) {
+				TRACE_STATE("TX PTO handshake not already confirmed", QUIC_EV_CONN_SPTO, qc);
 				pktns = p;
 				goto out;
 			}
@@ -128,7 +124,7 @@ struct quic_pktns *quic_pto_pktns(struct quic_conn *qc,
 
 		p = &qc->pktns[i];
 		tmp_pto = tick_add(p->tx.time_of_last_eliciting, duration);
-		if (!tick_isset(lpto) || tmp_pto < lpto) {
+		if (!tick_isset(lpto) || tick_is_lt(tmp_pto, lpto)) {
 			lpto = tmp_pto;
 			pktns = p;
 		}
@@ -158,6 +154,7 @@ void qc_packet_loss_lookup(struct quic_pktns *pktns, struct quic_conn *qc,
 	struct eb64_node *node;
 	struct quic_loss *ql;
 	unsigned int loss_delay;
+	uint64_t pktthresh;
 
 	TRACE_ENTER(QUIC_EV_CONN_PKTLOSS, qc, pktns);
 	pkts = &pktns->tx.pkts;
@@ -166,15 +163,37 @@ void qc_packet_loss_lookup(struct quic_pktns *pktns, struct quic_conn *qc,
 		goto out;
 
 	ql = &qc->path->loss;
-	loss_delay = QUIC_MAX(ql->latest_rtt, ql->srtt >> 3);
+	loss_delay = QUIC_MAX(ql->latest_rtt, ql->srtt);
 	loss_delay = QUIC_MAX(loss_delay, MS_TO_TICKS(QUIC_TIMER_GRANULARITY)) *
 		QUIC_LOSS_TIME_THRESHOLD_MULTIPLICAND / QUIC_LOSS_TIME_THRESHOLD_DIVISOR;
 
 	node = eb64_first(pkts);
+
+	/* RFC 9002 6.1.1. Packet Threshold
+	 * The RECOMMENDED initial value for the packet reordering threshold
+	 * (kPacketThreshold) is 3, based on best practices for TCP loss detection
+	 * [RFC5681] [RFC6675]. In order to remain similar to TCP, implementations
+	 * SHOULD NOT use a packet threshold less than 3; see [RFC5681].
+
+	 * Some networks may exhibit higher degrees of packet reordering, causing a
+	 * sender to detect spurious losses. Additionally, packet reordering could be
+	 * more common with QUIC than TCP because network elements that could observe
+	 * and reorder TCP packets cannot do that for QUIC and also because QUIC
+	 * packet numbers are encrypted.
+	 */
+
+	/* Dynamic packet reordering threshold calculation depending on the distance
+	 * (in packets) between the last transmitted packet and the oldest still in
+	 * flight before loss detection.
+	 */
+	pktthresh = pktns->tx.next_pn - 1 - eb64_entry(node, struct quic_tx_packet, pn_node)->pn_node.key;
+	/* Apply a ratio to this threshold and add it to QUIC_LOSS_PACKET_THRESHOLD. */
+	pktthresh = pktthresh * global.tune.quic_reorder_ratio / 100 + QUIC_LOSS_PACKET_THRESHOLD;
 	while (node) {
 		struct quic_tx_packet *pkt;
 		int64_t largest_acked_pn;
 		unsigned int loss_time_limit, time_sent;
+		int reordered;
 
 		pkt = eb64_entry(&node->node, struct quic_tx_packet, pn_node);
 		largest_acked_pn = pktns->rx.largest_acked_pn;
@@ -184,10 +203,15 @@ void qc_packet_loss_lookup(struct quic_pktns *pktns, struct quic_conn *qc,
 
 		time_sent = pkt->time_sent;
 		loss_time_limit = tick_add(time_sent, loss_delay);
-		if (tick_is_le(loss_time_limit, now_ms) ||
-			(int64_t)largest_acked_pn >= pkt->pn_node.key + QUIC_LOSS_PACKET_THRESHOLD) {
+
+		reordered = (int64_t)largest_acked_pn >= pkt->pn_node.key + pktthresh;
+		if (reordered)
+			ql->nb_reordered_pkt++;
+
+		if (tick_is_le(loss_time_limit, now_ms) || reordered) {
 			eb64_delete(&pkt->pn_node);
 			LIST_APPEND(lost_pkts, &pkt->list);
+			ql->nb_lost_pkt++;
 			HA_ATOMIC_INC(&qc->prx_counters->lost_pkt);
 		}
 		else {
@@ -202,4 +226,3 @@ void qc_packet_loss_lookup(struct quic_pktns *pktns, struct quic_conn *qc,
  out:
 	TRACE_LEAVE(QUIC_EV_CONN_PKTLOSS, qc, pktns, lost_pkts);
 }
-

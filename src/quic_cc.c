@@ -47,3 +47,22 @@ void quic_cc_state_trace(struct buffer *buf, const struct quic_cc *cc)
 {
 	cc->algo->state_trace(buf, cc);
 }
+
+/* Returns true if congestion window on path ought to be increased. */
+int quic_cwnd_may_increase(const struct quic_path *path)
+{
+	/* RFC 9002 7.8. Underutilizing the Congestion Window
+	 *
+	 * When bytes in flight is smaller than the congestion window and
+	 * sending is not pacing limited, the congestion window is
+	 * underutilized. This can happen due to insufficient application data
+	 * or flow control limits. When this occurs, the congestion window
+	 * SHOULD NOT be increased in either slow start or congestion avoidance.
+	 */
+
+	/* Consider that congestion window can be increased if it is at least
+	 * half full or window size is less than 16k. These conditions should
+	 * not be restricted too much to prevent slow window growing.
+	 */
+	return 2 * path->in_flight >= path->cwnd  || path->cwnd < 16384;
+}

@@ -478,6 +478,81 @@ static struct server *get_server_hh(struct stream *s, const struct server *avoid
 		return map_get_server_hash(px, hash);
 }
 
+/*
+ * This function tries to find a running server for the proxy <px> following
+ * the hash on method. It looks in a variety of locations to hash on
+ * based on the packet itself to compute the server ID. This is useful to optimize
+ * performance by avoiding bounces between servers in contexts where sessions
+ * are shared but cookies are not usable. If the parameter is not found, NULL
+ * is returned. If any server is found, it will be returned. If no valid server
+ * is found, NULL is returned.
+ */
+static struct server *get_server_hashon(struct stream *s, const struct server *avoid)
+{
+    struct proxy *px   = s->be;
+    struct server *srv = NULL;
+    struct hash_rule *hash_rule;
+    struct hash_rule *matched_rule = NULL;
+    int rewind;
+    struct sample * key = NULL;
+    struct session *sess = strm_sess(s);
+
+    /* tot_weight appears to mean srv_count */
+    if (px->lbprm.tot_weight == 0)
+        return NULL;
+
+    rewind = co_data(&s->req);
+    c_rew(&s->req, rewind);
+
+    /* Check every rule until one passes */
+    list_for_each_entry(hash_rule, &px->hash_rules, list) {
+        int ret = 1;
+
+        matched_rule = hash_rule;
+        if (hash_rule->cond) {
+            ret = acl_exec_cond(hash_rule->cond, px, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL);
+            ret = acl_pass(ret);
+            if (hash_rule->cond->pol == ACL_COND_UNLESS)
+                ret = !ret;
+        }
+
+        if (ret) {
+            /* no rule, or the rule matches */
+            break;
+        } else {
+            matched_rule = NULL;
+        }
+    }
+
+
+    /* If our rule matched, fetch the sample */
+    if (matched_rule) {
+        key = sample_fetch_as_type(px, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL, matched_rule->expr, SMP_T_STR);
+    }
+
+    c_adv(&s->req, rewind);
+
+    /* Got our sample, get the server */
+    if (key) {
+        unsigned int hash = gen_hash(px, key->data.u.str.area, key->data.u.str.data);
+        if ((px->lbprm.algo & BE_LB_HASH_MOD) == BE_LB_HMOD_AVAL)
+            hash = full_hash(hash);
+        if (px->lbprm.algo & BE_LB_LKUP_CHTREE)
+            srv = chash_get_server_hash(px, hash, avoid);
+        else
+            srv = map_get_server_hash(px, hash);
+    }   
+
+    /*
+    if (srv != NULL) {
+        fprintf(stderr, "GREG: SERVER SELECTED: %s.\n", srv->id);
+    } else {
+        fprintf(stderr, "GREG: NO SERVER SELECTED.\n");
+    }
+    */
+    return srv;
+}
+
 /* RDP Cookie HASH.  */
 static struct server *get_server_rch(struct stream *s, const struct server *avoid)
 {
@@ -627,8 +702,6 @@ int assign_server(struct stream *s)
 	struct server *srv = NULL, *prev_srv;
 	int err;
 
-	DPRINTF(stderr,"assign_server : s=%p\n",s);
-
 	err = SRV_STATUS_INTERNAL;
 	if (unlikely(s->pend_pos || s->flags & SF_ASSIGNED))
 		goto out_err;
@@ -653,9 +726,9 @@ int assign_server(struct stream *s)
 	if ((s->be->lbprm.algo & BE_LB_KIND) != BE_LB_KIND_HI &&
 	    ((s->sess->flags & SESS_FL_PREFER_LAST) ||
 	     (s->be->options & PR_O_PREF_LAST))) {
-		struct sess_srv_list *srv_list;
-		list_for_each_entry(srv_list, &s->sess->srv_list, srv_list) {
-			struct server *tmpsrv = objt_server(srv_list->target);
+		struct sess_priv_conns *pconns;
+		list_for_each_entry(pconns, &s->sess->priv_conns, sess_el) {
+			struct server *tmpsrv = objt_server(pconns->target);
 
 			if (tmpsrv && tmpsrv->proxy == s->be &&
 			    ((s->sess->flags & SESS_FL_PREFER_LAST) ||
@@ -663,7 +736,7 @@ int assign_server(struct stream *s)
 			      server_has_room(tmpsrv) || (
 			      tmpsrv->queue.length + 1 < s->be->max_ka_queue))) &&
 			    srv_currently_usable(tmpsrv)) {
-				list_for_each_entry(conn, &srv_list->conn_list, session_list) {
+				list_for_each_entry(conn, &pconns->conn_list, sess_el) {
 					if (!(conn->flags & CO_FL_WAIT_XPRT)) {
 						srv = tmpsrv;
 						s->target = &srv->obj_type;
@@ -688,7 +761,7 @@ int assign_server(struct stream *s)
 		/* if there's some queue on the backend, with certain algos we
 		 * know it's because all servers are full.
 		 */
-		if (s->be->queue.length && s->be->queue.length != s->be->beconn &&
+		if (s->be->queue.length && s->be->served && s->be->queue.length != s->be->beconn &&
 		    (((s->be->lbprm.algo & (BE_LB_KIND|BE_LB_NEED|BE_LB_PARM)) == BE_LB_ALGO_FAS)||   // first
 		     ((s->be->lbprm.algo & (BE_LB_KIND|BE_LB_NEED|BE_LB_PARM)) == BE_LB_ALGO_RR) ||   // roundrobin
 		     ((s->be->lbprm.algo & (BE_LB_KIND|BE_LB_NEED|BE_LB_PARM)) == BE_LB_ALGO_SRR))) { // static-rr
@@ -776,6 +849,12 @@ int assign_server(struct stream *s)
 						srv = get_server_ph_post(s, prev_srv);
 				}
 				break;
+
+			case BE_LB_HASH_ON:
+                if (IS_HTX_STRM(s) && (!s->txn || s->txn->req.msg_state < HTTP_MSG_BODY))
+                    break;
+                srv = get_server_hashon(s, prev_srv);
+                break;
 
 			case BE_LB_HASH_HDR:
 				/* Header Parameter hashing */
@@ -966,6 +1045,7 @@ int assign_server_and_queue(struct stream *s)
 	struct server *srv;
 	int err;
 
+ balance_again:
 	if (s->pend_pos)
 		return SRV_STATUS_INTERNAL;
 
@@ -1034,8 +1114,18 @@ int assign_server_and_queue(struct stream *s)
 				return SRV_STATUS_FULL;
 
 			p = pendconn_add(s);
-			if (p)
+			if (p) {
+				/* There's a TOCTOU here: it may happen that between the
+				 * moment we decided to queue the request and the moment
+				 * it was done, the last active request on the server
+				 * ended and no new one will be able to dequeue that one.
+				 * Since we already have our server we don't care, this
+				 * will be handled by the caller which will check for
+				 * this condition and will immediately dequeue it if
+				 * possible.
+				 */
 				return SRV_STATUS_QUEUED;
+			}
 			else
 				return SRV_STATUS_INTERNAL;
 		}
@@ -1047,8 +1137,23 @@ int assign_server_and_queue(struct stream *s)
 	case SRV_STATUS_FULL:
 		/* queue this stream into the proxy's queue */
 		p = pendconn_add(s);
-		if (p)
+		if (p) {
+			/* There's a TOCTOU here: it may happen that between the
+			 * moment we decided to queue the request and the moment
+			 * it was done, the last active request in the backend
+			 * ended and no new one will be able to dequeue that one.
+			 * This is more visible with maxconn 1 where it can
+			 * happen 1/1000 times, though the vast majority are
+			 * correctly recovered from. Since it's so rare and we
+			 * have no server assigned, the best solution in this
+			 * case is to detect the condition, dequeue our request
+			 * and balance it again.
+			 */
+			if (unlikely(pendconn_must_try_again(p)))
+				goto balance_again;
+
 			return SRV_STATUS_QUEUED;
+		}
 		else
 			return SRV_STATUS_INTERNAL;
 
@@ -1114,6 +1219,15 @@ static int alloc_bind_address(struct sockaddr_storage **ss,
 			return SRV_STATUS_INTERNAL;
 
 		**ss = *addr;
+		if ((src->opts & CO_SRC_TPROXY_MASK) == CO_SRC_TPROXY_CIP) {
+			/* always set port to zero when using "clientip", or
+			 * the idle connection hash will include the port part.
+			 */
+			if (addr->ss_family == AF_INET)
+				((struct sockaddr_in *)*ss)->sin_port = 0;
+			else if (addr->ss_family == AF_INET6)
+				((struct sockaddr_in6 *)*ss)->sin6_port = 0;
+		}
 		break;
 
 	case CO_SRC_TPROXY_DYN:
@@ -1394,14 +1508,13 @@ static int connect_server(struct stream *s)
 #endif /* USE_OPENSSL */
 
 	/* 3. destination address */
-	if (srv && (!is_addr(&srv->addr) || srv->flags & SRV_F_MAPPORTS))
-		hash_params.dst_addr = s->scb->dst;
+	hash_params.dst_addr = s->scb->dst;
 
 	/* 4. source address */
 	hash_params.src_addr = bind_addr;
 
 	/* 5. proxy protocol */
-	if (srv && srv->pp_opts) {
+	if (srv && (srv->pp_opts & SRV_PP_ENABLED)) {
 		proxy_line_ret = make_proxy_line(trash.area, trash.size, srv, cli_conn, s);
 		if (proxy_line_ret) {
 			hash_params.proxy_prehash =
@@ -1608,6 +1721,9 @@ skip_reuse:
 				return SF_ERR_RESOURCE;
 			}
 
+			/* copy the target address into the connection */
+			*srv_conn->dst = *s->scb->dst;
+
 			srv_conn->hash_node->node.key = hash;
 		}
 	}
@@ -1618,9 +1734,6 @@ skip_reuse:
 	/* srv_conn is still NULL only on allocation failure */
 	if (!srv_conn)
 		return SF_ERR_RESOURCE;
-
-	/* copy the target address into the connection */
-	*srv_conn->dst = *s->scb->dst;
 
 	/* Copy network namespace from client connection */
 	srv_conn->proxy_netns = cli_conn ? cli_conn->proxy_netns : NULL;
@@ -1663,7 +1776,7 @@ skip_reuse:
 		/* process the case where the server requires the PROXY protocol to be sent */
 		srv_conn->send_proxy_ofs = 0;
 
-		if (srv && srv->pp_opts) {
+		if (srv && (srv->pp_opts & SRV_PP_ENABLED)) {
 			srv_conn->flags |= CO_FL_SEND_PROXY;
 			srv_conn->send_proxy_ofs = 1; /* must compute size */
 		}
@@ -1921,7 +2034,16 @@ int srv_redispatch_connect(struct stream *s)
 	case SRV_STATUS_QUEUED:
 		s->conn_exp = tick_add_ifset(now_ms, s->be->timeout.queue);
 		s->scb->state = SC_ST_QUE;
-		/* do nothing else and do not wake any other stream up */
+
+		/* handle the unlikely event where we added to the server's
+		 * queue just after checking the server was full and before
+		 * it released its last entry (with extremely low maxconn).
+		 * Not needed for backend queues, already handled in
+		 * assign_server_and_queue().
+		 */
+		if (unlikely(srv && may_dequeue_tasks(srv, s->be)))
+			process_srv_queue(srv);
+
 		return 1;
 
 	case SRV_STATUS_INTERNAL:
@@ -2602,6 +2724,8 @@ const char *backend_lb_algo_str(int algo) {
 		return "first";
 	else if (algo == BE_LB_ALGO_LC)
 		return "leastconn";
+	else if (algo == BE_LB_ALGO_HASH)
+		return "hash";
 	else if (algo == BE_LB_ALGO_SH)
 		return "source";
 	else if (algo == BE_LB_ALGO_UH)
@@ -2678,6 +2802,10 @@ int backend_parse_balance(const char **args, char **err, struct proxy *curproxy)
 			}
 		}
 	}
+	else if (!strcmp(args[0], "hash")) {
+		curproxy->lbprm.algo &= ~BE_LB_ALGO;
+		curproxy->lbprm.algo |= BE_LB_ALGO_HASH;
+	}
 	else if (strcmp(args[0], "source") == 0) {
 		curproxy->lbprm.algo &= ~BE_LB_ALGO;
 		curproxy->lbprm.algo |= BE_LB_ALGO_SH;
@@ -2743,7 +2871,7 @@ int backend_parse_balance(const char **args, char **err, struct proxy *curproxy)
 			}
 		}
 	}
-	else if (strcmp(args[0], "hash") == 0) {
+	else if (strcmp(args[0], "hash_haproxy") == 0) {
 		if (!*args[1]) {
 			memprintf(err, "%s requires a sample expression.", args[0]);
 			return -1;
@@ -2817,7 +2945,7 @@ int backend_parse_balance(const char **args, char **err, struct proxy *curproxy)
 		}
 	}
 	else {
-		memprintf(err, "only supports 'roundrobin', 'static-rr', 'leastconn', 'source', 'uri', 'url_param', 'hdr(name)' and 'rdp-cookie(name)' options.");
+		memprintf(err, "only supports 'roundrobin', 'static-rr', 'hash', 'leastconn', 'source', 'uri', 'url_param', 'hdr(name)' and 'rdp-cookie(name)' options.");
 		return -1;
 	}
 	return 0;

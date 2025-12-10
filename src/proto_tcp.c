@@ -728,9 +728,7 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 	goto tcp_return;
 
  tcp_close_return:
-	free_trash_chunk(msg);
-	msg = NULL;
-	close(fd);
+	fd_delete(fd);
  tcp_return:
 	if (msg && errlen && msg->data) {
 		char pn[INET6_ADDRSTRLEN];
@@ -760,22 +758,24 @@ static void tcp_disable_listener(struct listener *l)
 }
 
 /* Suspend a receiver. Returns < 0 in case of failure, 0 if the receiver
- * was totally stopped, or > 0 if correctly suspended.
+ * was totally stopped, or > 0 if correctly suspended. Note that inherited FDs
+ * are neither suspended nor resumed, we only enable/disable polling on them.
  */
 static int tcp_suspend_receiver(struct receiver *rx)
 {
 	const struct sockaddr sa = { .sa_family = AF_UNSPEC };
 	int ret;
 
-	/* we never do that with a shared FD otherwise we'd break it in the
+	/* We never disconnect a shared FD otherwise we'd break it in the
 	 * parent process and any possible subsequent worker inheriting it.
+	 * Thus we just stop receiving from it.
 	 */
 	if (rx->flags & RX_F_INHERITED)
-		return -1;
+		goto done;
 
 	if (connect(rx->fd, &sa, sizeof(sa)) < 0)
 		goto check_already_done;
-
+ done:
 	fd_stop_recv(rx->fd);
 	return 1;
 
@@ -796,7 +796,8 @@ static int tcp_suspend_receiver(struct receiver *rx)
 }
 
 /* Resume a receiver. Returns < 0 in case of failure, 0 if the receiver
- * was totally stopped, or > 0 if correctly suspended.
+ * was totally stopped, or > 0 if correctly resumed. Note that inherited FDs
+ * are neither suspended nor resumed, we only enable/disable polling on them.
  */
 static int tcp_resume_receiver(struct receiver *rx)
 {
@@ -805,7 +806,7 @@ static int tcp_resume_receiver(struct receiver *rx)
 	if (rx->fd < 0)
 		return 0;
 
-	if (listen(rx->fd, listener_backlog(l)) == 0) {
+	if ((rx->flags & RX_F_INHERITED) || listen(rx->fd, listener_backlog(l)) == 0) {
 		fd_want_recv(l->rx.fd);
 		return 1;
 	}

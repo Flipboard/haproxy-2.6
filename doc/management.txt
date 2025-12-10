@@ -333,6 +333,11 @@ list of options is :
         the byte's value to -dM but using this option allows to disable/enable
         use of a previously set value.
 
+  -dR : disable SO_REUSEPORT socket option on listening ports. It is equivalent
+    to the "global" section's "noreuseport" keyword. This may be applied in
+    multi-threading scenarios, when load distribution issues observed among the
+    haproxy threads (could be monitored with top).
+
   -dS : disable use of the splice() system call. It is equivalent to the
     "global" section's "nosplice" keyword. This may be used when splice() is
     suspected to behave improperly or to cause performance issues, or when
@@ -382,6 +387,12 @@ list of options is :
     the libc fails to resolve an address, the startup sequence is not
     interrupted.
 
+  -dv : disable the use of the "evports" poller. It is equivalent to the
+    "global" section's keyword "noevports". It is mostly useful when suspecting
+    a bug related to this poller. On systems supporting event ports (SunOS
+    derived from Solaris 10 and later), the fallback will generally be the
+    "poll" poller.
+
   -m <limit> : limit the total allocatable memory to <limit> megabytes across
     all processes. This may cause some connection refusals or some slowdowns
     depending on the amount of memory needed for normal operations. This is
@@ -400,9 +411,8 @@ list of options is :
     before entering the chroot jail, and after doing the chdir() implied by
     "-C". Each pid appears on its own line.
 
-  -q : set "quiet" mode. This disables some messages during the configuration
-    parsing and during startup. It can be used in combination with "-c" to
-    just check if a configuration file is valid or not.
+  -q : set "quiet" mode. This disables the output messages. It can be used in
+    combination with "-c" to just check if a configuration file is valid or not.
 
   -S <bind>[,bind_options...]: in master-worker mode, bind a master CLI, which
     allows the access to every processes, running or leaving ones.
@@ -435,11 +445,16 @@ list of options is :
   -x <unix_socket> : connect to the specified socket and try to retrieve any
     listening sockets from the old process, and use them instead of trying to
     bind new ones. This is useful to avoid missing any new connection when
-    reloading the configuration on Linux. The capability must be enable on the
-    stats socket using "expose-fd listeners" in your configuration.
-    In master-worker mode, the master will use this option upon a reload with
-    the "sockpair@" syntax, which allows the master to connect directly to a
-    worker without using stats socket declared in the configuration.
+    reloading the configuration on Linux.
+
+    Without master-worker mode, the capability must be enable on the stats
+    socket using "expose-fd listeners" in your configuration.
+
+    In master-worker mode, it does not need "expose-fd listeners", the master
+    will use automatically this option upon a reload with the "sockpair@"
+    syntax, which allows the master to connect directly to a worker without using
+    any stats socket declared in the configuration. If you want to disable this,
+    you can pass -x /dev/null.
 
 A safe way to start HAProxy from an init file consists in forcing the daemon
 mode, storing existing pids to a pid file and using this pid file to notify
@@ -1067,9 +1082,9 @@ CSV output format for monitoring tools. The same format is provided on the
 Unix socket.
 
 Statistics are regroup in categories labelled as domains, corresponding to the
-multiple components of HAProxy. There are two domains available: proxy and dns.
-If not specified, the proxy domain is selected. Note that only the proxy
-statistics are printed on the HTTP page.
+multiple components of HAProxy. There are two domains available: proxy and
+resolvers. If not specified, the proxy domain is selected. Note that only the
+proxy statistics are printed on the HTTP page.
 
 9.1. CSV format
 ---------------
@@ -1628,6 +1643,7 @@ add server <backend>/<server> [args]*
   - check-via-socks4
   - ciphers
   - ciphersuites
+  - cookie
   - crl-file
   - crt
   - disabled
@@ -2879,7 +2895,7 @@ show resolvers [<resolvers section id>]
     other: any other DNS errors
     invalid: invalid DNS response (from a protocol point of view)
     too_big: too big response
-    outdated: number of response arrived too late (after an other name server)
+    outdated: number of response arrived too late (after another name server)
 
 show servers conn [<backend>]
   Dump the current and idle connections state of the servers belonging to the
@@ -3019,14 +3035,14 @@ show sess <id>
   The special id "all" dumps the states of all sessions, which must be avoided
   as much as possible as it is highly CPU intensive and can take a lot of time.
 
-show stat [domain <dns|proxy>] [{<iid>|<proxy>} <type> <sid>] [typed|json] \
-          [desc] [up|no-maint]
-  Dump statistics. The domain is used to select which statistics to print; dns
-  and proxy are available for now. By default, the CSV format is used; you can
-  activate the extended typed output format described in the section above if
-  "typed" is passed after the other arguments; or in JSON if "json" is passed
-  after the other arguments. By passing <id>, <type> and <sid>, it is possible
-  to dump only selected items :
+show stat [domain <resolvers|proxy>] [{<iid>|<proxy>} <type> <sid>] \
+          [typed|json] [desc] [up|no-maint]
+  Dump statistics. The domain is used to select which statistics to print;
+  resolvers and proxy are available for now. By default, the CSV format is used;
+  you can activate the extended typed output format described in the section
+  above if "typed" is passed after the other arguments; or in JSON if "json" is
+  passed after the other arguments. By passing <id>, <type> and <sid>, it is
+  possible to dump only selected items :
     - <iid> is a proxy ID, -1 to dump everything. Alternatively, a proxy name
       <proxy> may be specified. In this case, this proxy's ID will be used as
       the ID selector.
@@ -3188,8 +3204,13 @@ show stat [domain <dns|proxy>] [{<iid>|<proxy>} <type> <sid>] [typed|json] \
     python -m json.tool
 
 show ssl ca-file [<cafile>[:<index>]]
-  Display the list of CA files used by HAProxy and their respective certificate
-  counts. If a filename is prefixed by an asterisk, it is a transaction which
+  Display the list of CA files loaded into the process and their respective
+  certificate counts. The certificates are not used by any frontend or backend
+  until their status is "Used".
+  A "@system-ca" entry can appear in the list, it is loaded by the httpclient
+  by default. It contains the list of trusted CA of your system returned by
+  OpenSSL.
+  If a filename is prefixed by an asterisk, it is a transaction which
   is not committed yet. If a <cafile> is specified without <index>, it will show
   the status of the CA file ("Used"/"Unused") followed by details about all the
   certificates contained in the CA file. The details displayed for every
@@ -3232,7 +3253,8 @@ show ssl ca-file [<cafile>[:<index>]]
     [...]
 
 show ssl cert [<filename>]
-  Display the list of certificates used on frontends and backends.
+  Display the list of certificates loaded into the process. They are not used
+  by any frontend or backend until their status is "Used".
   If a filename is prefixed by an asterisk, it is a transaction which is not
   committed yet. If a filename is specified, it will show details about the
   certificate. This command can be useful to check if a certificate was well
@@ -3254,6 +3276,7 @@ show ssl cert [<filename>]
 
     $ echo "@1 show ssl cert test.local.pem" | socat /var/run/haproxy.master -
     Filename: test.local.pem
+    Status: Used
     Serial: 03ECC19BA54B25E85ABA46EE561B9A10D26F
     notBefore: Sep 13 21:20:24 2019 GMT
     notAfter: Dec 12 21:20:24 2019 GMT
@@ -3265,10 +3288,12 @@ show ssl cert [<filename>]
 
     $ echo "@1 show ssl cert *test.local.pem" | socat /var/run/haproxy.master -
     Filename: *test.local.pem
+    Status: Unused
     [...]
 
 show ssl crl-file [<crlfile>[:<index>]]
-  Display the list of CRL files used by HAProxy.
+  Display the list of CRL files loaded into the process. They are not used
+  by any frontend or backend until their status is "Used".
   If a filename is prefixed by an asterisk, it is a transaction which is not
   committed yet. If a <crlfile> is specified without <index>, it will show the
   status of the CRL file ("Used"/"Unused") followed by details about all the
@@ -4191,4 +4216,3 @@ A safe configuration will have :
     group allowed to access the CLI so that nobody may access it :
 
       stats socket /var/run/haproxy.stat uid hatop gid hatop mode 600
-

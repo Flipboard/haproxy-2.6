@@ -1,6 +1,6 @@
 /*
  * HAProxy : High Availability-enabled HTTP/TCP proxy
- * Copyright 2000-2022 Willy Tarreau <willy@haproxy.org>.
+ * Copyright 2000-2025 Willy Tarreau <willy@haproxy.org>.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -209,6 +209,7 @@ struct global global = {
 		.quic_backend_max_idle_timeout = QUIC_TP_DFLT_BACK_MAX_IDLE_TIMEOUT,
 		.quic_frontend_max_idle_timeout = QUIC_TP_DFLT_FRONT_MAX_IDLE_TIMEOUT,
 		.quic_frontend_max_streams_bidi = QUIC_TP_DFLT_FRONT_MAX_STREAMS_BIDI,
+		.quic_reorder_ratio = QUIC_DFLT_REORDER_RATIO,
 		.quic_retry_threshold = QUIC_DFLT_RETRY_THRESHOLD,
 		.quic_streams_buf = 30,
 #endif /* USE_QUIC */
@@ -218,6 +219,8 @@ struct global global = {
 	.maxsslconn = DEFAULT_MAXSSLCONN,
 #endif
 #endif
+	/* by default do not protect against clients using privileged port */
+	.clt_privileged_ports = HA_PROTO_ANY,
 	/* others NULL OK */
 };
 
@@ -681,6 +684,7 @@ static void mworker_reexec()
 	char *msg = NULL;
 	struct rlimit limit;
 	struct mworker_proc *current_child = NULL;
+	int x_off = 0; /* disable -x by putting -x /dev/null */
 
 	mworker_block_signals();
 #if defined(USE_SYSTEMD)
@@ -732,6 +736,10 @@ static void mworker_reexec()
 	/* copy the program name */
 	next_argv[next_argc++] = old_argv[0];
 
+	/* we need to reintroduce /dev/null everytime */
+	if (old_unixsocket && strcmp(old_unixsocket, "/dev/null") == 0)
+		x_off = 1;
+
 	/* insert the new options just after argv[0] in case we have a -- */
 
 	if (getenv("HAPROXY_MWORKER_WAIT_ONLY") == NULL) {
@@ -752,14 +760,19 @@ static void mworker_reexec()
 				msg = NULL;
 			}
 		}
-
-		if (current_child) {
+		if (!x_off && current_child) {
 			/* add the -x option with the socketpair of the current worker */
 			next_argv[next_argc++] = "-x";
 			if ((next_argv[next_argc++] = memprintf(&msg, "sockpair@%d", current_child->ipc_fd[0])) == NULL)
 				goto alloc_error;
 			msg = NULL;
 		}
+	}
+
+	if (x_off) {
+		/* if the cmdline contained a -x /dev/null, continue to use it */
+		next_argv[next_argc++] = "-x";
+		next_argv[next_argc++] = "/dev/null";
 	}
 
 	/* copy the previous options */
@@ -837,13 +850,6 @@ static void mworker_loop()
 	mworker_catch_sigchld(NULL); /* ensure we clean the children in case
 				     some SIGCHLD were lost */
 
-	global.nbthread = 1;
-
-#ifdef USE_THREAD
-	tid_bit = 1;
-	all_threads_mask = 1;
-#endif
-
 	jobs++; /* this is the "master" job, we want to take care of the
 		signals even if there is no listener so the poll loop don't
 		leave */
@@ -878,6 +884,17 @@ void reexec_on_failure()
 	usermsgs_clr(NULL);
 	ha_warning("Loading failure!\n");
 	mworker_reexec_waitmode();
+}
+
+/*
+ * Exit with an error message upon a wait-mode failure.
+ */
+void exit_on_waitmode_failure()
+{
+	if (!atexit_flag)
+		return;
+
+	ha_alert("Non-recoverable mworker wait-mode error, exiting.\n");
 }
 
 
@@ -947,19 +964,19 @@ static void sig_dump_state(struct sig_handler *sh)
 			chunk_printf(&trash,
 			             "SIGHUP: Proxy %s has no servers. Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %lld+%lld.",
 			             p->id,
-			             p->feconn, p->beconn, p->totpend, p->queue.length, p->fe_counters.cum_conn, p->be_counters.cum_conn);
+			             p->feconn, p->beconn, p->totpend, p->queue.length, p->fe_counters.cum_conn, p->be_counters.cum_sess);
 		} else if (p->srv_act == 0) {
 			chunk_printf(&trash,
 			             "SIGHUP: Proxy %s %s ! Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %lld+%lld.",
 			             p->id,
 			             (p->srv_bck) ? "is running on backup servers" : "has no server available",
-			             p->feconn, p->beconn, p->totpend, p->queue.length, p->fe_counters.cum_conn, p->be_counters.cum_conn);
+			             p->feconn, p->beconn, p->totpend, p->queue.length, p->fe_counters.cum_conn, p->be_counters.cum_sess);
 		} else {
 			chunk_printf(&trash,
 			             "SIGHUP: Proxy %s has %d active servers and %d backup servers available."
 			             " Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %lld+%lld.",
 			             p->id, p->srv_act, p->srv_bck,
-			             p->feconn, p->beconn, p->totpend, p->queue.length, p->fe_counters.cum_conn, p->be_counters.cum_conn);
+			             p->feconn, p->beconn, p->totpend, p->queue.length, p->fe_counters.cum_conn, p->be_counters.cum_sess);
 		}
 		ha_warning("%s\n", trash.area);
 		send_log(p, LOG_NOTICE, "%s\n", trash.area);
@@ -1367,8 +1384,38 @@ static int compute_ideal_maxconn()
 	 *   - two FDs per connection
 	 */
 
-	if (global.fd_hard_limit && remain > global.fd_hard_limit)
+	/* on some modern distros for archs like amd64 fs.nr_open (kernel max)
+	 * could be in order of 1 billion. Systemd since the version 256~rc3-3
+	 * bumped fs.nr_open as the hard RLIMIT_NOFILE (rlim_fd_max_at_boot).
+	 * If we are started without any limits, we risk to finish with computed
+	 * maxconn = ~500000000, maxsock = ~2*maxconn. So, fdtab will be
+	 * extremely large and watchdog will kill the process, when it will try
+	 * to loop over the fdtab (see fd_reregister_all). Please note, that
+	 * fd_hard_limit is taken in account implicitly via 'ideal_maxconn'
+	 * value in all global.maxconn adjustements, when global.rlimit_memmax
+	 * is set:
+	 *
+	 *   MIN(global.maxconn, capped by global.rlimit_memmax, ideal_maxconn);
+	 *
+	 * It also caps global.rlimit_nofile, if it couldn't be set as rlim_cur
+	 * and as rlim_max. So, fd_hard_limitit is a good parameter to serve as
+	 * a safeguard, when no haproxy-specific limits are set, i.e.
+	 * rlimit_memmax, maxconn, rlimit_nofile. But it must be kept as a zero,
+	 * if only one of these ha-specific limits is presented in config or in
+	 * the cmdline.
+	 */
+	if (!global.fd_hard_limit && !global.maxconn && !global.rlimit_nofile
+	    && !global.rlimit_memmax)
+		global.fd_hard_limit = DEFAULT_MAXFD;
+
+	if (global.fd_hard_limit && (remain > global.fd_hard_limit)) {
+		/* cap remain only when global.fd_hard_limit > 0, i.e.: either
+		 * there were no any other limits set and it's defined by lines
+		 * above as DEFAULT_MAXFD (100), or fd_hard_limit is explicitly
+		 * provided in config.
+		 */
 		remain = global.fd_hard_limit;
+	}
 
 	/* subtract listeners and checks */
 	remain -= global.maxsock;
@@ -1478,6 +1525,8 @@ static void init_early(int argc, char **argv)
 	char *progname;
 	char *tmp;
 	int len;
+
+	setenv("HAPROXY_STARTUP_VERSION", HAPROXY_VERSION, 0);
 
 	/* First, let's initialize most global variables */
 	totalconn = actconn = listeners = stopping = 0;
@@ -1885,17 +1934,16 @@ static void dump_registered_keywords(void)
 static void generate_random_cluster_secret()
 {
 	/* used as a default random cluster-secret if none defined. */
-	uint64_t rand = ha_random64();
+	uint64_t rand;
 
 	/* The caller must not overwrite an already defined secret. */
-	BUG_ON(global.cluster_secret);
+	BUG_ON(cluster_secret_isset);
 
-	global.cluster_secret = malloc(8);
-	if (!global.cluster_secret)
-		return;
-
+	rand = ha_random64();
 	memcpy(global.cluster_secret, &rand, sizeof(rand));
-	global.cluster_secret[7] = '\0';
+	rand = ha_random64();
+	memcpy(global.cluster_secret + sizeof(rand), &rand, sizeof(rand));
+	cluster_secret_isset = 1;
 }
 
 /*
@@ -1933,10 +1981,17 @@ static void init(int argc, char **argv)
 		global.mode &= ~MODE_MWORKER;
 	}
 
-	if ((global.mode & (MODE_MWORKER | MODE_CHECK | MODE_CHECK_CONDITION)) == MODE_MWORKER &&
-	    (getenv("HAPROXY_MWORKER_REEXEC") != NULL)) {
-		atexit_flag = 1;
-		atexit(reexec_on_failure);
+	/* set the atexit functions when not doing configuration check */
+	if (!(global.mode & (MODE_CHECK | MODE_CHECK_CONDITION))
+	    && (getenv("HAPROXY_MWORKER_REEXEC") != NULL)) {
+
+		if (global.mode & MODE_MWORKER) {
+			atexit_flag = 1;
+			atexit(reexec_on_failure);
+		} else if (global.mode & MODE_MWORKER_WAIT) {
+			atexit_flag = 1;
+			atexit(exit_on_waitmode_failure);
+		}
 	}
 
 	if (change_dir && chdir(change_dir) < 0) {
@@ -2095,9 +2150,23 @@ static void init(int argc, char **argv)
 
 		LIST_APPEND(&proc_list, &tmproc->list);
 	}
+
+	if (global.mode & MODE_MWORKER_WAIT) {
+		/* in exec mode, there's always exactly one thread. Failure to
+		 * set these ones now will result in nbthread being detected
+		 * automatically.
+		 */
+		global.nbthread = 1;
+#ifdef USE_THREAD
+		tid_bit = 1;
+		all_threads_mask = 1;
+#endif
+	}
+
 	if (global.mode & (MODE_MWORKER|MODE_MWORKER_WAIT)) {
 		struct wordlist *it, *c;
 
+		master = 1;
 		/* get the info of the children in the env */
 		if (mworker_env_to_proc_list() < 0) {
 			exit(EXIT_FAILURE);
@@ -2138,7 +2207,23 @@ static void init(int argc, char **argv)
 		exit(1);
 	}
 
+	/* update the ready date that will be used to count the startup time
+	 * during config checks (e.g. to schedule certain tasks if needed)
+	 */
+	gettimeofday(&date, NULL);
+	ready_date = date;
+
+	/* Note: global.nbthread will be initialized as part of this call */
 	err_code |= check_config_validity();
+	if (*initial_cwd && chdir(initial_cwd) == -1) {
+		ha_alert("Impossible to get back to initial directory '%s' : %s\n", initial_cwd, strerror(errno));
+		exit(1);
+	}
+
+	/* update the ready date to also account for the check time */
+	gettimeofday(&date, NULL);
+	ready_date = date;
+
 	for (px = proxies_list; px; px = px->next) {
 		struct server *srv;
 		struct post_proxy_check_fct *ppcf;
@@ -2206,6 +2291,10 @@ static void init(int argc, char **argv)
 	if (global.mode & MODE_DUMP_KWD)
 		dump_registered_keywords();
 
+	if (global.mode & MODE_DIAG) {
+		cfg_run_diagnostics();
+	}
+
 	if (global.mode & MODE_CHECK) {
 		struct peers *pr;
 		struct proxy *px;
@@ -2237,10 +2326,6 @@ static void init(int argc, char **argv)
 		exit(2);
 	}
 
-	if (global.mode & MODE_DIAG) {
-		cfg_run_diagnostics();
-	}
-
 	/* Initialize the random generators */
 #ifdef USE_OPENSSL
 	/* Initialize SSL random generator. Must be called before chroot for
@@ -2265,7 +2350,7 @@ static void init(int argc, char **argv)
 
 	/* set the default maxconn in the master, but let it be rewritable with -n */
 	if (global.mode & MODE_MWORKER_WAIT)
-		global.maxconn = DEFAULT_MAXCONN;
+		global.maxconn = MASTER_MAXCONN;
 
 	if (cfg_maxconn > 0)
 		global.maxconn = cfg_maxconn;
@@ -2520,7 +2605,7 @@ static void init(int argc, char **argv)
 		exit(1);
 	}
 
-	if (!global.cluster_secret)
+	if (!cluster_secret_isset)
 		generate_random_cluster_secret();
 
 	/*
@@ -2655,6 +2740,17 @@ void deinit(void)
 		free_proxy(p0);
 	}/* end while(p) */
 
+	/* we don't need to free sink_proxies_list proxies since it is
+	 * already handled in sink_deinit()
+	 */
+	p = cfg_log_forward;
+	/* we need to manually clean cfg_log_forward proxy list */
+	while (p) {
+		p0 = p;
+		p = p->next;
+		free_proxy(p0);
+	}
+
 	/* destroy all referenced defaults proxies  */
 	proxy_destroy_all_unref_defaults();
 
@@ -2696,7 +2792,6 @@ void deinit(void)
 	ha_free(&global.log_send_hostname);
 	chunk_destroy(&global.log_tag);
 	ha_free(&global.chroot);
-	ha_free(&global.cluster_secret);
 	ha_free(&global.pidfile);
 	ha_free(&global.node);
 	ha_free(&global.desc);
@@ -2709,10 +2804,10 @@ void deinit(void)
 	idle_conn_task = NULL;
 
 	list_for_each_entry_safe(log, logb, &global.logsrvs, list) {
-			LIST_DELETE(&log->list);
-			free(log->conf.file);
-			free(log);
-		}
+		LIST_DEL_INIT(&log->list);
+		free_logsrv(log);
+	}
+
 	list_for_each_entry_safe(wl, wlb, &cfg_cfgfiles, list) {
 		free(wl->s);
 		LIST_DELETE(&wl->list);
@@ -2831,7 +2926,7 @@ void run_poll_loop()
 			if (thread_has_tasks()) {
 				activity[tid].wake_tasks++;
 				_HA_ATOMIC_AND(&sleeping_thread_mask, ~tid_bit);
-			} else if (signal_queue_len) {
+			} else if (signal_queue_len && tid == 0) {
 				/* this check is required to avoid
 				 * a race with wakeup on signals using wake_threads() */
 				_HA_ATOMIC_AND(&sleeping_thread_mask, ~tid_bit);
@@ -3346,6 +3441,10 @@ int main(int argc, char **argv)
 				 global.maxsock);
 	}
 
+	/* update the ready date a last time to also account for final setup time */
+	gettimeofday(&date, NULL);
+	ready_date = date;
+
 	if (global.mode & (MODE_DAEMON | MODE_MWORKER | MODE_MWORKER_WAIT)) {
 		int ret = 0;
 		int in_parent = 0;
@@ -3412,9 +3511,12 @@ int main(int argc, char **argv)
 						if (child->reloads == 0 &&
 						    child->options & PROC_O_TYPE_WORKER &&
 						    child->pid == -1) {
-							child->timestamp = now.tv_sec;
+							child->timestamp = date.tv_sec;
 							child->pid = ret;
 							child->version = strdup(haproxy_version);
+							/* at this step the fd is bound for the worker, set it to -1 so
+							 * it could be close in case of errors in mworker_cleanup_proc() */
+							child->ipc_fd[1] = -1;
 							break;
 						}
 					}
@@ -3536,22 +3638,6 @@ int main(int argc, char **argv)
 		ha_free(&global.chroot);
 		set_identity(argv[0]);
 
-		/* pass through every cli socket, and check if it's bound to
-		 * the current process and if it exposes listeners sockets.
-		 * Caution: the GTUNE_SOCKET_TRANSFER is now set after the fork.
-		 * */
-
-		if (global.cli_fe) {
-			struct bind_conf *bind_conf;
-
-			list_for_each_entry(bind_conf, &global.cli_fe->conf.bind, by_fe) {
-				if (bind_conf->level & ACCESS_FD_LISTENERS) {
-					global.tune.options |= GTUNE_SOCKET_TRANSFER;
-					break;
-				}
-			}
-		}
-
 		/*
 		 * This is only done in daemon mode because we might want the
 		 * logs on stdout in mworker mode. If we're NOT in QUIET mode,
@@ -3571,6 +3657,22 @@ int main(int argc, char **argv)
 		if (!(global.mode & MODE_MWORKER)) /* in mworker mode we don't want a new pgid for the children */
 			setsid();
 		fork_poller();
+	}
+
+	/* pass through every cli socket, and check if it's bound to
+	 * the current process and if it exposes listeners sockets.
+	 * Caution: the GTUNE_SOCKET_TRANSFER is now set after the fork.
+	 * */
+
+	if (global.cli_fe) {
+		struct bind_conf *bind_conf;
+
+		list_for_each_entry(bind_conf, &global.cli_fe->conf.bind, by_fe) {
+			if (bind_conf->level & ACCESS_FD_LISTENERS) {
+				global.tune.options |= GTUNE_SOCKET_TRANSFER;
+				break;
+			}
+		}
 	}
 
 	/* try our best to re-enable core dumps depending on system capabilities.

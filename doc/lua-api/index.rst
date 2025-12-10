@@ -131,6 +131,13 @@ Core class
    The "core" class is static, it is not possible to create a new object of this
    type.
 
+.. js:attribute:: core.silent
+
+  :returns: integer
+
+  This attribute is an integer, it contains the value -1. It is a special value
+  used to disable logging.
+
 .. js:attribute:: core.emerg
 
   :returns: integer
@@ -448,7 +455,7 @@ Core class
 
 .. js:function:: core.msleep(milliseconds)
 
-  **context**: body, init, task, action
+  **context**: task, action
 
   The `core.msleep()` stops the Lua execution between specified milliseconds.
 
@@ -474,13 +481,13 @@ Core class
   used in HAProxy with the prefix "lua.". An action gets a TXN object class as
   input.
 
-  :param string name: is the name of the converter.
-  :param table actions: is a table of string describing the HAProxy actions who
-                        want to register to. The expected actions are 'tcp-req',
-                        'tcp-res', 'http-req' or 'http-res'.
+  :param string name: is the name of the action.
+  :param table actions: is a table of string describing the HAProxy actions
+   facilities where to expose the new action. Expected facilities  are:
+   'tcp-req', 'tcp-res', 'http-req' or 'http-res'.
+  :param function func: is the Lua function called to work as an action.
   :param integer nb_args: is the expected number of argument for the action.
                           By default the value is 0.
-  :param function func: is the Lua function called to work as converter.
 
   The prototype of the Lua function used as argument is:
 
@@ -805,7 +812,7 @@ Core class
 
 .. js:function:: core.sleep(int seconds)
 
-  **context**: body, init, task, action
+  **context**: task, action
 
   The `core.sleep()` functions stop the Lua execution between specified seconds.
 
@@ -850,7 +857,7 @@ Core class
 
 .. js:function:: core.yield()
 
-  **context**: task, action, sample-fetch, converter
+  **context**: task, action
 
   Give back the hand at the HAProxy scheduler. It is used when the LUA
   processing consumes a lot of processing time.
@@ -936,7 +943,8 @@ Proxy class
 
 .. js:attribute:: Proxy.stktable
 
-  Contains a stick table object attached to the proxy.
+  Contains a stick table object of type :ref:`sticktable_class` attached to the
+  proxy.
 
 .. js:attribute:: Proxy.listeners
 
@@ -987,8 +995,8 @@ Proxy class
   Returns a string describing the mode of the current proxy.
 
   :param class_proxy px: A :ref:`proxy_class` which indicates the manipulated
-    proxy.
-  :returns: a string "tcp", "http", "health" or "unknown"
+   proxy.
+  :returns: a string "tcp", "http" or "unknown"
 
 .. js:function:: Proxy.get_stats(px)
 
@@ -2191,12 +2199,12 @@ TXN class
 .. js:function:: TXN.set_loglevel(txn, loglevel)
 
   Is used to change the log level of the current request. The "loglevel" must
-  be an integer between 0 and 7.
+  be an integer between 0 and 7 or the special value -1 to disable logging.
 
   :param class_txn txn: The class txn object containing the data.
   :param integer loglevel: The required log level. This variable can be one of
-  :see: :js:attr:`core.emerg`, :js:attr:`core.alert`, :js:attr:`core.crit`,
-    :js:attr:`core.err`, :js:attr:`core.warning`, :js:attr:`core.notice`,
+  :see: :js:attr:`core.silent`, :js:attr:`core.emerg`, :js:attr:`core.alert`,
+    :js:attr:`core.crit`, :js:attr:`core.err`, :js:attr:`core.warning`, :js:attr:`core.notice`,
     :js:attr:`core.info`, :js:attr:`core.debug` (log level definitions)
 
 .. js:function:: TXN.set_tos(txn, tos)
@@ -3044,6 +3052,8 @@ AppletTCP class
   :see: :js:func:`AppletTCP.unset_var`
   :see: :js:func:`AppletTCP.set_var`
 
+.. _sticktable_class:
+
 StickTable class
 ================
 
@@ -3216,7 +3226,7 @@ Filter class
 
   This class contains return codes some filter callback functions may return. It
   also contains configuration flags and some helper functions. To understand how
-  the filter API works, see `doc/internal/filters.txt` documentation.
+  the filter API works, see `doc/internals/api/filters.txt` documentation.
 
 .. js:attribute:: filter.CONTINUE
 
@@ -3653,6 +3663,27 @@ HTTPMessage class
                          data by default.
   :returns: an integer containing the amount of bytes copied or -1.
 
+.. js:function:: HTTPMessage.set_body_len(http_msg, length)
+
+  This function changes the expected payload length of the HTTP message
+  **http_msg**. **length** can be an integer value. In that case, a
+  "Content-Length" header is added with the given value. It is also possible to
+  pass the **"chunked"** string instead of an integer value to force the HTTP
+  message to be chunk-encoded. In that case, a "Transfer-Encoding" header is
+  added with the "chunked" value. In both cases, all existing "Content-Length"
+  and "Transfer-Encoding" headers are removed.
+
+  This fnuction should be used in the filter context to be able to alter the
+  payload of the HTTP message. The internal state fo the HTTP message is updated
+  accordingly. :js:func:`HTTPMessage.add_header()` or
+  :js:func:`HTTPMessage.set_header()` functions must to be used in that case.
+
+  :param class_httpmessage http_msg: The manipulated HTTP message.
+  :param type length: The new payload length to set. It can be an integer or
+		      the string "chunked".
+  :returns: true if the payload length was successfully updated, false
+	    otherwise.
+
 .. js:function:: HTTPMessage.set_eom(http_msg)
 
   This function set the end of message for the HTTP message **http_msg**.
@@ -3749,6 +3780,10 @@ CertCache class
   :param string certificate.ocsp: An OCSP response in base64. (cf management.txt)
   :param string certificate.issuer: The certificate of the OCSP issuer.
   :param string certificate.sctl: An SCTL file.
+
+  .. Note::
+     This function may be slow. As such, it may only be used during startup
+     (main or init context) or from a yield-capable runtime context.
 
 .. code-block:: lua
 

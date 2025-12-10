@@ -34,13 +34,20 @@ int h1_parse_cont_len_header(struct h1m *h1m, struct ist *value)
 	int not_first = !!(h1m->flags & H1_MF_CLEN);
 	struct ist word;
 
-	word.ptr = value->ptr - 1; // -1 for next loop's pre-increment
+	word.ptr = value->ptr;
 	e = value->ptr + value->len;
 
-	while (++word.ptr < e) {
+	while (1) {
+		if (word.ptr >= e) {
+			/* empty header or empty value */
+			goto fail;
+		}
+
 		/* skip leading delimiter and blanks */
-		if (unlikely(HTTP_IS_LWS(*word.ptr)))
+		if (unlikely(HTTP_IS_LWS(*word.ptr))) {
+			word.ptr++;
 			continue;
+		}
 
 		/* digits only now */
 		for (cl = 0, n = word.ptr; n < e; n++) {
@@ -51,6 +58,14 @@ int h1_parse_cont_len_header(struct h1m *h1m, struct ist *value)
 					goto fail;
 				break;
 			}
+
+			if (unlikely(!cl && n > word.ptr)) {
+				/* There was a leading zero before this digit,
+				 * let's trim it.
+				 */
+				word.ptr = n;
+			}
+
 			if (unlikely(cl > ULLONG_MAX / 10ULL))
 				goto fail; /* multiply overflow */
 			cl = cl * 10ULL;
@@ -79,6 +94,13 @@ int h1_parse_cont_len_header(struct h1m *h1m, struct ist *value)
 		h1m->flags |= H1_MF_CLEN;
 		h1m->curr_len = h1m->body_len = cl;
 		*value = word;
+
+		/* Now either n==e and we're done, or n points to the comma,
+		 * and we skip it and continue.
+		 */
+		if (n++ == e)
+			break;
+
 		word.ptr = n;
 	}
 	/* here we've reached the end with a single value or a series of
@@ -99,13 +121,21 @@ int h1_parse_cont_len_header(struct h1m *h1m, struct ist *value)
  * H1_MF_TE_OTHER flag is set if any other encoding is found. The H1_MF_XFER_ENC
  * flag is always set. The H1_MF_CHNK is set when "chunked" encoding is the last
  * one. Note that transfer codings are case-insensitive (cf RFC7230#4). This
- * function returns <0 if a error is found, 0 if the whole header can be dropped
- * (not used yet), or >0 if the value can be indexed.
+ * function returns -2 for a fatal error, -1 for an error that may be hiidden by
+ * config, 0 if the whole header can be dropped (not used yet), or >0 if the
+ * value can be indexed.
  */
 int h1_parse_xfer_enc_header(struct h1m *h1m, struct ist value)
 {
 	char *e, *n;
 	struct ist word;
+	int ret = 1;
+
+	/* Reject empty header */
+	if (istptr(value) == istend(value)) {
+		ret = -1;
+		goto end;
+	}
 
 	h1m->flags |= H1_MF_XFER_ENC;
 
@@ -118,6 +148,10 @@ int h1_parse_xfer_enc_header(struct h1m *h1m, struct ist value)
 			continue;
 
 		n = http_find_hdr_value_end(word.ptr, e); // next comma or end of line
+
+		/* a comma at the end means the last value is empty */
+		if (n+1 == e)
+			ret = -1;
 		word.len = n - word.ptr;
 
 		/* trim trailing blanks */
@@ -125,14 +159,18 @@ int h1_parse_xfer_enc_header(struct h1m *h1m, struct ist value)
 			word.len--;
 
 		h1m->flags &= ~H1_MF_CHNK;
-		if (isteqi(word, ist("chunked"))) {
+
+		/* empty values are forbidden */
+		if (!word.len)
+			ret = -1;
+		else if (isteqi(word, ist("chunked"))) {
 			if (h1m->flags & H1_MF_TE_CHUNKED) {
 				/* cf RFC7230#3.3.1 : A sender MUST NOT apply
 				 * chunked more than once to a message body
 				 * (i.e., chunking an already chunked message is
 				 * not allowed)
 				 */
-				goto fail;
+				ret = -1;
 			}
 			h1m->flags |= (H1_MF_TE_CHUNKED|H1_MF_CHNK);
 		}
@@ -144,7 +182,8 @@ int h1_parse_xfer_enc_header(struct h1m *h1m, struct ist value)
 				 * as the final transfer coding to ensure that
 				 * the message is properly framed.
 				 */
-				goto fail;
+				ret = -2;
+				goto end;
 			}
 			h1m->flags |= H1_MF_TE_OTHER;
 		}
@@ -152,24 +191,23 @@ int h1_parse_xfer_enc_header(struct h1m *h1m, struct ist value)
 		word.ptr = n;
 	}
 
-	return 1;
-  fail:
-	return -1;
+  end:
+	return ret;
 }
 
 /* Validate the authority and the host header value for CONNECT method. If there
  * is hast header, its value is normalized. 0 is returned on success, -1 if the
  * authority is invalid and -2 if the host is invalid.
  */
-static int h1_validate_connect_authority(struct ist authority, struct ist *host_hdr)
+static int h1_validate_connect_authority(struct ist scheme, struct ist authority, struct ist *host_hdr)
 {
 	struct ist uri_host, uri_port, host, host_port;
 
-	if (!isttest(authority))
+	if (isttest(scheme) || !isttest(authority))
 		goto invalid_authority;
 	uri_host = authority;
 	uri_port = http_get_host_port(authority);
-	if (!isttest(uri_port))
+	if (!istlen(uri_port))
 		goto invalid_authority;
 	uri_host.len -= (istlen(uri_port) + 1);
 
@@ -179,8 +217,10 @@ static int h1_validate_connect_authority(struct ist authority, struct ist *host_
 	/* Get the port of the host header value, if any */
 	host = *host_hdr;
 	host_port = http_get_host_port(*host_hdr);
-	if (isttest(host_port)) {
+	if (isttest(host_port))
 		host.len -= (istlen(host_port) + 1);
+
+	if (istlen(host_port)) {
 		if (!isteqi(host, uri_host) || !isteq(host_port, uri_port))
 			goto invalid_host;
 		if (http_is_default_port(IST_NULL, uri_port))
@@ -200,6 +240,63 @@ static int h1_validate_connect_authority(struct ist authority, struct ist *host_
   invalid_host:
 	return -2;
 }
+
+
+/* Validate the authority and the host header value for non-CONNECT method, when
+ * an absolute-URI is detected but when it does not exactly match the host
+ * value. The idea is to detect default port (http or https). authority and host
+ * are defined here. 0 is returned on success, -1 if the host is does not match
+ * the authority.
+ */
+static int h1_validate_mismatch_authority(struct ist scheme, struct ist authority, struct ist host_hdr)
+{
+	struct ist uri_host, uri_port, host, host_port;
+
+	if (!isttest(scheme))
+		goto mismatch;
+
+	uri_host = authority;
+	uri_port = http_get_host_port(authority);
+	if (isttest(uri_port))
+		uri_host.len -= (istlen(uri_port) + 1);
+
+	host = host_hdr;
+	host_port = http_get_host_port(host_hdr);
+	if (isttest(host_port))
+	    host.len -= (istlen(host_port) + 1);
+
+	if (!isttest(uri_port) && !isttest(host_port)) {
+		/* No port on both: we already know the authority does not match
+		 * the host value
+		 */
+		goto mismatch;
+	}
+	else if (isttest(uri_port) && !http_is_default_port(scheme, uri_port)) {
+		/* here there is no port for the host value and the port for the
+		 * authority is not the default one
+		 */
+		goto mismatch;
+	}
+	else if (isttest(host_port) && !http_is_default_port(scheme, host_port)) {
+		/* here there is no port for the authority and the port for the
+		 * host value is not the default one
+		 */
+		goto mismatch;
+	}
+	else {
+		/* the authority or the host value contain a default port and
+		 * there is no port on the other value
+		 */
+		if (!isteqi(uri_host, host))
+			goto mismatch;
+	}
+
+	return 0;
+
+  mismatch:
+	return -1;
+}
+
 
 /* Parse the Connection: header of an HTTP/1 request, looking for "close",
  * "keep-alive", and "upgrade" values, and updating h1m->flags according to
@@ -264,13 +361,14 @@ void h1_parse_connection_header(struct h1m *h1m, struct ist *value)
 
 /* Parse the Upgrade: header of an HTTP/1 request.
  * If "websocket" is found, set H1_MF_UPG_WEBSOCKET flag
+ * If "h2c" or "h2" found, set H1_MF_UPG_H2C flag.
  */
 void h1_parse_upgrade_header(struct h1m *h1m, struct ist value)
 {
 	char *e, *n;
 	struct ist word;
 
-	h1m->flags &= ~H1_MF_UPG_WEBSOCKET;
+	h1m->flags &= ~(H1_MF_UPG_WEBSOCKET|H1_MF_UPG_H2C);
 
 	word.ptr = value.ptr - 1; // -1 for next loop's pre-increment
 	e = istend(value);
@@ -289,6 +387,8 @@ void h1_parse_upgrade_header(struct h1m *h1m, struct ist value)
 
 		if (isteqi(word, ist("websocket")))
 			h1m->flags |= H1_MF_UPG_WEBSOCKET;
+		else if (isteqi(word, ist("h2c")) || isteqi(word, ist("h2")))
+			h1m->flags |= H1_MF_UPG_H2C;
 
 		word.ptr = n;
 	}
@@ -492,14 +592,11 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 	case H1_MSG_RQURI:
 	http_msg_rquri:
 #ifdef HA_UNALIGNED_LE
-		/* speedup: skip bytes not between 0x21 and 0x7e inclusive */
+		/* speedup: skip bytes not between 0x24 and 0x7e inclusive */
 		while (ptr <= end - sizeof(int)) {
-			int x = *(int *)ptr - 0x21212121;
-			if (x & 0x80808080)
-				break;
+			uint x = *(uint *)ptr;
 
-			x -= 0x5e5e5e5e;
-			if (!(x & 0x80808080))
+			if (((x - 0x24242424) | (0x7e7e7e7e - x)) & 0x80808080U)
 				break;
 
 			ptr += sizeof(int);
@@ -510,8 +607,15 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 			goto http_msg_ood;
 		}
 	http_msg_rquri2:
-		if (likely((unsigned char)(*ptr - 33) <= 93)) /* 33 to 126 included */
+		if (likely((unsigned char)(*ptr - 33) <= 93)) { /* 33 to 126 included */
+			if (*ptr == '#') {
+				if (h1m->err_pos < -1) /* PR_O2_REQBUG_OK not set */
+					goto invalid_char;
+				if (h1m->err_pos == -1) /* PR_O2_REQBUG_OK set: just log */
+					h1m->err_pos = ptr - start + skip;
+			}
 			EAT_AND_JUMP_OR_RETURN(ptr, end, http_msg_rquri2, http_msg_ood, state, H1_MSG_RQURI);
+		}
 
 		if (likely(HTTP_IS_SPHT(*ptr))) {
 			sl.rq.u.len = ptr - sl.rq.u.ptr;
@@ -775,6 +879,10 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 
 		if (likely(*ptr == ':')) {
 			col = ptr - start;
+			if (col <= sol) {
+				state = H1_MSG_HDR_NAME;
+				goto http_msg_invalid;
+			}
 			EAT_AND_JUMP_OR_RETURN(ptr, end, http_msg_hdr_l1_sp, http_msg_ood, state, H1_MSG_HDR_L1_SP);
 		}
 
@@ -855,6 +963,17 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 			goto http_msg_ood;
 		}
 	http_msg_hdr_val2:
+		if (likely(!*ptr)) {
+			/* RFC9110 clarified that NUL is explicitly forbidden in header values
+			 * (like CR and LF).
+			 */
+			if (h1m->err_pos < -1) { /* PR_O2_REQBUG_OK not set */
+				state = H1_MSG_HDR_VAL;
+				goto http_msg_invalid;
+			}
+			if (h1m->err_pos == -1) /* PR_O2_REQBUG_OK set: just log */
+				h1m->err_pos = ptr - start + skip;
+		}
 		if (likely(!HTTP_IS_CRLF(*ptr)))
 			EAT_AND_JUMP_OR_RETURN(ptr, end, http_msg_hdr_val2, http_msg_ood, state, H1_MSG_HDR_VAL);
 
@@ -914,9 +1033,15 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 				if (isteqi(n, ist("transfer-encoding"))) {
 					ret = h1_parse_xfer_enc_header(h1m, v);
 					if (ret < 0) {
-						state = H1_MSG_HDR_L2_LWS;
-						ptr = v.ptr; /* Set ptr on the error */
-						goto http_msg_invalid;
+						/* For the response only, don't report error if PR_O2_RSPBUG_OK is set
+						 * and the error can be hidden */
+						if (ret == -2 || !(h1m->flags & H1_MF_RESP) || (h1m->err_pos < -1)) {
+							state = H1_MSG_HDR_L2_LWS;
+							ptr = v.ptr; /* Set ptr on the error */
+							goto http_msg_invalid;
+						}
+						if (h1m->err_pos == -1)
+							h1m->err_pos = ptr - start + skip;
 					}
 					else if (ret == 0) {
 						/* skip it */
@@ -1002,14 +1127,19 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 
 		if (!(h1m->flags & (H1_MF_HDRS_ONLY|H1_MF_RESP))) {
 			struct http_uri_parser parser = http_uri_parser_init(sl.rq.u);
-			struct ist authority;
+			struct ist scheme, authority = IST_NULL;
+			int ret;
 
-			authority = http_parse_authority(&parser, 1);
+			scheme = http_parse_scheme(&parser);
+			if (istlen(scheme) || sl.rq.meth == HTTP_METH_CONNECT) {
+				/* Expect an authority if for CONNECT method or if there is a scheme */
+				authority = http_parse_authority(&parser, 1);
+			}
+
 			if (sl.rq.meth == HTTP_METH_CONNECT) {
 				struct ist *host = ((host_idx != -1) ? &hdr[host_idx].v : NULL);
-				int ret;
 
-				ret = h1_validate_connect_authority(authority, host);
+				ret = h1_validate_connect_authority(scheme, authority, host);
 				if (ret < 0) {
 					if (h1m->err_pos < -1) {
 						state = H1_MSG_LAST_LF;
@@ -1030,15 +1160,17 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 
 				/* For non-CONNECT method, the authority must match the host header value */
 				if (!isteqi(authority, host)) {
-					if (h1m->err_pos < -1) {
-						state = H1_MSG_LAST_LF;
-						ptr = host.ptr; /* Set ptr on the error */
-						goto http_msg_invalid;
+					ret = h1_validate_mismatch_authority(scheme, authority, host);
+					if (ret < 0) {
+						if (h1m->err_pos < -1) {
+							state = H1_MSG_LAST_LF;
+							ptr = host.ptr; /* Set ptr on the error */
+							goto http_msg_invalid;
+						}
+						if (h1m->err_pos == -1) /* capture the error pointer */
+							h1m->err_pos = v.ptr - start + skip; /* >= 0 now */
 					}
-					if (h1m->err_pos == -1) /* capture the error pointer */
-						h1m->err_pos = v.ptr - start + skip; /* >= 0 now */
 				}
-
 			}
 		}
 
@@ -1048,6 +1180,7 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 				/* T-E + C-L: force close and remove C-L */
 				h1m->flags |= H1_MF_CONN_CLO;
 				h1m->flags &= ~H1_MF_CLEN;
+				h1m->curr_len = h1m->body_len = 0;
 				hdr_count = http_del_hdr(hdr, ist("content-length"));
 			}
 			else if (!(h1m->flags & H1_MF_VER_11)) {

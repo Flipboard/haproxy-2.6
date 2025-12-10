@@ -4,7 +4,7 @@
 #include <haproxy/global.h>
 #include <haproxy/ncbuf-t.h>
 #include <haproxy/net_helper.h>
-#include <haproxy/quic_conn-t.h>
+#include <haproxy/quic_conn.h>
 #include <haproxy/quic_enc.h>
 #include <haproxy/quic_tp.h>
 #include <haproxy/trace.h>
@@ -129,27 +129,30 @@ static int quic_transport_param_dec_pref_addr(struct tp_preferred_address *addr,
 	if (end - *buf < addr_len)
 		return 0;
 
-	addr->ipv4_port = read_n16(*buf);
-	*buf += sizeof addr->ipv4_port;
-
 	memcpy(addr->ipv4_addr, *buf, sizeof addr->ipv4_addr);
 	*buf += sizeof addr->ipv4_addr;
 
-	addr->ipv6_port = read_n16(*buf);
-	*buf += sizeof addr->ipv6_port;
+	addr->ipv4_port = read_n16(*buf);
+	*buf += sizeof addr->ipv4_port;
 
 	memcpy(addr->ipv6_addr, *buf, sizeof addr->ipv6_addr);
 	*buf += sizeof addr->ipv6_addr;
 
+	addr->ipv6_port = read_n16(*buf);
+	*buf += sizeof addr->ipv6_port;
+
 	addr->cid.len = *(*buf)++;
 	if (addr->cid.len) {
-		if (end - *buf > addr->cid.len || addr->cid.len > sizeof addr->cid.data)
+		if (end - sizeof(addr->stateless_reset_token) - *buf > addr->cid.len ||
+		    addr->cid.len > sizeof(addr->cid.data)) {
 			return 0;
+		}
+
 		memcpy(addr->cid.data, *buf, addr->cid.len);
 		*buf += addr->cid.len;
 	}
 
-	if (end - *buf != sizeof addr->stateless_reset_token)
+	if (end - *buf != sizeof(addr->stateless_reset_token))
 		return 0;
 
 	memcpy(addr->stateless_reset_token, *buf, end - *buf);
@@ -170,23 +173,23 @@ static int quic_transport_param_dec_version_info(struct tp_version_information *
                                                  const unsigned char *end, int server)
 {
 	size_t tp_len = end - *buf;
-	const uint32_t *ver;
+	const unsigned char *ver, *others;
 
 	/* <tp_len> must be a multiple of sizeof(uint32_t) */
 	if (tp_len < sizeof tp->choosen || (tp_len & 0x3))
 		return 0;
 
-	tp->choosen = ntohl(*(uint32_t *)*buf);
+	tp->choosen = ntohl(read_u32(*buf));
 	/* Must not be null */
 	if (!tp->choosen)
 		return 0;
 
 	*buf += sizeof tp->choosen;
-	tp->others = (const uint32_t *)*buf;
+	others = *buf;
 
 	/* Others versions must not be null */
-	for (ver = tp->others; ver < (const uint32_t *)end; ver++) {
-		if (!*ver)
+	for (ver = others; ver < end; ver += 4) {
+		if (!read_u32(ver))
 			return 0;
 	}
 
@@ -194,20 +197,19 @@ static int quic_transport_param_dec_version_info(struct tp_version_information *
 		/* TODO: not supported */
 		return 0;
 
-	tp->nb_others = (end - (const unsigned char *)tp->others) / sizeof *tp->others;
-	for (ver = tp->others; ver < (const uint32_t *)end; ver++) {
+	for (ver = others; ver < end; ver += 4) {
 		if (!tp->negotiated_version) {
 			int i;
 
 			for (i = 0; i < quic_versions_nb; i++) {
-				if (ntohl(*ver) == quic_versions[i].num) {
+				if (ntohl(read_u32(ver)) == quic_versions[i].num) {
 					tp->negotiated_version = &quic_versions[i];
 					break;
 				}
 			}
 		}
 
-		if (preferred_version && ntohl(*ver) == preferred_version->num) {
+		if (preferred_version && ntohl(read_u32(ver)) == preferred_version->num) {
 			tp->negotiated_version = preferred_version;
 			goto out;
 		}
@@ -224,17 +226,27 @@ static int quic_transport_param_dec_version_info(struct tp_version_information *
  * must be set to 1 for a server (haproxy listener) or 0 for a client (connection
  * to an haproxy server).
  */
-static int quic_transport_param_decode(struct quic_transport_params *p,
-                                       int server, uint64_t type,
-                                       const unsigned char **buf, size_t len)
+static enum quic_tp_dec_err
+quic_transport_param_decode(struct quic_transport_params *p, int server,
+                            uint64_t type, const unsigned char **buf, size_t len)
 {
 	const unsigned char *end = *buf + len;
 
 	switch (type) {
 	case QUIC_TP_ORIGINAL_DESTINATION_CONNECTION_ID:
-		if (!server || len > sizeof p->original_destination_connection_id.data)
-			return 0;
+		/* RFC 9000 18.2. Transport Parameter Definitions
+		 *
+		 * A client MUST NOT include any server-only transport parameter:
+		 * original_destination_connection_id, preferred_address,
+		 * retry_source_connection_id, or stateless_reset_token. A server MUST
+		 * treat receipt of any of these transport parameters as a connection
+		 * error of type TRANSPORT_PARAMETER_ERROR.
+		 */
+		if (!server)
+			return QUIC_TP_DEC_ERR_INVAL;
 
+		if (len > sizeof p->original_destination_connection_id.data)
+			return QUIC_TP_DEC_ERR_TRUNC;
 		if (len)
 			memcpy(p->original_destination_connection_id.data, *buf, len);
 		p->original_destination_connection_id.len = len;
@@ -243,7 +255,7 @@ static int quic_transport_param_decode(struct quic_transport_params *p,
 		break;
 	case QUIC_TP_INITIAL_SOURCE_CONNECTION_ID:
 		if (len > sizeof p->initial_source_connection_id.data)
-			return 0;
+			return QUIC_TP_DEC_ERR_TRUNC;
 
 		if (len)
 			memcpy(p->initial_source_connection_id.data, *buf, len);
@@ -252,81 +264,120 @@ static int quic_transport_param_decode(struct quic_transport_params *p,
 		p->initial_source_connection_id_present = 1;
 		break;
 	case QUIC_TP_STATELESS_RESET_TOKEN:
-		if (!server || len != sizeof p->stateless_reset_token)
-			return 0;
+		/* see original_destination_connection_id RFC reference above. */
+		if (!server)
+			return QUIC_TP_DEC_ERR_INVAL;
+
+		if (len != sizeof p->stateless_reset_token)
+			return QUIC_TP_DEC_ERR_TRUNC;
 		memcpy(p->stateless_reset_token, *buf, len);
 		*buf += len;
 		p->with_stateless_reset_token = 1;
 		break;
 	case QUIC_TP_PREFERRED_ADDRESS:
+		/* see original_destination_connection_id RFC reference above. */
 		if (!server)
-			return 0;
+			return QUIC_TP_DEC_ERR_INVAL;
+
 		if (!quic_transport_param_dec_pref_addr(&p->preferred_address, buf, *buf + len))
-			return 0;
+			return QUIC_TP_DEC_ERR_TRUNC;
 		p->with_preferred_address = 1;
 		break;
 	case QUIC_TP_MAX_IDLE_TIMEOUT:
 		if (!quic_dec_int(&p->max_idle_timeout, buf, end))
-			return 0;
+			return QUIC_TP_DEC_ERR_TRUNC;
 		break;
 	case QUIC_TP_MAX_UDP_PAYLOAD_SIZE:
 		if (!quic_dec_int(&p->max_udp_payload_size, buf, end))
-			return 0;
+			return QUIC_TP_DEC_ERR_TRUNC;
+
+		/* RFC 9000 18.2. Transport Parameter Definitions
+		 *
+		 * max_udp_payload_size (0x03): [...]
+		 * The default for this parameter is the maximum permitted UDP
+		 * payload of 65527. Values below 1200 are invalid.
+		 */
+		if (p->max_udp_payload_size < 1200)
+			return QUIC_TP_DEC_ERR_INVAL;
+
 		break;
 	case QUIC_TP_INITIAL_MAX_DATA:
 		if (!quic_dec_int(&p->initial_max_data, buf, end))
-			return 0;
+			return QUIC_TP_DEC_ERR_TRUNC;
 		break;
 	case QUIC_TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL:
 		if (!quic_dec_int(&p->initial_max_stream_data_bidi_local, buf, end))
-			return 0;
+			return QUIC_TP_DEC_ERR_TRUNC;
 		break;
 	case QUIC_TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE:
 		if (!quic_dec_int(&p->initial_max_stream_data_bidi_remote, buf, end))
-			return 0;
+			return QUIC_TP_DEC_ERR_TRUNC;
 		break;
 	case QUIC_TP_INITIAL_MAX_STREAM_DATA_UNI:
 		if (!quic_dec_int(&p->initial_max_stream_data_uni, buf, end))
-			return 0;
+			return QUIC_TP_DEC_ERR_TRUNC;
 		break;
 	case QUIC_TP_INITIAL_MAX_STREAMS_BIDI:
 		if (!quic_dec_int(&p->initial_max_streams_bidi, buf, end))
-			return 0;
+			return QUIC_TP_DEC_ERR_TRUNC;
 		break;
 	case QUIC_TP_INITIAL_MAX_STREAMS_UNI:
 		if (!quic_dec_int(&p->initial_max_streams_uni, buf, end))
-			return 0;
+			return QUIC_TP_DEC_ERR_TRUNC;
 		break;
 	case QUIC_TP_ACK_DELAY_EXPONENT:
-		if (!quic_dec_int(&p->ack_delay_exponent, buf, end) ||
-			p->ack_delay_exponent > QUIC_TP_ACK_DELAY_EXPONENT_LIMIT)
-			return 0;
+		if (!quic_dec_int(&p->ack_delay_exponent, buf, end))
+			return QUIC_TP_DEC_ERR_TRUNC;
+
+		/* RFC 9000 18.2. Transport Parameter Definitions
+		 *
+		 * ack_delay_exponent (0x0a): [...]
+		 * Values above 20 are invalid.
+		 */
+		if (p->ack_delay_exponent > QUIC_TP_ACK_DELAY_EXPONENT_LIMIT)
+			return QUIC_TP_DEC_ERR_INVAL;
+
 		break;
 	case QUIC_TP_MAX_ACK_DELAY:
-		if (!quic_dec_int(&p->max_ack_delay, buf, end) ||
-			p->max_ack_delay > QUIC_TP_MAX_ACK_DELAY_LIMIT)
-			return 0;
+		if (!quic_dec_int(&p->max_ack_delay, buf, end))
+			return QUIC_TP_DEC_ERR_TRUNC;
+
+		/* RFC 9000 18.2. Transport Parameter Definitions
+		 *
+		 * max_ack_delay (0x0b): [...]
+		 * Values of 2^14 or greater are invalid.
+		 */
+		if (p->max_ack_delay >= QUIC_TP_MAX_ACK_DELAY_LIMIT)
+			return QUIC_TP_DEC_ERR_INVAL;
+
 		break;
 	case QUIC_TP_DISABLE_ACTIVE_MIGRATION:
 		/* Zero-length parameter type. */
 		if (len != 0)
-			return 0;
+			return QUIC_TP_DEC_ERR_TRUNC;
 		p->disable_active_migration = 1;
 		break;
 	case QUIC_TP_ACTIVE_CONNECTION_ID_LIMIT:
 		if (!quic_dec_int(&p->active_connection_id_limit, buf, end))
-			return 0;
+			return QUIC_TP_DEC_ERR_TRUNC;
 		break;
 	case QUIC_TP_DRAFT_VERSION_INFORMATION:
 		if (!quic_transport_param_dec_version_info(&p->version_information,
 		                                           buf, *buf + len, server))
-			return 0;
+			return QUIC_TP_DEC_ERR_TRUNC;
+		break;
+	case QUIC_TP_RETRY_SOURCE_CONNECTION_ID:
+		/* see original_destination_connection_id RFC reference above. */
+		if (!server)
+			return QUIC_TP_DEC_ERR_INVAL;
+
+		/* TODO implement parsing for client side */
 		break;
 	default:
 		*buf += len;
 	};
 
-	return *buf == end;
+	return *buf == end ? QUIC_TP_DEC_ERR_NONE : QUIC_TP_DEC_ERR_TRUNC;
 }
 
 /* Encode <type> and <len> variable length values in <buf>.
@@ -579,10 +630,11 @@ int quic_transport_params_encode(unsigned char *buf,
  * or 0 for a client (connection to a haproxy server).
  * Returns 1 if succeeded, 0 if not.
  */
-static int quic_transport_params_decode(struct quic_transport_params *p, int server,
-                                        const unsigned char *buf,
-                                        const unsigned char *end)
+static enum quic_tp_dec_err
+quic_transport_params_decode(struct quic_transport_params *p, int server,
+                             const unsigned char *buf, const unsigned char *end)
 {
+	enum quic_tp_dec_err err;
 	const unsigned char *pos;
 
 	pos = buf;
@@ -591,24 +643,30 @@ static int quic_transport_params_decode(struct quic_transport_params *p, int ser
 		uint64_t type, len;
 
 		if (!quic_transport_param_decode_type_len(&type, &len, &pos, end))
-			return 0;
+			return QUIC_TP_DEC_ERR_TRUNC;
 
 		if (end - pos < len)
-			return 0;
+			return QUIC_TP_DEC_ERR_TRUNC;
 
-		if (!quic_transport_param_decode(p, server, type, &pos, len))
-			return 0;
+		err = quic_transport_param_decode(p, server, type, &pos, len);
+		if (err != QUIC_TP_DEC_ERR_NONE)
+			return err;
 	}
 
-	/*
-	 * A server MUST send original_destination_connection_id transport parameter.
-	 * initial_source_connection_id must be present both for server and client.
+	/* RFC 9000 7.3. Authenticating Connection IDs
+	 *
+	 * An endpoint MUST treat the absence of the
+	 * initial_source_connection_id transport parameter from either endpoint
+	 * or the absence of the original_destination_connection_id transport
+	 * parameter from the server as a connection error of type
+	 * TRANSPORT_PARAMETER_ERROR.
 	 */
-	if ((server && !p->original_destination_connection_id_present) ||
-	    !p->initial_source_connection_id_present)
-		return 0;
+	if (!p->initial_source_connection_id_present ||
+	    (server && !p->original_destination_connection_id_present)) {
+		return QUIC_TP_DEC_ERR_INVAL;
+	}
 
-	return 1;
+	return QUIC_TP_DEC_ERR_NONE;
 }
 
 /* Store transport parameters found in <buf> buffer into <qc> QUIC connection
@@ -617,19 +675,63 @@ static int quic_transport_params_decode(struct quic_transport_params *p, int ser
  * Note that peer transport parameters are stored in the TX part of the connection:
  * they are used to send packets to the peer with its transport parameters as
  * limitations.
- * Returns 1 if succeeded, 0 if not.
+ *
+ * Returns 1 on success, or 0 if parsing is interrupted on a truncated field.
+ * Note that if invalid values are used, success is returned by this function
+ * but the connection is scheduled for CONNECTION_CLOSE emission.
  */
 int quic_transport_params_store(struct quic_conn *qc, int server,
                                 const unsigned char *buf,
                                 const unsigned char *end)
 {
+	enum quic_tp_dec_err err;
 	struct quic_transport_params *tx_params = &qc->tx.params;
+	struct quic_transport_params *rx_params = &qc->rx.params;
+	/* Initial source connection ID */
+	struct tp_cid *iscid;
 
 	/* initialize peer TPs to RFC default value */
 	quic_dflt_transport_params_cpy(tx_params);
 
-	if (!quic_transport_params_decode(tx_params, server, buf, end))
+	err = quic_transport_params_decode(tx_params, server, buf, end);
+	if (err == QUIC_TP_DEC_ERR_INVAL) {
+		TRACE_ERROR("invalid transport parameter value", QUIC_EV_TRANSP_PARAMS, qc);
+		quic_set_connection_close(qc, quic_err_transport(QC_ERR_TRANSPORT_PARAMETER_ERROR));
+		return 1;
+	}
+	else if (err == QUIC_TP_DEC_ERR_TRUNC) {
+		TRACE_ERROR("error on transport parameters decoding", QUIC_EV_TRANSP_PARAMS, qc);
 		return 0;
+	}
+
+	/* Update the connection from transport parameters received */
+	if (tx_params->version_information.negotiated_version &&
+	    tx_params->version_information.negotiated_version != qc->original_version)
+		qc->negotiated_version =
+			qc->tx.params.version_information.negotiated_version;
+
+	if (tx_params->max_ack_delay)
+		qc->max_ack_delay = tx_params->max_ack_delay;
+
+	if (tx_params->max_idle_timeout && rx_params->max_idle_timeout)
+		qc->max_idle_timeout =
+			QUIC_MIN(tx_params->max_idle_timeout, rx_params->max_idle_timeout);
+	else
+		qc->max_idle_timeout =
+			QUIC_MAX(tx_params->max_idle_timeout, rx_params->max_idle_timeout);
+	TRACE_PROTO("\nTX(remote) transp. params.", QUIC_EV_TRANSP_PARAMS, qc, tx_params);
+
+	/* Check that the "initial_source_connection_id" transport parameter matches
+	 * the SCID received which is also the DCID of the connection.
+	 */
+	iscid = &tx_params->initial_source_connection_id;
+	if (qc->dcid.len != iscid->len ||
+	    (qc->dcid.len && memcmp(qc->dcid.data, iscid->data, qc->dcid.len))) {
+		TRACE_PROTO("initial_source_connection_id transport parameter mismatch",
+		            QUIC_EV_TRANSP_PARAMS, qc);
+		/* Kill the connection as soon as possible */
+		qc_kill_conn(qc);
+	}
 
 	return 1;
 }

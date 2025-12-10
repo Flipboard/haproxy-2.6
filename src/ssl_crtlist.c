@@ -141,6 +141,15 @@ struct ssl_bind_conf *crtlist_dup_ssl_conf(struct ssl_bind_conf *src)
 		if (!dst->ecdhe)
 			goto error;
 	}
+
+	dst->ssl_methods_cfg.flags = src->ssl_methods_cfg.flags;
+	dst->ssl_methods_cfg.min = src->ssl_methods_cfg.min;
+	dst->ssl_methods_cfg.max = src->ssl_methods_cfg.max;
+
+	dst->ssl_methods.flags = src->ssl_methods.flags;
+	dst->ssl_methods.min = src->ssl_methods.min;
+	dst->ssl_methods.max = src->ssl_methods.max;
+
 	return dst;
 
 error:
@@ -403,6 +412,11 @@ int crtlist_parse_line(char *line, char **crt_path, struct crtlist_entry *entry,
 	*crt_path = args[0];
 
 	if (ssl_b) {
+		if (ssl_b > 1) {
+			memprintf(err, "parsing [%s:%d]: malformated line, filters can't be between filename and options!", file, linenum);
+			cfgerr |= ERR_WARN;
+		}
+
 		ssl_conf = calloc(1, sizeof *ssl_conf);
 		if (!ssl_conf) {
 			memprintf(err, "not enough memory!");
@@ -414,17 +428,17 @@ int crtlist_parse_line(char *line, char **crt_path, struct crtlist_entry *entry,
 	cur_arg = ssl_b ? ssl_b : 1;
 	while (cur_arg < ssl_e) {
 		newarg = 0;
-		for (i = 0; ssl_bind_kws[i].kw != NULL; i++) {
-			if (strcmp(ssl_bind_kws[i].kw, args[cur_arg]) == 0) {
+		for (i = 0; ssl_crtlist_kws[i].kw != NULL; i++) {
+			if (strcmp(ssl_crtlist_kws[i].kw, args[cur_arg]) == 0) {
 				newarg = 1;
-				cfgerr |= ssl_bind_kws[i].parse(args, cur_arg, NULL, ssl_conf, from_cli, err);
-				if (cur_arg + 1 + ssl_bind_kws[i].skip > ssl_e) {
+				cfgerr |= ssl_crtlist_kws[i].parse(args, cur_arg, NULL, ssl_conf, from_cli, err);
+				if (cur_arg + 1 + ssl_crtlist_kws[i].skip > ssl_e) {
 					memprintf(err, "parsing [%s:%d]: ssl args out of '[]' for %s",
 					          file, linenum, args[cur_arg]);
 					cfgerr |= ERR_ALERT | ERR_FATAL;
 					goto error;
 				}
-				cur_arg += 1 + ssl_bind_kws[i].skip;
+				cur_arg += 1 + ssl_crtlist_kws[i].skip;
 				break;
 			}
 		}
@@ -771,7 +785,6 @@ static void dump_crtlist_sslconf(struct buffer *buf, const struct ssl_bind_conf 
 		char *ptr = conf->npn_str;
 		int comma = 0;
 
-		if (space) chunk_appendf(buf, " ");
 		chunk_appendf(buf, "npn ");
 		while (len) {
 			unsigned short size;
@@ -1442,7 +1455,6 @@ static int cli_parse_del_crtlist(char **args, char *payload, struct appctx *appc
 
 	list_for_each_entry_safe(inst, inst_s, &entry->ckch_inst, by_crtlist_entry) {
 		struct sni_ctx *sni, *sni_s;
-		struct ckch_inst_link_ref *link_ref, *link_ref_s;
 
 		HA_RWLOCK_WRLOCK(SNI_LOCK, &inst->bind_conf->sni_lock);
 		list_for_each_entry_safe(sni, sni_s, &inst->sni_ctx, by_ckch_inst) {
@@ -1452,13 +1464,7 @@ static int cli_parse_del_crtlist(char **args, char *payload, struct appctx *appc
 			free(sni);
 		}
 		HA_RWLOCK_WRUNLOCK(SNI_LOCK, &inst->bind_conf->sni_lock);
-		LIST_DELETE(&inst->by_ckchs);
-		list_for_each_entry_safe(link_ref, link_ref_s, &inst->cafile_link_refs, list) {
-			LIST_DELETE(&link_ref->link->list);
-			LIST_DELETE(&link_ref->list);
-			free(link_ref);
-		}
-		free(inst);
+		ckch_inst_free(inst);
 	}
 
 	crtlist_free_filters(entry->filters);

@@ -1171,6 +1171,10 @@ spoe_recv_frame(struct appctx *appctx, char *buf, size_t framesz)
 	ret = co_getblk(sc_oc(sc), (char *)&netint, 4, 0);
 	if (ret > 0) {
 		framesz = ntohl(netint);
+		if (framesz < 7)  {
+			SPOE_APPCTX(appctx)->status_code = SPOE_FRM_ERR_INVALID;
+			return -1;
+		}
 		if (framesz > SPOE_APPCTX(appctx)->max_frame_size) {
 			SPOE_APPCTX(appctx)->status_code = SPOE_FRM_ERR_TOO_BIG;
 			return -1;
@@ -1295,6 +1299,7 @@ spoe_release_appctx(struct appctx *appctx)
 		if (appctx->st0 == SPOE_APPCTX_ST_IDLE) {
 			eb32_delete(&spoe_appctx->node);
 			_HA_ATOMIC_DEC(&agent->counters.idles);
+			agent->rt[tid].idles--;
 		}
 
 		appctx->st0 = SPOE_APPCTX_ST_END;
@@ -1344,13 +1349,12 @@ spoe_release_appctx(struct appctx *appctx)
 	}
 	else {
 		/* It is the last running applet and the sending and async
-		 * waiting queues are not empty. So try to start a new applet if
-		 * HAproxy is not stopping. On success, we remove reference on
-		 * the current appctx from streams in the async waiting queue.
-		 * In async mode, the ACK may be received from another appctx.
+		 * waiting queues are not empty. So try to start a new applet.
+		 * On success, we remove reference on the current appctx
+		 * from streams in the async waiting queue.  In async mode, the
+		 * ACK may be received from another appctx.
 		 */
-		if (!stopping &&
-		    (!LIST_ISEMPTY(&agent->rt[tid].sending_queue) || !LIST_ISEMPTY(&agent->rt[tid].waiting_queue)) &&
+		if ((!LIST_ISEMPTY(&agent->rt[tid].sending_queue) || !LIST_ISEMPTY(&agent->rt[tid].waiting_queue)) &&
 		    spoe_create_appctx(agent->spoe_conf)) {
 			list_for_each_entry_safe(ctx, back, &agent->rt[tid].waiting_queue, list) {
 				if (ctx->spoe_appctx == spoe_appctx)
@@ -1508,6 +1512,7 @@ spoe_handle_connecting_appctx(struct appctx *appctx)
 
 		default:
 			_HA_ATOMIC_INC(&agent->counters.idles);
+			agent->rt[tid].idles++;
 			appctx->st0 = SPOE_APPCTX_ST_IDLE;
 			SPOE_APPCTX(appctx)->node.key = 0;
 			eb32_insert(&agent->rt[tid].idle_applets, &SPOE_APPCTX(appctx)->node);
@@ -1750,12 +1755,6 @@ spoe_handle_processing_appctx(struct appctx *appctx)
 		      (agent->b.be->queue.length ||
 		       (srv && (srv->queue.length || (srv->maxconn && srv->served >= srv_dynamic_maxconn(srv))))));
 
-	/* Don"t try to send new frame we are waiting for at lease a ack, in
-	 * sync mode or if applet must be closed ASAP
-	 */
-	if (appctx->st0 == SPOE_APPCTX_ST_WAITING_SYNC_ACK || (close_asap && SPOE_APPCTX(appctx)->cur_fpa))
-		skip_sending = 1;
-
 	/* receiving_frame loop */
 	while (!skip_receiving) {
 		ret = spoe_handle_receiving_frame_appctx(appctx, &skip_receiving);
@@ -1775,6 +1774,12 @@ spoe_handle_processing_appctx(struct appctx *appctx)
 				break;
 		}
 	}
+
+	/* Don"t try to send new frame we are waiting for at lease a ack, in
+	 * sync mode or if applet must be closed ASAP
+	 */
+	if (appctx->st0 == SPOE_APPCTX_ST_WAITING_SYNC_ACK || (close_asap && SPOE_APPCTX(appctx)->cur_fpa))
+		skip_sending = 1;
 
 	/* send_frame loop */
 	while (!skip_sending && SPOE_APPCTX(appctx)->cur_fpa < agent->max_fpa) {
@@ -1822,6 +1827,7 @@ spoe_handle_processing_appctx(struct appctx *appctx)
 			goto next;
 		}
 		_HA_ATOMIC_INC(&agent->counters.idles);
+		agent->rt[tid].idles++;
 		appctx->st0 = SPOE_APPCTX_ST_IDLE;
 		eb32_insert(&agent->rt[tid].idle_applets, &SPOE_APPCTX(appctx)->node);
 	}
@@ -1987,9 +1993,11 @@ spoe_handle_appctx(struct appctx *appctx)
 
 		case SPOE_APPCTX_ST_IDLE:
 			_HA_ATOMIC_DEC(&agent->counters.idles);
+			agent->rt[tid].idles--;
 			eb32_delete(&SPOE_APPCTX(appctx)->node);
 			if (stopping &&
 			    LIST_ISEMPTY(&agent->rt[tid].sending_queue) &&
+			    LIST_ISEMPTY(&agent->rt[tid].waiting_queue) &&
 			    LIST_ISEMPTY(&SPOE_APPCTX(appctx)->waiting_queue)) {
 				SPOE_APPCTX(appctx)->task->expire =
 					tick_add_ifset(now_ms, agent->timeout.idle);
@@ -2002,8 +2010,11 @@ spoe_handle_appctx(struct appctx *appctx)
 		case SPOE_APPCTX_ST_PROCESSING:
 		case SPOE_APPCTX_ST_SENDING_FRAG_NOTIFY:
 		case SPOE_APPCTX_ST_WAITING_SYNC_ACK:
-			if (spoe_handle_processing_appctx(appctx))
+			if (spoe_handle_processing_appctx(appctx)) {
+				if (stopping && appctx->st0 == SPOE_APPCTX_ST_IDLE && !SPOE_APPCTX(appctx)->cur_fpa)
+					task_wakeup(SPOE_APPCTX(appctx)->task, TASK_WOKEN_MSG);
 				goto out;
+			}
 			goto switchstate;
 
 		case SPOE_APPCTX_ST_DISCONNECT:
@@ -2026,12 +2037,10 @@ spoe_handle_appctx(struct appctx *appctx)
 			/* fall through */
 
 		case SPOE_APPCTX_ST_END:
+			co_skip(sc_oc(sc), co_data(sc_oc(sc)));
 			return;
 	}
   out:
-	if (stopping)
-		spoe_wakeup_appctx(appctx);
-
 	if (SPOE_APPCTX(appctx)->task->expire != TICK_ETERNITY)
 		task_queue(SPOE_APPCTX(appctx)->task);
 }
@@ -2049,16 +2058,35 @@ struct applet spoe_applet = {
 static struct appctx *
 spoe_create_appctx(struct spoe_config *conf)
 {
+	struct spoe_agent *agent = conf->agent;
 	struct spoe_appctx *spoe_appctx;
 	struct appctx *appctx;
+
+	/* Do not try to create a new applet if there is no server up for the
+	 * agent's backend. */
+	if (!agent->b.be->srv_act && !agent->b.be->srv_bck) {
+		SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: don't create SPOE appctx: no server up\n",
+			    (int)now.tv_sec, (int)now.tv_usec, agent->id, __FUNCTION__);
+		goto out;
+	}
+
+	/* Do not try to create a new applet if we have reached the maximum of
+	 * connection per seconds */
+	if (agent->cps_max > 0) {
+		if (!freq_ctr_remain(&agent->rt[tid].conn_per_sec, agent->cps_max, 0)) {
+			SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: don't create SPOE appctx: max CPS reached\n",
+				    (int)now.tv_sec, (int)now.tv_usec, agent->id, __FUNCTION__);
+			goto out;
+		}
+	}
 
 	spoe_appctx = pool_zalloc(pool_head_spoe_appctx);
 	if (spoe_appctx == NULL)
 		goto out_error;
 
-	spoe_appctx->agent           = conf->agent;
+	spoe_appctx->agent           = agent;
 	spoe_appctx->version         = 0;
-	spoe_appctx->max_frame_size  = conf->agent->max_frame_size;
+	spoe_appctx->max_frame_size  = agent->max_frame_size;
 	spoe_appctx->flags           = 0;
 	spoe_appctx->status_code     = SPOE_FRM_ERR_NONE;
 	spoe_appctx->buffer          = BUF_NULL;
@@ -2074,6 +2102,10 @@ spoe_create_appctx(struct spoe_config *conf)
 	if (appctx_init(appctx) == -1)
 		goto out_free_appctx;
 
+	/* Increase the per-process number of cumulated connections */
+	if (agent->cps_max > 0)
+		update_freq_ctr(&agent->rt[tid].conn_per_sec, 1);
+
 	appctx_wakeup(appctx);
 	return appctx;
 
@@ -2083,6 +2115,11 @@ spoe_create_appctx(struct spoe_config *conf)
  out_free_spoe_appctx:
 	pool_free(pool_head_spoe_appctx, spoe_appctx);
  out_error:
+	SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: failed to create SPOE appctx\n",
+		    (int)now.tv_sec, (int)now.tv_usec, agent->id, __FUNCTION__);
+	send_log(&conf->agent_fe, LOG_EMERG, "SPOE: [%s] failed to create SPOE applet\n", agent->id);
+ out:
+
 	return NULL;
 }
 
@@ -2091,12 +2128,12 @@ spoe_queue_context(struct spoe_context *ctx)
 {
 	struct spoe_config *conf = FLT_CONF(ctx->filter);
 	struct spoe_agent  *agent = conf->agent;
-	struct appctx      *appctx;
 	struct spoe_appctx *spoe_appctx;
 
 	/* Check if we need to create a new SPOE applet or not. */
-	if (!eb_is_empty(&agent->rt[tid].idle_applets) &&
-	    (agent->rt[tid].processing == 1 || agent->rt[tid].processing < read_freq_ctr(&agent->rt[tid].processing_per_sec)))
+	if (!LIST_ISEMPTY(&agent->rt[tid].applets) &&
+	    (agent->rt[tid].processing < agent->rt[tid].idles  ||
+	     agent->rt[tid].processing < read_freq_ctr(&agent->rt[tid].processing_per_sec)))
 		goto end;
 
 	SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p"
@@ -2104,44 +2141,7 @@ spoe_queue_context(struct spoe_context *ctx)
 		    (int)now.tv_sec, (int)now.tv_usec, agent->id, __FUNCTION__,
 		    ctx->strm);
 
-	/* Do not try to create a new applet if there is no server up for the
-	 * agent's backend. */
-	if (!agent->b.be->srv_act && !agent->b.be->srv_bck) {
-		SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p"
-			    " - cannot create SPOE appctx: no server up\n",
-			    (int)now.tv_sec, (int)now.tv_usec, agent->id,
-			    __FUNCTION__, ctx->strm);
-		goto end;
-	}
-
-	/* Do not try to create a new applet if we have reached the maximum of
-	 * connection per seconds */
-	if (agent->cps_max > 0) {
-		if (!freq_ctr_remain(&agent->rt[tid].conn_per_sec, agent->cps_max, 0)) {
-			SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p"
-				    " - cannot create SPOE appctx: max CPS reached\n",
-				    (int)now.tv_sec, (int)now.tv_usec, agent->id,
-				    __FUNCTION__, ctx->strm);
-			goto end;
-		}
-	}
-
-	appctx = spoe_create_appctx(conf);
-	if (appctx == NULL) {
-		SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p"
-			    " - failed to create SPOE appctx\n",
-			    (int)now.tv_sec, (int)now.tv_usec, agent->id,
-			    __FUNCTION__, ctx->strm);
-		send_log(&conf->agent_fe, LOG_EMERG,
-			 "SPOE: [%s] failed to create SPOE applet\n",
-			 agent->id);
-
-		goto end;
-	}
-
-	/* Increase the per-process number of cumulated connections */
-	if (agent->cps_max > 0)
-		update_freq_ctr(&agent->rt[tid].conn_per_sec, 1);
+	spoe_create_appctx(conf);
 
   end:
 	/* The only reason to return an error is when there is no applet */
@@ -2666,6 +2666,8 @@ spoe_stop_processing(struct spoe_agent *agent, struct spoe_context *ctx)
 
 	/* Reset processing timer */
 	ctx->process_exp = TICK_ETERNITY;
+	ctx->strm->req.analyse_exp = TICK_ETERNITY;
+	ctx->strm->res.analyse_exp = TICK_ETERNITY;
 
 	spoe_release_buffer(&ctx->buffer, &ctx->buffer_wait);
 
@@ -2724,8 +2726,10 @@ spoe_process_messages(struct stream *s, struct spoe_context *ctx,
 
 		if (!tick_isset(ctx->process_exp)) {
 			ctx->process_exp = tick_add_ifset(now_ms, agent->timeout.processing);
-			s->task->expire  = tick_first((tick_is_expired(s->task->expire, now_ms) ? 0 : s->task->expire),
-						      ctx->process_exp);
+			if (dir == SMP_OPT_DIR_REQ)
+				s->req.analyse_exp = ctx->process_exp;
+			else
+				s->res.analyse_exp = ctx->process_exp;
 		}
 		ret = spoe_start_processing(agent, ctx, dir);
 		if (!ret)
@@ -3012,6 +3016,14 @@ spoe_sig_stop(struct sig_handler *sh)
 	while (p) {
 		struct flt_conf *fconf;
 
+		/* SPOE filter are not initialized for disabled proxoes. Move to
+		 * the next one
+		 */
+		if (p->flags & PR_FL_DISABLED) {
+			p = p->next;
+			continue;
+		}
+
 		list_for_each_entry(fconf, &p->filter_configs, list) {
 			struct spoe_config *conf;
 			struct spoe_agent  *agent;
@@ -3053,7 +3065,6 @@ spoe_init(struct proxy *px, struct flt_conf *fconf)
         conf->agent_fe.accept = frontend_accept;
         conf->agent_fe.srv = NULL;
         conf->agent_fe.timeout.client = TICK_ETERNITY;
-	conf->agent_fe.default_target = &spoe_applet.obj_type;
 	conf->agent_fe.fe_req_ana = AN_REQ_SWITCHING_RULES;
 
 	if (!sighandler_registered) {
@@ -3137,6 +3148,7 @@ spoe_check(struct proxy *px, struct flt_conf *fconf)
 		conf->agent->rt[i].engine_id    = NULL;
 		conf->agent->rt[i].frame_size   = conf->agent->max_frame_size;
 		conf->agent->rt[i].processing   = 0;
+		conf->agent->rt[i].idles        = 0;
 		LIST_INIT(&conf->agent->rt[i].applets);
 		LIST_INIT(&conf->agent->rt[i].sending_queue);
 		LIST_INIT(&conf->agent->rt[i].waiting_queue);

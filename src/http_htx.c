@@ -390,6 +390,7 @@ int http_replace_req_uri(struct htx *htx, const struct ist uri)
 
 	sl = http_get_stline(htx);
 	ALREADY_CHECKED(sl); /* the stline exists because http_replace_stline() succeded */
+	sl->flags &= ~HTX_SL_F_NORMALIZED_URI;
 
 	if (!http_update_host(htx, sl, uri))
 		goto fail;
@@ -923,7 +924,7 @@ int http_str_to_htx(struct buffer *buf, struct ist raw, char **errmsg)
 	ret = h1_headers_to_hdr_list(raw.ptr, istend(raw),
 				     hdrs, sizeof(hdrs)/sizeof(hdrs[0]), &h1m, &h1sl);
 	if (ret <= 0) {
-		memprintf(errmsg, "unabled to parse headers (error offset: %d)", h1m.err_pos);
+		memprintf(errmsg, "unable to parse headers (error offset: %d)", h1m.err_pos);
 		goto error;
 	}
 
@@ -1744,8 +1745,9 @@ int http_scheme_based_normalize(struct htx *htx)
 {
 	struct http_hdr_ctx ctx;
 	struct htx_sl *sl;
-	struct ist uri, scheme, authority, host, port;
+	struct ist uri, scheme, authority, host, port, path;
 	struct http_uri_parser parser;
+	int normalize = 0;
 
 	sl = http_get_stline(htx);
 
@@ -1762,14 +1764,21 @@ int http_scheme_based_normalize(struct htx *htx)
 
 	/* Extract the port if present in authority */
 	authority = http_parse_authority(&parser, 1);
+	path = http_parse_path(&parser);
 	port = http_get_host_port(authority);
-	if (!isttest(port)) {
-		/* if no port found, no normalization to proceed */
-		return 0;
+	if (!isttest(port) || !http_is_default_port(scheme, port))
+		host = authority;
+	else {
+		host = isttrim(authority, istlen(authority) - istlen(port) - 1);
+		normalize = 1;
 	}
-	host = isttrim(authority, istlen(authority) - istlen(port) - 1);
 
-	if (istlen(port) && http_is_default_port(scheme, port)) {
+	if (!isttest(path)) {
+		path = ist("/");
+		normalize = 1;
+	}
+
+	if (normalize) {
 		/* reconstruct the uri with removal of the port */
 		struct buffer *temp = get_trash_chunk();
 		struct ist meth, vsn;
@@ -1785,8 +1794,8 @@ int http_scheme_based_normalize(struct htx *htx)
 		/* reconstruct uri without port */
 		chunk_memcat(temp, uri.ptr, authority.ptr - uri.ptr);
 		chunk_istcat(temp, host);
-		chunk_memcat(temp, istend(authority), istend(uri) - istend(authority));
-		uri = ist2(temp->area + meth.len + vsn.len, host.len + uri.len - authority.len); /* uri */
+		chunk_istcat(temp, path);
+		uri = ist2(temp->area + meth.len + vsn.len, host.len + path.len + authority.ptr - uri.ptr); /* uri */
 
 		http_replace_stline(htx, meth, uri, vsn);
 
@@ -1902,6 +1911,11 @@ static int proxy_parse_errorloc(char **args, int section, struct proxy *curpx,
 		ret = -1;
 		goto out;
 	}
+	if (*(args[3])) {
+		memprintf(errmsg, "%s : expects exactly two arguments.\n", args[0]);
+		ret = -1;
+		goto out;
+	}
 
 	status = atol(args[1]);
 	errloc = (strcmp(args[0], "errorloc303") == 0 ? 303 : 302);
@@ -1966,6 +1980,11 @@ static int proxy_parse_errorfile(char **args, int section, struct proxy *curpx,
 
 	if (*(args[1]) == 0 || *(args[2]) == 0) {
 		memprintf(errmsg, "%s : expects <status_code> and <file> as arguments.\n", args[0]);
+		ret = -1;
+		goto out;
+	}
+	if (*(args[3])) {
+		memprintf(errmsg, "%s : expects exactly two arguments.\n", args[0]);
 		ret = -1;
 		goto out;
 	}

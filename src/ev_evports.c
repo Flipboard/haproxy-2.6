@@ -124,16 +124,24 @@ static void _do_poll(struct poller *p, int exp, int wake)
 	for (i = 0; i < fd_nbupdt; i++) {
 		fd = fd_updt[i];
 
-		_HA_ATOMIC_AND(&fdtab[fd].update_mask, ~tid_bit);
-		if (fdtab[fd].owner == NULL) {
+		if (!fd_grab_tgid(fd, 1)) {
+			/* was reassigned */
 			activity[tid].poll_drop_fd++;
 			continue;
 		}
 
-		_update_fd(fd);
+		_HA_ATOMIC_AND(&fdtab[fd].update_mask, ~tid_bit);
+
+		if (fdtab[fd].owner)
+			_update_fd(fd);
+		else
+			activity[tid].poll_drop_fd++;
+
+		fd_drop_tgid(fd);
 	}
 	fd_nbupdt = 0;
-	/* Scan the global update list */
+
+	/* Scan the shared update list */
 	for (old_fd = fd = update_list.first; fd != -1; fd = fdtab[fd].update.next) {
 		if (fd == -2) {
 			fd = old_fd;
@@ -143,13 +151,26 @@ static void _do_poll(struct poller *p, int exp, int wake)
 			fd = -fd -4;
 		if (fd == -1)
 			break;
-		if (fdtab[fd].update_mask & tid_bit)
-			done_update_polling(fd);
+
+		if (!fd_grab_tgid(fd, 1)) {
+			/* was reassigned */
+			activity[tid].poll_drop_fd++;
+			continue;
+		}
+
+		if (!(fdtab[fd].update_mask & tid_bit)) {
+			fd_drop_tgid(fd);
+			continue;
+		}
+
+		done_update_polling(fd);
+
+		if (fdtab[fd].owner)
+			_update_fd(fd);
 		else
-			continue;
-		if (!fdtab[fd].owner)
-			continue;
-		_update_fd(fd);
+			activity[tid].poll_drop_fd++;
+
+		fd_drop_tgid(fd);
 	}
 
 	thread_idle_now();
@@ -171,6 +192,12 @@ static void _do_poll(struct poller *p, int exp, int wake)
 				   evports_evlist_max,
 				   &nevlist, /* updated to the number of events retrieved */
 				   &timeout_ts);
+
+		/* Be careful, nevlist here is always updated by the syscall
+		 * even on status == -1, so it must always be respected
+		 * otherwise events are lost. Awkward API BTW, I wonder how
+		 * they thought ENOSYS ought to be handled... -WT
+		 */
 		if (status != 0) {
 			int e = errno;
 			switch (e) {
@@ -183,12 +210,12 @@ static void _do_poll(struct poller *p, int exp, int wake)
 				/* nevlist >= 0 */
 				break;
 			default:
-				nevlist = 0;
+				/* signal or anything else */
 				interrupted = 1;
 				break;
 			}
 		}
-		clock_update_date(timeout, nevlist);
+		clock_update_date(timeout, (global.tune.options & GTUNE_BUSY_POLLING) ? 1 : nevlist);
 
 		if (nevlist || interrupted)
 			break;
@@ -246,12 +273,9 @@ static void _do_poll(struct poller *p, int exp, int wake)
 		 */
 		ret = fd_update_events(fd, n);
 
-		/* disable polling on this instance if the FD was migrated */
-		if (ret == FD_UPDT_MIGRATED) {
-			if (!HA_ATOMIC_BTS(&fdtab[fd].update_mask, tid))
-				fd_updt[fd_nbupdt++] = fd;
+		/* polling will be on this instance if the FD was migrated */
+		if (ret == FD_UPDT_MIGRATED)
 			continue;
-		}
 
 		/*
 		 * This file descriptor was closed during the processing of

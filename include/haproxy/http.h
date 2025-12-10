@@ -42,6 +42,8 @@ int http_validate_scheme(const struct ist schm);
 struct ist http_parse_scheme(struct http_uri_parser *parser);
 struct ist http_parse_authority(struct http_uri_parser *parser, int no_userinfo);
 struct ist http_parse_path(struct http_uri_parser *parser);
+int http_parse_cont_len_header(struct ist *value, unsigned long long *body_len,
+                               int not_first);
 int http_header_match2(const char *hdr, const char *end,
                        const char *name, int len);
 char *http_find_hdr_value_end(char *s, const char *e);
@@ -169,6 +171,58 @@ static inline struct http_uri_parser http_uri_parser_init(const struct ist uri)
 	}
 
 	return parser;
+}
+
+/* Looks into <ist> for forbidden characters for header values (0x00, 0x0A,
+ * 0x0D), starting at pointer <start> which must be within <ist>. Returns
+ * non-zero if such a character is found, 0 otherwise. When run on unlikely
+ * header match, it's recommended to first check for the presence of control
+ * chars using ist_find_ctl().
+ */
+static inline int http_header_has_forbidden_char(const struct ist ist, const char *start)
+{
+	do {
+		if ((uint8_t)*start <= 0x0d &&
+		    (1U << (uint8_t)*start) & ((1<<13) | (1<<10) | (1<<0)))
+			return 1;
+		start++;
+	} while (start < istend(ist));
+	return 0;
+}
+
+/* Check that method only contains token as required.
+ * See RFC 9110 9. Methods
+ */
+static inline int http_method_has_forbidden_char(const struct ist ist)
+{
+	const char *start = istptr(ist);
+
+	do {
+		if (!HTTP_IS_TOKEN(*start))
+			return 1;
+		start++;
+	} while (start < istend(ist));
+	return 0;
+}
+
+/* Looks into <ist> for forbidden characters for :path values (0x00..0x1F,
+ * 0x20, 0x23), starting at pointer <start> which must be within <ist>.
+ * Returns non-zero if such a character is found, 0 otherwise. When run on
+ * unlikely header match, it's recommended to first check for the presence
+ * of control chars using ist_find_ctl().
+ */
+static inline int http_path_has_forbidden_char(const struct ist ist, const char *start)
+{
+	do {
+		if ((uint8_t)*start <= 0x23) {
+			if ((uint8_t)*start < 0x20)
+				return 1;
+			if ((1U << ((uint8_t)*start & 0x1F)) & ((1<<3) | (1<<0)))
+				return 1;
+		}
+		start++;
+	} while (start < istend(ist));
+	return 0;
 }
 
 #endif /* _HAPROXY_HTTP_H */

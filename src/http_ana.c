@@ -65,8 +65,8 @@ static enum rule_result http_req_restrict_header_names(struct stream *s, struct 
 static void http_manage_client_side_cookies(struct stream *s, struct channel *req);
 static void http_manage_server_side_cookies(struct stream *s, struct channel *res);
 
-static int http_stats_check_uri(struct stream *s, struct http_txn *txn, struct proxy *backend);
-static int http_handle_stats(struct stream *s, struct channel *req);
+static int http_stats_check_uri(struct stream *s, struct http_txn *txn, struct proxy *px);
+static int http_handle_stats(struct stream *s, struct channel *req, struct proxy *px);
 
 static int http_handle_expect_hdr(struct stream *s, struct htx *htx, struct http_msg *msg);
 static int http_reply_100_continue(struct stream *s);
@@ -438,7 +438,7 @@ int http_process_req_common(struct stream *s, struct channel *req, int an_bit, s
 		}
 
 		/* parse the whole stats request and extract the relevant information */
-		http_handle_stats(s, req);
+		http_handle_stats(s, req, px);
 		verdict = http_req_get_intercept_rule(px, NULL, &px->uri_auth->http_req_rules, s);
 		/* not all actions implemented: deny, allow, auth */
 
@@ -899,17 +899,15 @@ int http_process_tarpit(struct stream *s, struct channel *req, int an_bit)
  * reached the buffer. It must only be called after the standard HTTP request
  * processing has occurred, because it expects the request to be parsed and will
  * look for the Expect header. It may send a 100-Continue interim response. It
- * takes in input any state starting from HTTP_MSG_BODY and leaves with one of
- * HTTP_MSG_CHK_SIZE, HTTP_MSG_DATA or HTTP_MSG_TRAILERS. It returns zero if it
- * needs to read more data, or 1 once it has completed its analysis.
+ * returns zero if it needs to read more data, or 1 once it has completed its
+ * analysis.
  */
 int http_wait_for_request_body(struct stream *s, struct channel *req, int an_bit)
 {
 	struct session *sess = s->sess;
 	struct http_txn *txn = s->txn;
-	struct http_msg *msg = &s->txn->req;
 
-	DBG_TRACE_ENTER(STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA, s, txn, msg);
+	DBG_TRACE_ENTER(STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA, s, txn, &s->txn->req);
 
 
 	switch (http_wait_for_msg_body(s, req, s->be->timeout.httpreq, 0)) {
@@ -967,7 +965,7 @@ int http_wait_for_request_body(struct stream *s, struct channel *req, int an_bit
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_PRXCOND;
 	if (!(s->flags & SF_FINST_MASK))
-		s->flags |= (msg->msg_state < HTTP_MSG_DATA ? SF_FINST_R : SF_FINST_D);
+		s->flags |= SF_FINST_R;
 
 	req->analysers &= AN_REQ_FLT_END;
 	req->analyse_exp = TICK_ETERNITY;
@@ -1076,7 +1074,8 @@ int http_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 	}
 	else {
 		c_adv(req, htx->data - co_data(req));
-		if (msg->flags & HTTP_MSGF_XFER_LEN)
+		if ((msg->flags & HTTP_MSGF_XFER_LEN) &&
+		    (!(msg->flags & HTTP_MSGF_CONN_UPG) || (htx->flags & HTX_FL_EOM)))
 			channel_htx_forward_forever(req, htx);
 	}
 
@@ -1259,10 +1258,9 @@ static __inline int do_l7_retry(struct stream *s, struct stconn *sc)
 	struct channel *req, *res;
 	int co_data;
 
-	s->conn_retries++;
 	if (s->conn_retries >= s->be->conn_retries)
 		return -1;
-
+	s->conn_retries++;
 	if (objt_server(s->target)) {
 		if (s->flags & SF_CURR_SESS) {
 			s->flags &= ~SF_CURR_SESS;
@@ -1275,7 +1273,7 @@ static __inline int do_l7_retry(struct stream *s, struct stconn *sc)
 	req = &s->req;
 	res = &s->res;
 	/* Remove any write error from the request, and read error from the response */
-	req->flags &= ~(CF_WRITE_ERROR | CF_WRITE_TIMEOUT | CF_SHUTW | CF_SHUTW_NOW);
+	req->flags &= ~(CF_WRITE_ERROR | CF_WRITE_TIMEOUT | CF_SHUTW | CF_SHUTW_NOW | CF_WROTE_DATA);
 	res->flags &= ~(CF_READ_ERROR | CF_READ_TIMEOUT | CF_SHUTR | CF_EOI | CF_READ_NULL | CF_SHUTR_NOW);
 	res->analysers &= AN_RES_FLT_END;
 	s->conn_err_type = STRM_ET_NONE;
@@ -1337,8 +1335,11 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	htx = htxbuf(&rep->buf);
 
 	/* Parsing errors are caught here */
-	if (htx->flags & HTX_FL_PARSING_ERROR)
+	if (htx->flags & HTX_FL_PARSING_ERROR) {
+		if (objt_server(s->target))
+			health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_HDRRSP);
 		goto return_bad_res;
+	}
 	if (htx->flags & HTX_FL_PROCESSING_ERROR)
 		goto return_int_err;
 
@@ -1360,7 +1361,17 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		if (rep->flags & CF_READ_ERROR) {
 			struct connection *conn = sc_conn(s->scb);
 
-			/* Perform a L7 retry because server refuses the early data. */
+			if (!(s->flags & SF_SRV_REUSED) && objt_server(s->target))
+				health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_READ_ERROR);
+
+			if ((txn->flags & TX_L7_RETRY) &&
+			    (s->be->retry_type & PR_RE_DISCONNECTED) &&
+			    (!conn || conn->err_code != CO_ER_SSL_EARLY_FAILED)) {
+				if (co_data(rep) || do_l7_retry(s, s->scb) == 0)
+					return 0;
+			}
+
+			/* Perform a L7 retry on empty response or because server refuses the early data. */
 			if ((txn->flags & TX_L7_RETRY) &&
 			    (s->be->retry_type & PR_RE_EARLY_ERROR) &&
 			    conn && conn->err_code == CO_ER_SSL_EARLY_FAILED &&
@@ -1370,14 +1381,12 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 				return 0;
 			}
 
-			if (txn->flags & TX_NOT_FIRST)
+			if (s->flags & SF_SRV_REUSED)
 				goto abort_keep_alive;
 
 			_HA_ATOMIC_INC(&s->be->be_counters.failed_resp);
-			if (objt_server(s->target)) {
+			if (objt_server(s->target))
 				_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_resp);
-				health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_READ_ERROR);
-			}
 
 			/* if the server refused the early data, just send a 425 */
 			if (conn && conn->err_code == CO_ER_SSL_EARLY_FAILED)
@@ -1401,6 +1410,9 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 
 		/* 2: read timeout : return a 504 to the client. */
 		else if (rep->flags & CF_READ_TIMEOUT) {
+			if (objt_server(s->target))
+				health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_READ_TIMEOUT);
+
 			if ((txn->flags & TX_L7_RETRY) &&
 			    (s->be->retry_type & PR_RE_TIMEOUT)) {
 				if (co_data(rep) || do_l7_retry(s, s->scb) == 0) {
@@ -1410,10 +1422,8 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 				}
 			}
 			_HA_ATOMIC_INC(&s->be->be_counters.failed_resp);
-			if (objt_server(s->target)) {
+			if (objt_server(s->target))
 				_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_resp);
-				health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_READ_TIMEOUT);
-			}
 
 			txn->status = 504;
 			stream_inc_http_fail_ctr(s);
@@ -1454,6 +1464,9 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 
 		/* 4: close from server, capture the response if the server has started to respond */
 		else if (rep->flags & CF_SHUTR) {
+			if (!(s->flags & SF_SRV_REUSED) && objt_server(s->target))
+				health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_BROKEN_PIPE);
+
 			if ((txn->flags & TX_L7_RETRY) &&
 			    (s->be->retry_type & PR_RE_DISCONNECTED)) {
 				if (co_data(rep) || do_l7_retry(s, s->scb) == 0) {
@@ -1463,14 +1476,12 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 				}
 			}
 
-			if (txn->flags & TX_NOT_FIRST)
+			if (s->flags & SF_SRV_REUSED)
 				goto abort_keep_alive;
 
 			_HA_ATOMIC_INC(&s->be->be_counters.failed_resp);
-			if (objt_server(s->target)) {
+			if (objt_server(s->target))
 				_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_resp);
-				health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_BROKEN_PIPE);
-			}
 
 			txn->status = 502;
 			stream_inc_http_fail_ctr(s);
@@ -1488,7 +1499,7 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 
 		/* 5: write error to client (we don't send any message then) */
 		else if (rep->flags & CF_WRITE_ERROR) {
-			if (txn->flags & TX_NOT_FIRST)
+			if (s->flags & SF_SRV_REUSED)
 				goto abort_keep_alive;
 
 			_HA_ATOMIC_INC(&s->be->be_counters.failed_resp);
@@ -1521,6 +1532,17 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	BUG_ON(htx_get_first_type(htx) != HTX_BLK_RES_SL);
 	sl = http_get_stline(htx);
 
+	/* Adjust server's health based on status code. Note: status codes 501
+	 * and 505 are triggered on demand by client request, so we must not
+	 * count them as server failures.
+	 */
+	if (objt_server(s->target)) {
+		if (sl->info.res.status >= 100 && (sl->info.res.status < 500 || sl->info.res.status == 501 || sl->info.res.status == 505))
+			health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_OK);
+		else
+			health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_STS);
+	}
+
 	/* Perform a L7 retry because of the status code */
 	if ((txn->flags & TX_L7_RETRY) &&
 	    l7_status_match(s->be, sl->info.res.status) &&
@@ -1528,9 +1550,6 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		DBG_TRACE_DEVEL("leaving on L7 retry", STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA, s, txn);
 		return 0;
 	}
-
-	/* Now, L7 buffer is useless, it can be released */
-	b_free(&txn->l7_buffer);
 
 	msg->msg_state = HTTP_MSG_BODY;
 
@@ -1593,17 +1612,6 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.p.http.cum_req);
 	}
 
-	/* Adjust server's health based on status code. Note: status codes 501
-	 * and 505 are triggered on demand by client request, so we must not
-	 * count them as server failures.
-	 */
-	if (objt_server(s->target)) {
-		if (txn->status >= 100 && (txn->status < 500 || txn->status == 501 || txn->status == 505))
-			health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_OK);
-		else
-			health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_STS);
-	}
-
 	/*
 	 * We may be facing a 100-continue response, or any other informational
 	 * 1xx response which is non-final, in which case this is not the right
@@ -1629,8 +1637,11 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	 * header content. But it is probably stronger enough for now.
 	 */
 	if (txn->status == 101 &&
-	    (!(txn->req.flags & HTTP_MSGF_CONN_UPG) || !(txn->rsp.flags & HTTP_MSGF_CONN_UPG)))
+	    (!(txn->req.flags & HTTP_MSGF_CONN_UPG) || !(txn->rsp.flags & HTTP_MSGF_CONN_UPG))) {
+		if (objt_server(s->target))
+			health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_HDRRSP);
 		goto return_bad_res;
+	}
 
 	/*
 	 * 2: check for cacheability.
@@ -1686,11 +1697,17 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		txn->flags |= TX_CON_WANT_TUN;
 	}
 
-	/* check for NTML authentication headers in 401 (WWW-Authenticate) and
-	 * 407 (Proxy-Authenticate) responses and set the connection to private
+	/* Check for NTML authentication headers in 401 (WWW-Authenticate) and
+	 * 407 (Proxy-Authenticate) responses and set the connection to
+	 * private.
+	 *
+	 * Note that this is not performed when using a true multiplexer unless
+	 * connection is already attached to the session as nothing prevents it
+	 * from being shared already by several sessions here.
 	 */
 	srv_conn = sc_conn(s->scb);
-	if (srv_conn) {
+	if (srv_conn &&
+	    (LIST_INLIST(&srv_conn->sess_el) || strcmp(srv_conn->mux->name, "H1") == 0)) {
 		struct ist hdr;
 		struct http_hdr_ctx ctx;
 
@@ -1722,6 +1739,9 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	}
 
   end:
+	/* Now, L7 buffer is useless, it can be released */
+	b_free(&txn->l7_buffer);
+
 	/* we want to have the response time before we start processing it */
 	s->logs.t_data = tv_ms_elapsed(&s->logs.tv_accept, &now);
 
@@ -1745,11 +1765,6 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	goto return_prx_cond;
 
   return_bad_res:
-	_HA_ATOMIC_INC(&s->be->be_counters.failed_resp);
-	if (objt_server(s->target)) {
-		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_resp);
-		health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_HDRRSP);
-	}
 	if ((s->be->retry_type & PR_RE_JUNK_REQUEST) &&
 	    (txn->flags & TX_L7_RETRY) &&
 	    do_l7_retry(s, s->scb) == 0) {
@@ -1757,6 +1772,11 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 				STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA, s, txn);
 		return 0;
 	}
+
+	_HA_ATOMIC_INC(&s->be->be_counters.failed_resp);
+	if (objt_server(s->target))
+		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_resp);
+
 	txn->status = 502;
 	stream_inc_http_fail_ctr(s);
 	/* fall through */
@@ -2075,6 +2095,7 @@ int http_process_res_common(struct stream *s, struct channel *rep, int an_bit, s
 	goto return_prx_err;
 
  return_bad_res:
+	s->logs.t_data = -1; /* was not a valid response */
 	txn->status = 502;
 	stream_inc_http_fail_ctr(s);
 	_HA_ATOMIC_INC(&s->be->be_counters.failed_resp);
@@ -2089,7 +2110,6 @@ int http_process_res_common(struct stream *s, struct channel *rep, int an_bit, s
 	/* fall through */
 
  return_prx_cond:
-	s->logs.t_data = -1; /* was not a valid response */
 	s->scb->flags |= SC_FL_NOLINGER;
 
 	if (!(s->flags & SF_ERR_MASK))
@@ -2362,8 +2382,6 @@ int http_response_forward_body(struct stream *s, struct channel *res, int an_bit
 		health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_RSP);
 	}
 	stream_inc_http_fail_ctr(s);
-	if (!(s->flags & SF_ERR_MASK))
-		s->flags |= SF_ERR_SRVCL;
 	/* fall through */
 
    return_error:
@@ -2569,7 +2587,7 @@ int http_apply_redirect_rule(struct redirect_rule *rule, struct stream *s, struc
 	htx = htx_from_buf(&res->buf);
 	/* Trim any possible response */
 	channel_htx_truncate(&s->res, htx);
-	flags = (HTX_SL_F_IS_RESP|HTX_SL_F_VER_11|HTX_SL_F_XFER_LEN|HTX_SL_F_BODYLESS);
+	flags = (HTX_SL_F_IS_RESP|HTX_SL_F_VER_11|HTX_SL_F_XFER_LEN|HTX_SL_F_CLEN|HTX_SL_F_BODYLESS);
 	sl = htx_add_stline(htx, HTX_BLK_RES_SL, flags, ist("HTTP/1.1"), status, reason);
 	if (!sl)
 		goto fail;
@@ -2684,10 +2702,11 @@ int http_replace_hdrs(struct stream* s, struct htx *htx, struct ist name,
 		     const char *str, struct my_regex *re, int full)
 {
 	struct http_hdr_ctx ctx;
-	struct buffer *output = get_trash_chunk();
 
 	ctx.blk = NULL;
 	while (http_find_header(htx, name, &ctx, full)) {
+		struct buffer *output = get_trash_chunk();
+
 		if (!regex_exec_match2(re, ctx.value.ptr, ctx.value.len, MAX_MATCH, pmatch, 0))
 			continue;
 
@@ -2772,6 +2791,7 @@ int http_res_set_status(unsigned int status, struct ist reason, struct stream *s
 
 	if (!http_replace_res_status(htx, ist2(trash.area, trash.data), reason))
 		return -1;
+	s->txn->status = status;
 	return 0;
 }
 
@@ -2847,6 +2867,15 @@ static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct lis
 					goto end;
 				case ACT_RET_YIELD:
 					s->current_rule = rule;
+					if (act_opts & ACT_OPT_FINAL) {
+						send_log(s->be, LOG_WARNING,
+							 "Internal error: action yields while it is  no long allowed "
+							 "for the http-request actions.");
+						s->last_rule_file = rule->conf.file;
+						s->last_rule_line = rule->conf.line;
+						rule_ret = HTTP_RULE_RES_ERROR;
+						goto end;
+					}
 					rule_ret = HTTP_RULE_RES_YIELD;
 					goto end;
 				case ACT_RET_ERR:
@@ -3010,6 +3039,15 @@ resume_execution:
 					goto end;
 				case ACT_RET_YIELD:
 					s->current_rule = rule;
+					if (act_opts & ACT_OPT_FINAL) {
+						send_log(s->be, LOG_WARNING,
+							 "Internal error: action yields while it is no long allowed "
+							 "for the http-response/http-after-response actions.");
+						s->last_rule_file = rule->conf.file;
+						s->last_rule_line = rule->conf.line;
+						rule_ret = HTTP_RULE_RES_ERROR;
+						goto end;
+					}
 					rule_ret = HTTP_RULE_RES_YIELD;
 					goto end;
 				case ACT_RET_ERR:
@@ -3885,6 +3923,7 @@ void http_check_response_for_cacheability(struct stream *s, struct channel *res)
 	struct htx *htx;
 	int has_freshness_info = 0;
 	int has_validator = 0;
+	int has_null_maxage = 0;
 
 	if (txn->status < 200) {
 		/* do not try to cache interim responses! */
@@ -3909,10 +3948,16 @@ void http_check_response_for_cacheability(struct stream *s, struct channel *res)
 			txn->flags |= TX_CACHEABLE | TX_CACHE_COOK;
 			continue;
 		}
+		/* This max-age might be overridden by a s-maxage directive, do
+		 * not unset the TX_CACHEABLE yet. */
+		if (isteqi(ctx.value, ist("max-age=0"))) {
+			has_null_maxage = 1;
+			continue;
+		}
+
 		if (isteqi(ctx.value, ist("private")) ||
 		    isteqi(ctx.value, ist("no-cache")) ||
 		    isteqi(ctx.value, ist("no-store")) ||
-		    isteqi(ctx.value, ist("max-age=0")) ||
 		    isteqi(ctx.value, ist("s-maxage=0"))) {
 			txn->flags &= ~TX_CACHEABLE & ~TX_CACHE_COOK;
 			continue;
@@ -3923,11 +3968,21 @@ void http_check_response_for_cacheability(struct stream *s, struct channel *res)
 			continue;
 		}
 
-		if (istmatchi(ctx.value, ist("s-maxage")) ||
-		    istmatchi(ctx.value, ist("max-age"))) {
+		if (istmatchi(ctx.value, ist("s-maxage"))) {
+			has_freshness_info = 1;
+			has_null_maxage = 0;	/* The null max-age is overridden, ignore it */
+			continue;
+		}
+		if (istmatchi(ctx.value, ist("max-age"))) {
 			has_freshness_info = 1;
 			continue;
 		}
+	}
+
+	/* We had a 'max-age=0' directive but no extra s-maxage, do not cache
+	 * the response. */
+	if (has_null_maxage) {
+		txn->flags &= ~TX_CACHEABLE & ~TX_CACHE_COOK;
 	}
 
 	/* If no freshness information could be found in Cache-Control values,
@@ -3952,21 +4007,21 @@ void http_check_response_for_cacheability(struct stream *s, struct channel *res)
 	/* We won't store an entry that has neither a cache validator nor an
 	 * explicit expiration time, as suggested in RFC 7234#3. */
 	if (!has_freshness_info && !has_validator)
-		txn->flags |= TX_CACHE_IGNORE;
+		txn->flags &= ~TX_CACHEABLE;
 }
 
 /*
  * In a GET, HEAD or POST request, check if the requested URI matches the stats uri
- * for the current backend.
+ * for the current proxy.
  *
  * It is assumed that the request is either a HEAD, GET, or POST and that the
  * uri_auth field is valid.
  *
  * Returns 1 if stats should be provided, otherwise 0.
  */
-static int http_stats_check_uri(struct stream *s, struct http_txn *txn, struct proxy *backend)
+static int http_stats_check_uri(struct stream *s, struct http_txn *txn, struct proxy *px)
 {
-	struct uri_auth *uri_auth = backend->uri_auth;
+	struct uri_auth *uri_auth = px->uri_auth;
 	struct htx *htx;
 	struct htx_sl *sl;
 	struct ist uri;
@@ -4003,13 +4058,13 @@ static int http_stats_check_uri(struct stream *s, struct http_txn *txn, struct p
  * s->target which is supposed to already point to the stats applet. The caller
  * is expected to have already assigned an appctx to the stream.
  */
-static int http_handle_stats(struct stream *s, struct channel *req)
+static int http_handle_stats(struct stream *s, struct channel *req, struct proxy *px)
 {
 	struct stats_admin_rule *stats_admin_rule;
 	struct session *sess = s->sess;
 	struct http_txn *txn = s->txn;
 	struct http_msg *msg = &txn->req;
-	struct uri_auth *uri_auth = s->be->uri_auth;
+	struct uri_auth *uri_auth = px->uri_auth;
 	const char *h, *lookup, *end;
 	struct appctx *appctx = __sc_appctx(s->scb);
 	struct show_stat_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
@@ -4019,6 +4074,7 @@ static int http_handle_stats(struct stream *s, struct channel *req)
 	appctx->st1 = 0;
 	ctx->state = STAT_STATE_INIT;
 	ctx->st_code = STAT_STATUS_INIT;
+	ctx->http_px = px;
 	ctx->flags |= uri_auth->flags;
 	ctx->flags |= STAT_FMT_HTML; /* assume HTML mode by default */
 	if ((msg->flags & HTTP_MSGF_VER_11) && (txn->meth != HTTP_METH_HEAD))
@@ -4217,17 +4273,15 @@ enum rule_result http_wait_for_msg_body(struct stream *s, struct channel *chn,
 	if (txn->meth == HTTP_METH_CONNECT || (msg->flags & HTTP_MSGF_BODYLESS))
 		goto end;
 
-	if (!(chn->flags & CF_ISRESP) && msg->msg_state < HTTP_MSG_DATA) {
+	if (!(chn->flags & CF_ISRESP)) {
 		if (http_handle_expect_hdr(s, htx, msg) == -1) {
 			ret = HTTP_RULE_RES_ERROR;
 			goto end;
 		}
 	}
 
-	msg->msg_state = HTTP_MSG_DATA;
-
-	/* Now we're in HTTP_MSG_DATA. We just need to know if all data have
-	 * been received or if the buffer is full.
+	/* Now we're are waiting for the payload. We just need to know if all
+	 * data have been received or if the buffer is full.
 	 */
 	if ((htx->flags & HTX_FL_EOM) ||
 	    htx_get_tail_type(htx) > HTX_BLK_DATA ||
@@ -4269,7 +4323,7 @@ enum rule_result http_wait_for_msg_body(struct stream *s, struct channel *chn,
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_CLITO;
 	if (!(s->flags & SF_FINST_MASK))
-		s->flags |= SF_FINST_D;
+		s->flags |= SF_FINST_R;
 	_HA_ATOMIC_INC(&sess->fe->fe_counters.failed_req);
 	if (sess->listener && sess->listener->counters)
 		_HA_ATOMIC_INC(&sess->listener->counters->failed_req);
@@ -4282,7 +4336,7 @@ enum rule_result http_wait_for_msg_body(struct stream *s, struct channel *chn,
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_SRVTO;
 	if (!(s->flags & SF_FINST_MASK))
-		s->flags |= SF_FINST_D;
+		s->flags |= SF_FINST_R;
 	stream_inc_http_fail_ctr(s);
 	http_reply_and_close(s, txn->status, http_error_message(s));
 	ret = HTTP_RULE_RES_ABRT;
@@ -4329,7 +4383,7 @@ void http_perform_server_redirect(struct stream *s, struct stconn *sc)
 	 * Create the 302 respone
 	 */
 	htx = htx_from_buf(&res->buf);
-	flags = (HTX_SL_F_IS_RESP|HTX_SL_F_VER_11|HTX_SL_F_XFER_LEN|HTX_SL_F_BODYLESS);
+	flags = (HTX_SL_F_IS_RESP|HTX_SL_F_VER_11|HTX_SL_F_XFER_LEN|HTX_SL_F_CLEN|HTX_SL_F_BODYLESS);
 	sl = htx_add_stline(htx, HTX_BLK_RES_SL, flags,
 			    ist("HTTP/1.1"), ist("302"), ist("Found"));
 	if (!sl)
@@ -4949,7 +5003,8 @@ static int http_handle_expect_hdr(struct stream *s, struct htx *htx, struct http
 	/* If we have HTTP/1.1 message with a body and Expect: 100-continue,
 	 * then we must send an HTTP/1.1 100 Continue intermediate response.
 	 */
-	if (msg->msg_state == HTTP_MSG_BODY && (msg->flags & HTTP_MSGF_VER_11) &&
+	if (!(msg->flags & HTTP_MSGF_EXPECT_CHECKED) &&
+	    (msg->flags & HTTP_MSGF_VER_11) &&
 	    (msg->flags & (HTTP_MSGF_CNT_LEN|HTTP_MSGF_TE_CHNK))) {
 		struct ist hdr = { .ptr = "Expect", .len = 6 };
 		struct http_hdr_ctx ctx;
@@ -4963,6 +5018,7 @@ static int http_handle_expect_hdr(struct stream *s, struct htx *htx, struct http
 			http_remove_header(htx, &ctx);
 		}
 	}
+	msg->flags |= HTTP_MSGF_EXPECT_CHECKED;
 	return 0;
 }
 

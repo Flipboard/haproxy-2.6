@@ -1295,6 +1295,7 @@ int smp_resolve_args(struct proxy *p, char **err)
 		ctx = "sample fetch keyword";
 		switch (cur->ctx) {
 		case ARGC_STK:   where = "in stick rule in"; break;
+		case ARGC_HON:   where = "in hash-on rule in"; break;
 		case ARGC_TRK:   where = "in tracking rule in"; break;
 		case ARGC_LOG:   where = "in log-format string in"; break;
 		case ARGC_LOGSD: where = "in log-format-sd string in"; break;
@@ -1672,7 +1673,7 @@ static int sample_conv_debug(const struct arg *arg_p, struct sample *smp, void *
 
  done:
 	line = ist2(buf->area, buf->data);
-	sink_write(sink, &line, 1, 0, 0, NULL);
+	sink_write(sink, 0, &line, 1, 0, 0, NULL);
  end:
 	free_trash_chunk(buf);
 	return 1;
@@ -2587,7 +2588,7 @@ static int sample_conv_word(const struct arg *arg_p, struct sample *smp, void *p
 	/* Field not found */
 	if (word != arg_p[0].data.sint) {
 		smp->data.u.str.data = 0;
-		return 1;
+		return 0;
 	}
 found:
 	smp->data.u.str.data = end - start;
@@ -2690,7 +2691,7 @@ static int sample_conv_regsub(const struct arg *arg_p, struct sample *smp, void 
 		output->data = exp_replace(output->area, output->size, start, arg_p[1].data.str.area, pmatch);
 
 		/* replace the matching part */
-		max = output->size - output->data;
+		max = trash->size - trash->data;
 		if (max) {
 			if (max > output->data)
 				max = output->data;
@@ -2839,12 +2840,12 @@ static inline long long int arith_add(long long int a, long long int b)
 	 * +------+----------+----------+
 	 */
 	if ((a ^ b) >= 0) {
-		/* signs are different. */
+		/* signs are same. */
 		if (a < 0) {
 			if (LLONG_MIN - a > b)
 				return LLONG_MIN;
 		}
-		if (LLONG_MAX - a < b)
+		else if (LLONG_MAX - a < b)
 			return LLONG_MAX;
 	}
 	return a + b;
@@ -3360,7 +3361,7 @@ static int sample_conv_ungrpc(const struct arg *arg_p, struct sample *smp, void 
 	while (grpc_left > GRPC_MSG_HEADER_SZ) {
 		size_t grpc_msg_len, left;
 
-		grpc_msg_len = left = ntohl(*(uint32_t *)(pos + GRPC_MSG_COMPRESS_FLAG_SZ));
+		grpc_msg_len = left = ntohl(read_u32(pos + GRPC_MSG_COMPRESS_FLAG_SZ));
 
 		pos += GRPC_MSG_HEADER_SZ;
 		grpc_left -= GRPC_MSG_HEADER_SZ;
@@ -3797,11 +3798,13 @@ static int sample_conv_json_query(const struct arg *args, struct sample *smp, vo
 static int sample_conv_jwt_verify_check(struct arg *args, struct sample_conv *conv,
 					const char *file, int line, char **err)
 {
+	enum jwt_alg alg = JWT_ALG_DEFAULT;
+
 	vars_check_arg(&args[0], NULL);
 	vars_check_arg(&args[1], NULL);
 
 	if (args[0].type == ARGT_STR) {
-		enum jwt_alg alg = jwt_parse_alg(args[0].data.str.area, args[0].data.str.data);
+		alg = jwt_parse_alg(args[0].data.str.area, args[0].data.str.data);
 
 		switch(alg) {
 		case JWT_ALG_DEFAULT:
@@ -3820,7 +3823,16 @@ static int sample_conv_jwt_verify_check(struct arg *args, struct sample_conv *co
 	}
 
 	if (args[1].type == ARGT_STR) {
-		jwt_tree_load_cert(args[1].data.str.area, args[1].data.str.data, err);
+		switch (alg) {
+			JWS_ALG_HS256:
+			JWS_ALG_HS384:
+			JWS_ALG_HS512:
+			/* don't try to load a file with HMAC algorithms */
+				break;
+			default:
+				jwt_tree_load_cert(args[1].data.str.area, args[1].data.str.data, err);
+				break;
+		}
 	}
 
 	return 1;
@@ -3830,9 +3842,7 @@ static int sample_conv_jwt_verify_check(struct arg *args, struct sample_conv *co
 static int sample_conv_jwt_verify(const struct arg *args, struct sample *smp, void *private)
 {
 	struct sample alg_smp, key_smp;
-
-	smp->data.type = SMP_T_SINT;
-	smp->data.u.sint = 0;
+	enum jwt_vrfy_status ret;
 
 	smp_set_owner(&alg_smp, smp->px, smp->sess, smp->strm, smp->opt);
 	smp_set_owner(&key_smp, smp->px, smp->sess, smp->strm, smp->opt);
@@ -3841,9 +3851,10 @@ static int sample_conv_jwt_verify(const struct arg *args, struct sample *smp, vo
 	if (!sample_conv_var2smp_str(&args[1], &key_smp))
 		return 0;
 
-	smp->data.u.sint = jwt_verify(&smp->data.u.str,  &alg_smp.data.u.str,
-				      &key_smp.data.u.str);
+	ret = jwt_verify(&smp->data.u.str,  &alg_smp.data.u.str, &key_smp.data.u.str);
 
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = ret;
 	return 1;
 }
 

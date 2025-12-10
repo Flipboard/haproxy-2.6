@@ -354,7 +354,7 @@ static int pendconn_process_next_strm(struct server *srv, struct proxy *px, int 
 /* Manages a server's connection queue. This function will try to dequeue as
  * many pending streams as possible, and wake them up.
  */
-void process_srv_queue(struct server *s)
+int process_srv_queue(struct server *s)
 {
 	struct server *ref = s->track ? s->track : s;
 	struct proxy  *p = s->proxy;
@@ -379,12 +379,20 @@ void process_srv_queue(struct server *s)
 	 * However we still re-enter the loop for one pass if there's no
 	 * more served, otherwise we could end up with no other thread
 	 * trying to dequeue them.
+	 *
+	 * There's one racy part: we don't want to have more than one thread
+	 * in charge of dequeuing, hence the dequeung flag. We cannot rely
+	 * on a trylock here because it would compete against pendconn_add()
+	 * and would occasionally leave entries in the queue that are never
+	 * dequeued. Nobody else uses the dequeuing flag so when seeing it
+	 * non-null, we're certain that another thread is waiting on it.
 	 */
 	while (!stop && (done < global.tune.maxpollevents || !s->served) &&
 	       s->served < (maxconn = srv_dynamic_maxconn(s))) {
-		if (HA_SPIN_TRYLOCK(QUEUE_LOCK, &s->queue.lock) != 0)
+		if (HA_ATOMIC_XCHG(&s->dequeuing, 1))
 			break;
 
+		HA_SPIN_LOCK(QUEUE_LOCK, &s->queue.lock);
 		while (s->served < maxconn) {
 			stop = !pendconn_process_next_strm(s, p, px_ok);
 			if (stop)
@@ -394,6 +402,7 @@ void process_srv_queue(struct server *s)
 			if (done >= global.tune.maxpollevents)
 				break;
 		}
+		HA_ATOMIC_STORE(&s->dequeuing, 0);
 		HA_SPIN_UNLOCK(QUEUE_LOCK, &s->queue.lock);
 	}
 
@@ -404,6 +413,7 @@ void process_srv_queue(struct server *s)
 		if (p->lbprm.server_take_conn)
 			p->lbprm.server_take_conn(s);
 	}
+	return done;
 }
 
 /* Adds the stream <strm> to the pending connection queue of server <strm>->srv
@@ -486,12 +496,14 @@ int pendconn_redistribute(struct server *s)
 {
 	struct pendconn *p;
 	struct eb32_node *node, *nodeb;
+	struct proxy *px = s->proxy;
+	int px_xferred = 0;
 	int xferred = 0;
 
 	/* The REDISP option was specified. We will ignore cookie and force to
 	 * balance or use the dispatcher. */
 	if ((s->proxy->options & (PR_O_REDISP|PR_O_PERSIST)) != PR_O_REDISP)
-		return 0;
+		goto skip_srv_queue;
 
 	HA_SPIN_LOCK(QUEUE_LOCK, &s->queue.lock);
 	for (node = eb32_first(&s->queue.head); node; node = nodeb) {
@@ -514,7 +526,33 @@ int pendconn_redistribute(struct server *s)
 		_HA_ATOMIC_SUB(&s->queue.length, xferred);
 		_HA_ATOMIC_SUB(&s->proxy->totpend, xferred);
 	}
-	return xferred;
+
+ skip_srv_queue:
+	if (px->lbprm.tot_wact || px->lbprm.tot_wbck)
+		goto done;
+
+	HA_SPIN_LOCK(QUEUE_LOCK, &px->queue.lock);
+	for (node = eb32_first(&px->queue.head); node; node = nodeb) {
+		nodeb =	eb32_next(node);
+		p = eb32_entry(node, struct pendconn, node);
+
+		/* force-persist streams may occasionally appear in the
+		 * proxy's queue, and we certainly don't want them here!
+		 */
+		p->strm_flags &= ~SF_FORCE_PRST;
+		__pendconn_unlink_prx(p);
+
+		task_wakeup(p->strm->task, TASK_WOKEN_RES);
+		px_xferred++;
+	}
+	HA_SPIN_UNLOCK(QUEUE_LOCK, &px->queue.lock);
+
+	if (px_xferred) {
+		_HA_ATOMIC_SUB(&px->queue.length, px_xferred);
+		_HA_ATOMIC_SUB(&px->totpend, px_xferred);
+	}
+ done:
+	return xferred + px_xferred;
 }
 
 /* Check for pending connections at the backend, and assign some of them to
@@ -619,6 +657,68 @@ int pendconn_dequeue(struct stream *strm)
 	strm->pend_pos = NULL;
 	pool_free(pool_head_pendconn, p);
 	return 0;
+}
+
+/* checks after a successful pendconn_add() if the connection ended up being
+ * alone with no active connection left to dequeue it. In such a case it will
+ * simply remove it from the queue, free it and return non-zero to inform the
+ * caller that it must try to add the connection again, otherwise it returns
+ * zero, indicating that the connection will be handled normally. The caller
+ * might have to drop SF_DIRECT and/or SF_ASSIGNED if the conn was on a proxy.
+ */
+int pendconn_must_try_again(struct pendconn *p)
+{
+	struct queue  *q  = p->queue;
+	struct proxy  *px = q->px;
+	struct server *sv = q->sv;
+	int ret = 0;
+
+	if (likely(!HA_ATOMIC_LOAD(&p->node.node.leaf_p)))
+		goto leave;
+
+	/* for a server, we need at least one conn left on this server to
+	 * find ours.
+	 */
+	if (likely(sv && HA_ATOMIC_LOAD(&sv->served)))
+		goto leave;
+
+	/* for a backend, we need at least one conn left on any of this
+	 * backend's servers to find ours.
+	 */
+	if (likely(!sv && HA_ATOMIC_LOAD(&px->served)))
+		goto leave;
+
+	/* OK the situation is not safe anymore, we need to check if we're
+	 * still in the queue under a lock.
+	 */
+	HA_SPIN_LOCK(QUEUE_LOCK, &q->lock);
+	HA_SPIN_LOCK(QUEUE_LOCK, &p->del_lock);
+
+	if (p->node.node.leaf_p) {
+		eb32_delete(&p->node);
+		_HA_ATOMIC_DEC(&q->length);
+		_HA_ATOMIC_INC(&q->idx);
+		_HA_ATOMIC_DEC(&px->totpend);
+		ret = 1;
+	}
+
+	HA_SPIN_UNLOCK(QUEUE_LOCK, &p->del_lock);
+	HA_SPIN_UNLOCK(QUEUE_LOCK, &q->lock);
+
+	/* check if the connection was still queued. If not, it means its
+	 * processing has begun so it's safe.
+	 */
+	if (!ret)
+		goto leave;
+
+	/* The pendconn is not queued anymore and will not be so we're safe
+	 * to free it.
+	 */
+	p->strm->pend_pos = NULL;
+	pool_free(pool_head_pendconn, p);
+
+leave:
+	return ret;
 }
 
 static enum act_return action_set_priority_class(struct act_rule *rule, struct proxy *px,

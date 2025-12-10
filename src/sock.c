@@ -30,6 +30,7 @@
 #include <haproxy/listener.h>
 #include <haproxy/log.h>
 #include <haproxy/namespace.h>
+#include <haproxy/protocol-t.h>
 #include <haproxy/proto_sockpair.h>
 #include <haproxy/sock.h>
 #include <haproxy/sock_inet.h>
@@ -108,6 +109,9 @@ struct connection *sock_accept_conn(struct listener *l, int *status)
 				 p->id);
 			goto fail_conn;
 		}
+
+		if (unlikely(port_is_restricted(addr, HA_PROTO_TCP)))
+			goto fail_conn;
 
 		/* Perfect, the connection was accepted */
 		conn = conn_new(&l->obj_type);
@@ -234,6 +238,7 @@ void sock_unbind(struct receiver *rx)
 {
 	/* There are a number of situations where we prefer to keep the FD and
 	 * not to close it (unless we're stopping, of course):
+	 *   - worker process unbinding from a worker's non-suspendable FD (ABNS) => close
 	 *   - worker process unbinding from a worker's FD with socket transfer enabled => keep
 	 *   - master process unbinding from a master's inherited FD => keep
 	 *   - master process unbinding from a master's FD => close
@@ -247,6 +252,7 @@ void sock_unbind(struct receiver *rx)
 
 	if (!stopping && !master &&
 	    !(rx->flags & RX_F_MWORKER) &&
+	    !(rx->flags & RX_F_NON_SUSPENDABLE) &&
 	    (global.tune.options & GTUNE_SOCKET_TRANSFER))
 		return;
 
@@ -762,6 +768,30 @@ int sock_conn_check(struct connection *conn)
 			goto done;
 		if (!(fdtab[fd].state & (FD_POLL_ERR|FD_POLL_HUP)))
 			goto wait;
+
+		/* Removing HUP if there is no ERR reported.
+		 *
+		 * After a first connect() returning EINPROGRESS, it seems
+		 * possible to have EPOLLHUP or EPOLLRDHUP reported by
+		 * epoll_wait() and turned to an error while the following
+		 * connect() will return a success. So the connection is
+		 * validated but the error is saved and reported on the first
+		 * subsequent read.
+		 *
+		 * We have no explanation for now. Why epoll report the
+		 * connection is closed while the connect() it able to validate
+		 * it ? no idea. But, it seems reasonnable in this case, and if
+		 * no error was reported, to remove the the HUP flag. At worst, if
+		 * the connection is really closed, this will be reported later.
+		 *
+		 * Only observed on Ubuntu kernel (5.4/5.15). See:
+		 *   - https://github.com/haproxy/haproxy/issues/1863
+		 *   - https://www.spinics.net/lists/netdev/msg876470.html
+		 */
+		if (unlikely((fdtab[fd].state & (FD_POLL_HUP|FD_POLL_ERR)) == FD_POLL_HUP)) {
+			fdtab[fd].state &= ~FD_POLL_HUP;
+		}
+
 		/* error present, fall through common error check path */
 	}
 
@@ -805,6 +835,13 @@ int sock_conn_check(struct connection *conn)
 	return 0;
 
  wait:
+	/* we may arrive here due to connect() misleadingly reporting EALREADY
+	 * in some corner cases while the system disagrees and reports an error
+	 * on the FD.
+	 */
+	if (fdtab[fd].state & FD_POLL_ERR)
+		goto out_error;
+
 	fd_cant_send(fd);
 	fd_want_send(fd);
 	return 0;
@@ -891,6 +928,12 @@ void sock_conn_iocb(int fd)
 	if (unlikely(conn->flags & CO_FL_ERROR)) {
 		if (conn_ctrl_ready(conn))
 			fd_stop_both(fd);
+
+		if (conn->subs) {
+			tasklet_wakeup(conn->subs->tasklet);
+			if (!conn->subs->events)
+				conn->subs = NULL;
+		}
 	}
 }
 

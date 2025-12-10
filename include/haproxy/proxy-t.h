@@ -290,6 +290,7 @@ struct proxy {
 	struct list redirect_rules;             /* content redirecting rules (chained) */
 	struct list switching_rules;            /* content switching rules (chained) */
 	struct list persist_rules;		/* 'force-persist' and 'ignore-persist' rules (chained) */
+	struct list hash_rules;         /* 'hash-on' rules (chained) */
 	struct list sticking_rules;             /* content sticking rules (chained) */
 	struct list storersp_rules;             /* content store response rules (chained) */
 	struct list server_rules;               /* server switching rules (chained) */
@@ -405,6 +406,7 @@ struct proxy {
 	unsigned int li_paused;                 /* total number of listeners paused (LI_PAUSED) */
 	unsigned int li_bound;                  /* total number of listeners ready (LI_LISTEN)  */
 	unsigned int li_ready;                  /* total number of listeners ready (>=LI_READY) */
+	unsigned int li_suspended;		/* total number of listeners suspended (could be paused or unbound) */
 
 	/* warning: these structs are huge, keep them at the bottom */
 	struct sockaddr_storage dispatch_addr;	/* the default address to connect to */
@@ -501,6 +503,13 @@ struct persist_rule {
 	struct list list;			/* list linked to from the proxy */
 	struct acl_cond *cond;			/* acl condition to meet */
 	int type;
+};
+
+struct hash_rule {
+    struct list list;           /* list linked to from the proxy */
+    struct acl_cond *cond;      /* acl condition to meet */
+    struct sample_expr *expr;   /* fetch expr to fetch key */
+    int type;
 };
 
 struct sticking_rule {

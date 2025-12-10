@@ -217,11 +217,11 @@ static int ha_ssl_write(BIO *h, const char *buf, int num)
 	tmpbuf.data = num;
 	tmpbuf.head = 0;
 	ret = ctx->xprt->snd_buf(ctx->conn, ctx->xprt_ctx, &tmpbuf, num, 0);
+	BIO_clear_retry_flags(h);
 	if (ret == 0 && !(ctx->conn->flags & (CO_FL_ERROR | CO_FL_SOCK_WR_SH))) {
 		BIO_set_retry_write(h);
 		ret = -1;
-	} else if (ret == 0)
-		 BIO_clear_retry_flags(h);
+	}
 	return ret;
 }
 
@@ -249,11 +249,11 @@ static int ha_ssl_read(BIO *h, char *buf, int size)
 	tmpbuf.data = 0;
 	tmpbuf.head = 0;
 	ret = ctx->xprt->rcv_buf(ctx->conn, ctx->xprt_ctx, &tmpbuf, size, 0);
+	BIO_clear_retry_flags(h);
 	if (ret == 0 && !(ctx->conn->flags & (CO_FL_ERROR | CO_FL_SOCK_RD_SH))) {
 		BIO_set_retry_read(h);
 		ret = -1;
-	} else if (ret == 0)
-		BIO_clear_retry_flags(h);
+	}
 
 	return ret;
 }
@@ -1354,8 +1354,7 @@ static int tlskeys_finalize_config(void)
 	}
 
 	/* swap root */
-	LIST_INSERT(&tkr, &tlskeys_reference);
-	LIST_DELETE(&tkr);
+	LIST_SPLICE(&tlskeys_reference, &tkr);
 	return ERR_NONE;
 }
 #endif /* SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB */
@@ -1422,7 +1421,7 @@ int ssl_sock_ocsp_stapling_cbk(SSL *ssl, void *arg)
 	if (!ocsp ||
 	    !ocsp->response.area ||
 	    !ocsp->response.data ||
-	    (ocsp->expire < now.tv_sec))
+	    (ocsp->expire < date.tv_sec))
 		return SSL_TLSEXT_ERR_NOACK;
 
 	ssl_buf = OPENSSL_malloc(ocsp->response.data);
@@ -1480,7 +1479,7 @@ static int ssl_sock_load_ocsp(SSL_CTX *ctx, const struct cert_key_and_chain *ckc
 	struct certificate_ocsp *ocsp = NULL, *iocsp;
 	char *warn = NULL;
 	unsigned char *p;
-	void (*callback) (void);
+	void (*callback) (void) = NULL;
 
 
 	x = ckch->cert;
@@ -1779,7 +1778,8 @@ int ssl_sock_bind_verifycbk(int ok, X509_STORE_CTX *x_store)
 			ctx->xprt_st |= SSL_SOCK_CAEDEPTH_TO_ST(depth);
 		}
 
-		if (err < 64 && bind_conf->ca_ignerr & (1ULL << err))
+		if (err <= SSL_MAX_VFY_ERROR_CODE &&
+		    cert_ignerr_bitfield_get(__objt_listener(conn->target)->bind_conf->ca_ignerr_bitfield, err))
 			goto err_ignored;
 
 		/* TODO: for QUIC connection, this error code is lost */
@@ -1792,7 +1792,8 @@ int ssl_sock_bind_verifycbk(int ok, X509_STORE_CTX *x_store)
 		ctx->xprt_st |= SSL_SOCK_CRTERROR_TO_ST(err);
 
 	/* check if certificate error needs to be ignored */
-	if (err < 64 && bind_conf->crt_ignerr & (1ULL << err))
+	if (err <= SSL_MAX_VFY_ERROR_CODE &&
+	    cert_ignerr_bitfield_get(__objt_listener(conn->target)->bind_conf->crt_ignerr_bitfield, err))
 		goto err_ignored;
 
 	/* TODO: for QUIC connection, this error code is lost */
@@ -2677,9 +2678,10 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 		}
 
 		if (!quic_transport_params_store(qc, 0, extension_data,
-		                                 extension_data + extension_len) ||
-		    !qc_conn_finalize(qc, 0))
+		                                 extension_data + extension_len))
 			goto abort;
+
+		qc->flags |= QUIC_FL_CONN_TX_TP_RECEIVED;
 	}
 #endif /* USE_QUIC */
 
@@ -2743,6 +2745,7 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 	if (SSL_client_hello_get0_ext(ssl, TLSEXT_TYPE_signature_algorithms, &extension_data, &extension_len)) {
 #endif
 		uint8_t sign;
+		uint8_t hash;
 		size_t len;
 		if (extension_len < 2)
 			goto abort;
@@ -2753,7 +2756,7 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 		if (len % 2 != 0)
 			goto abort;
 		for (; len > 0; len -= 2) {
-			extension_data++; /* hash */
+			hash = *extension_data++; /* hash */
 			sign = *extension_data++;
 			switch (sign) {
 			case TLSEXT_signature_rsa:
@@ -2761,6 +2764,18 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 				break;
 			case TLSEXT_signature_ecdsa:
 				has_ecdsa_sig = 1;
+				break;
+			case 0x04:
+			case 0x05:
+			case 0x06:
+			case 0x09:
+			case 0x0a:
+			case 0x0b:
+				/* match the RSA-PSS sigalgs from TLSv1.3
+				 * https://datatracker.ietf.org/doc/html/rfc8446#section-4.2.3
+				 */
+				if (hash == 0x08)
+					has_rsa_sig = 1;
 				break;
 			default:
 				continue;
@@ -2774,9 +2789,14 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 	}
 	if (has_ecdsa_sig) {  /* in very rare case: has ecdsa sign but not a ECDSA cipher */
 		const SSL_CIPHER *cipher;
+		STACK_OF(SSL_CIPHER) *ha_ciphers; /* haproxy side ciphers */
+		uint32_t cipher_id;
 		size_t len;
 		const uint8_t *cipher_suites;
+
+		ha_ciphers = SSL_get_ciphers(ssl);
 		has_ecdsa_sig = 0;
+
 #ifdef OPENSSL_IS_BORINGSSL
 		len = ctx->cipher_suites_len;
 		cipher_suites = ctx->cipher_suites;
@@ -2792,7 +2812,20 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 #else
 			cipher = SSL_CIPHER_find(ssl, cipher_suites);
 #endif
-			if (cipher && SSL_CIPHER_get_auth_nid(cipher) == NID_auth_ecdsa) {
+			if (!cipher)
+				continue;
+
+			/* check if this cipher is available in haproxy configuration */
+			if (sk_SSL_CIPHER_find(ha_ciphers, cipher) == -1)
+				continue;
+
+			cipher_id = SSL_CIPHER_get_id(cipher);
+			/* skip the SCSV "fake" signaling ciphersuites because they are NID_auth_any (RFC 7507) */
+			if (cipher_id == SSL3_CK_SCSV || cipher_id == SSL3_CK_FALLBACK_SCSV)
+				continue;
+
+			if (SSL_CIPHER_get_auth_nid(cipher) == NID_auth_ecdsa
+			    || SSL_CIPHER_get_auth_nid(cipher) == NID_auth_any) {
 				has_ecdsa_sig = 1;
 				break;
 			}
@@ -2973,10 +3006,10 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *priv)
 		}
 
 		if (!quic_transport_params_store(qc, 0, extension_data,
-		                                 extension_data + extension_len) ||
-		    !qc_conn_finalize(qc, 0)) {
+		                                 extension_data + extension_len))
 			return SSL_TLSEXT_ERR_NOACK;
-		}
+
+		qc->flags |= QUIC_FL_CONN_TX_TP_RECEIVED;
 	}
 #endif /* USE_QUIC */
 
@@ -3629,6 +3662,8 @@ end:
  *     ERR_FATAL in any fatal error case
  *     ERR_ALERT if the reason of the error is available in err
  *     ERR_WARN if a warning is available into err
+ * The caller is responsible of freeing the newly built or newly refcounted
+ * find_chain element.
  * The value 0 means there is no error nor warning and
  * the operation succeed.
  */
@@ -3636,6 +3671,9 @@ static int ssl_sock_load_cert_chain(const char *path, const struct cert_key_and_
 				    SSL_CTX *ctx, STACK_OF(X509) **find_chain, char **err)
 {
 	int errcode = 0;
+	int ret;
+
+	ERR_clear_error();
 
 	if (find_chain == NULL) {
 		errcode |= ERR_FATAL;
@@ -3643,20 +3681,21 @@ static int ssl_sock_load_cert_chain(const char *path, const struct cert_key_and_
 	}
 
 	if (!SSL_CTX_use_certificate(ctx, ckch->cert)) {
-		memprintf(err, "%sunable to load SSL certificate into SSL Context '%s'.\n",
-				err && *err ? *err : "", path);
+		ret = ERR_get_error();
+		memprintf(err, "%sunable to load SSL certificate into SSL Context '%s': %s.\n",
+				err && *err ? *err : "", path, ERR_reason_error_string(ret));
 		errcode |= ERR_ALERT | ERR_FATAL;
 		goto end;
 	}
 
 	if (ckch->chain) {
-		*find_chain = ckch->chain;
+		*find_chain = X509_chain_up_ref(ckch->chain);
 	} else {
 		/* Find Certificate Chain in global */
 		struct issuer_chain *issuer;
 		issuer = ssl_get0_issuer_chain(ckch->cert);
 		if (issuer)
-			*find_chain = issuer->chain;
+			*find_chain = X509_chain_up_ref(issuer->chain);
 	}
 
 	if (!*find_chain) {
@@ -3668,22 +3707,20 @@ static int ssl_sock_load_cert_chain(const char *path, const struct cert_key_and_
 	/* Load all certs in the ckch into the ctx_chain for the ssl_ctx */
 #ifdef SSL_CTX_set1_chain
 	if (!SSL_CTX_set1_chain(ctx, *find_chain)) {
-		memprintf(err, "%sunable to load chain certificate into SSL Context '%s'. Make sure you are linking against Openssl >= 1.0.2.\n",
-			  err && *err ? *err : "", path);
+		ret = ERR_get_error();
+		memprintf(err, "%sunable to load chain certificate into SSL Context '%s': %s. Make sure you are linking against Openssl >= 1.0.2.\n",
+			  err && *err ? *err : "", path,  ERR_reason_error_string(ret));
 		errcode |= ERR_ALERT | ERR_FATAL;
 		goto end;
 	}
 #else
 	{ /* legacy compat (< openssl 1.0.2) */
 		X509 *ca;
-		STACK_OF(X509) *chain;
-		chain = X509_chain_up_ref(*find_chain);
-		while ((ca = sk_X509_shift(chain)))
+		while ((ca = sk_X509_shift(*find_chain)))
 			if (!SSL_CTX_add_extra_chain_cert(ctx, ca)) {
 				memprintf(err, "%sunable to load chain certificate into SSL Context '%s'.\n",
 					  err && *err ? *err : "", path);
 				X509_free(ca);
-				sk_X509_pop_free(chain, X509_free);
 				errcode |= ERR_ALERT | ERR_FATAL;
 				goto end;
 			}
@@ -3771,6 +3808,7 @@ static int ssl_sock_put_ckch_into_ctx(const char *path, const struct cert_key_an
 #endif
 
  end:
+	sk_X509_pop_free(find_chain, X509_free);
 	return errcode;
 }
 
@@ -3808,6 +3846,7 @@ static int ssl_sock_put_srv_ckch_into_ctx(const char *path, const struct cert_ke
 	}
 
 end:
+	sk_X509_pop_free(find_chain, X509_free);
 	return errcode;
 }
 
@@ -4506,6 +4545,7 @@ static int sh_ssl_sess_store(unsigned char *s_id, unsigned char *data, int data_
 	if (oldsh_ssl_sess != sh_ssl_sess) {
 		 /* NOTE: Row couldn't be in use because we lock read & write function */
 		/* release the reserved row */
+		first->len = 0; /* the len must be liberated in order not to call the release callback on it */
 		shctx_row_dec_hot(ssl_shctx, first);
 		/* replace the previous session already in the tree */
 		sh_ssl_sess = oldsh_ssl_sess;
@@ -4549,6 +4589,8 @@ static int ssl_sess_new_srv_cb(SSL *ssl, SSL_SESSION *sess)
 			ptr = s->ssl_ctx.reused_sess[tid].ptr;
 		} else {
 			ptr = realloc(s->ssl_ctx.reused_sess[tid].ptr, len);
+			if (!ptr)
+				free(s->ssl_ctx.reused_sess[tid].ptr);
 			s->ssl_ctx.reused_sess[tid].ptr = ptr;
 			s->ssl_ctx.reused_sess[tid].allocated_size = len;
 		}
@@ -5209,8 +5251,10 @@ int ssl_sock_prepare_srv_ctx(struct server *srv)
 {
 	int cfgerr = 0;
 	SSL_CTX *ctx;
-	/* Automatic memory computations need to know we use SSL there */
-	global.ssl_used_backend = 1;
+	/* Automatic memory computations need to know we use SSL there
+	 * If this is an internal proxy, don't use it for the computation */
+	if (!(srv->proxy && srv->proxy->cap & PR_CAP_INT))
+		global.ssl_used_backend = 1;
 
 	/* Initiate SSL context for current server */
 	if (!srv->ssl_ctx.reused_sess) {
@@ -5576,8 +5620,10 @@ int ssl_sock_prepare_bind_conf(struct bind_conf *bind_conf)
 	/* initialize all certificate contexts */
 	err += ssl_sock_prepare_all_ctx(bind_conf);
 
+#ifndef SSL_NO_GENERATE_CERTIFICATES
 	/* initialize CA variables if the certificates generation is enabled */
 	err += ssl_sock_load_ca(bind_conf);
+#endif
 
 	return -err;
 }
@@ -5673,7 +5719,9 @@ REGISTER_POST_DEINIT(ssl_sock_deinit);
 /* Destroys all the contexts for a bind_conf. This is used during deinit(). */
 void ssl_sock_destroy_bind_conf(struct bind_conf *bind_conf)
 {
+#ifndef SSL_NO_GENERATE_CERTIFICATES
 	ssl_sock_free_ca(bind_conf);
+#endif
 	ssl_sock_free_all_ctx(bind_conf);
 	ssl_sock_free_ssl_conf(&bind_conf->ssl_conf);
 	free(bind_conf->ca_sign_file);
@@ -5841,6 +5889,27 @@ static int ssl_sock_start(struct connection *conn, void *xprt_ctx)
 	return 0;
 }
 
+/* Similar to increment_actconn() but for SSL connections. */
+int increment_sslconn()
+{
+	unsigned int count, next_sslconn;
+
+	do {
+		count = global.sslconns;
+		if (global.maxsslconn && count >= global.maxsslconn) {
+			/* maxconn reached */
+			next_sslconn = 0;
+			goto end;
+		}
+
+		/* try to increment sslconns */
+		next_sslconn = count + 1;
+	} while (!_HA_ATOMIC_CAS(&global.sslconns, &count, next_sslconn) && __ha_cpu_relax());
+
+ end:
+	return next_sslconn;
+}
+
 /*
  * This function is called if SSL * context is not yet allocated. The function
  * is designed to be called before any other data-layer operation and sets the
@@ -5850,6 +5919,8 @@ static int ssl_sock_start(struct connection *conn, void *xprt_ctx)
 static int ssl_sock_init(struct connection *conn, void **xprt_ctx)
 {
 	struct ssl_sock_ctx *ctx;
+	int next_sslconn = 0;
+
 	/* already initialized */
 	if (*xprt_ctx)
 		return 0;
@@ -5877,6 +5948,12 @@ static int ssl_sock_init(struct connection *conn, void **xprt_ctx)
 	ctx->xprt_ctx = NULL;
 	ctx->error_code = 0;
 
+	next_sslconn = increment_sslconn();
+	if (!next_sslconn) {
+		conn->err_code = CO_ER_SSL_TOO_MANY;
+		goto err;
+	}
+
 	/* Only work with sockets for now, this should be adapted when we'll
 	 * add QUIC support.
 	 */
@@ -5884,11 +5961,6 @@ static int ssl_sock_init(struct connection *conn, void **xprt_ctx)
 	if (ctx->xprt->init) {
 		if (ctx->xprt->init(conn, &ctx->xprt_ctx) != 0)
 			goto err;
-	}
-
-	if (global.maxsslconn && global.sslconns >= global.maxsslconn) {
-		conn->err_code = CO_ER_SSL_TOO_MANY;
-		goto err;
 	}
 
 	/* If it is in client mode initiate SSL session
@@ -5915,7 +5987,6 @@ static int ssl_sock_init(struct connection *conn, void **xprt_ctx)
 		/* leave init state and start handshake */
 		conn->flags |= CO_FL_SSL_WAIT_HS | CO_FL_WAIT_L6_CONN;
 
-		_HA_ATOMIC_INC(&global.sslconns);
 		_HA_ATOMIC_INC(&global.totalsslconns);
 		*xprt_ctx = ctx;
 		return 0;
@@ -5948,7 +6019,6 @@ static int ssl_sock_init(struct connection *conn, void **xprt_ctx)
 			conn->flags |= CO_FL_EARLY_SSL_HS;
 #endif
 
-		_HA_ATOMIC_INC(&global.sslconns);
 		_HA_ATOMIC_INC(&global.totalsslconns);
 		*xprt_ctx = ctx;
 		return 0;
@@ -5956,6 +6026,8 @@ static int ssl_sock_init(struct connection *conn, void **xprt_ctx)
 	/* don't know how to handle such a target */
 	conn->err_code = CO_ER_SSL_NO_TARGET;
 err:
+	if (next_sslconn)
+		_HA_ATOMIC_DEC(&global.sslconns);
 	if (ctx && ctx->wait_event.tasklet)
 		tasklet_free(ctx->wait_event.tasklet);
 	pool_free(ssl_sock_ctx_pool, ctx);
@@ -6418,7 +6490,7 @@ static void ssl_set_used(struct connection *conn, void *xprt_ctx)
 	if (!ctx || !ctx->wait_event.tasklet)
 		return;
 
-	HA_ATOMIC_OR(&ctx->wait_event.tasklet->state, TASK_F_USR1);
+	HA_ATOMIC_AND(&ctx->wait_event.tasklet->state, ~TASK_F_USR1);
 	if (ctx->xprt)
 		xprt_set_used(conn, ctx->xprt, ctx->xprt_ctx);
 }
@@ -6474,7 +6546,7 @@ struct task *ssl_sock_io_cb(struct task *t, void *context, unsigned int state)
 			return NULL;
 		}
 		conn = ctx->conn;
-		conn_in_list = conn->flags & CO_FL_LIST_MASK;
+		conn_in_list = conn_get_idle_flag(conn);
 		if (conn_in_list)
 			conn_delete_from_tree(&conn->hash_node->node);
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
@@ -6639,7 +6711,7 @@ static size_t ssl_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 				struct ssl_sock_ctx *ctx = conn_get_ssl_sock_ctx(conn);
 				if (ctx && !ctx->error_code)
 					ctx->error_code = ERR_peek_error();
-				conn->err_code = CO_ERR_SSL_FATAL;
+				conn->err_code = CO_ER_SSL_FATAL;
 			}
 			/* For SSL_ERROR_SYSCALL, make sure to clear the error
 			 * stack before shutting down the connection for
@@ -6810,7 +6882,7 @@ static size_t ssl_sock_from_buf(struct connection *conn, void *xprt_ctx, const s
 
 				if (ctx && !ctx->error_code)
 					ctx->error_code = ERR_peek_error();
-				conn->err_code = CO_ERR_SSL_FATAL;
+				conn->err_code = CO_ER_SSL_FATAL;
 			}
 			goto out_error;
 		}
@@ -7275,7 +7347,7 @@ static int ssl_sock_show_fd(struct buffer *buf, const struct connection *conn, c
 		chunk_appendf(&trash, " xctx.conn=%p(BOGUS)", sctx->conn);
 		ret = 1;
 	}
-	chunk_appendf(&trash, " xctx.st=%d", sctx->xprt_st);
+	chunk_appendf(&trash, " xctx.st=%d .err=%ld", sctx->xprt_st, sctx->error_code);
 
 	if (sctx->xprt) {
 		chunk_appendf(&trash, " .xprt=%s", sctx->xprt->name);
@@ -8091,6 +8163,8 @@ static void __ssl_sock_init(void)
 	xprt_register(XPRT_SSL, &ssl_sock);
 #if HA_OPENSSL_VERSION_NUMBER < 0x10100000L
 	SSL_library_init();
+#elif HA_OPENSSL_VERSION_NUMBER >= 0x10100000L
+	OPENSSL_init_ssl(0, NULL);
 #endif
 #if (!defined(OPENSSL_NO_COMP) && !defined(SSL_OP_NO_COMPRESSION))
 	cm = SSL_COMP_get_compression_methods();

@@ -62,6 +62,7 @@ struct stream;
 #define HLUA_WAKEREQWR 0x00000008
 #define HLUA_EXIT      0x00000010
 #define HLUA_NOYIELD   0x00000020
+#define HLUA_BUSY      0x00000040
 
 #define HLUA_F_AS_STRING    0x01
 #define HLUA_F_MAY_USE_HTTP 0x02
@@ -111,7 +112,7 @@ struct hlua {
 	struct task *task; /* The task associated with the lua stack execution.
 	                      We must wake this task to continue the task execution */
 	struct list com; /* The list head of the signals attached to this task. */
-	struct list hc_list;  /* list of httpclient associated to this lua task */
+	struct mt_list hc_list;  /* list of httpclient associated to this lua task */
 	struct ebpt_node node;
 	int gc_count;  /* number of items which need a GC */
 };
@@ -199,7 +200,7 @@ struct hlua_httpclient {
 	struct httpclient *hc; /* ptr to the httpclient instance */
 	size_t sent; /* payload sent */
 	luaL_Buffer b; /* buffer used to prepare strings. */
-	struct list by_hlua; /* linked in the current hlua task */
+	struct mt_list by_hlua; /* linked in the current hlua task */
 };
 
 #else /* USE_LUA */

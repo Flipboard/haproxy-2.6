@@ -31,6 +31,7 @@
 #include <haproxy/global.h>
 #include <haproxy/http_ana.h>
 #include <haproxy/http_htx.h>
+#include <haproxy/http_rules.h>
 #include <haproxy/listener.h>
 #include <haproxy/log.h>
 #include <haproxy/obj_type-t.h>
@@ -127,6 +128,18 @@ const struct cfg_opt cfg_opts2[] =
 	{"disable-h2-upgrade",            PR_O2_NO_H2_UPGRADE, PR_CAP_FE, 0, PR_MODE_HTTP },
 	{ NULL, 0, 0, 0 }
 };
+
+static void free_hash_rules(struct list *rules)
+{
+  struct hash_rule *rule, *ruleb;
+
+  list_for_each_entry_safe(rule, ruleb, rules, list) {
+    LIST_DELETE(&rule->list);
+    free_acl_cond(rule->cond);
+    release_sample_expr(rule->expr);
+    free(rule);
+  }
+}
 
 static void free_stick_rules(struct list *rules)
 {
@@ -230,22 +243,21 @@ void free_proxy(struct proxy *p)
 			prune_acl_cond(rule->cond);
 			free(rule->cond);
 		}
+		if (rule->dynamic) {
+			list_for_each_entry_safe(lf, lfb, &rule->be.expr, list) {
+				LIST_DELETE(&lf->list);
+				release_sample_expr(lf->expr);
+				free(lf->arg);
+				free(lf);
+			}
+		}
 		free(rule->file);
 		free(rule);
 	}
 
 	list_for_each_entry_safe(rdr, rdrb, &p->redirect_rules, list) {
 		LIST_DELETE(&rdr->list);
-		if (rdr->cond) {
-			prune_acl_cond(rdr->cond);
-			free(rdr->cond);
-		}
-		free(rdr->rdr_str);
-		list_for_each_entry_safe(lf, lfb, &rdr->rdr_fmt, list) {
-			LIST_DELETE(&lf->list);
-			free(lf);
-		}
-		free(rdr);
+		http_free_redirect_rule(rdr);
 	}
 
 	list_for_each_entry_safe(log, logb, &p->logsrvs, list) {
@@ -291,6 +303,7 @@ void free_proxy(struct proxy *p)
 
 	free_stick_rules(&p->storersp_rules);
 	free_stick_rules(&p->sticking_rules);
+	free_hash_rules(&p->hash_rules);
 
 	h = p->req_cap;
 	while (h) {
@@ -338,6 +351,7 @@ void free_proxy(struct proxy *p)
 			bind_conf->xprt->destroy_bind_conf(bind_conf);
 		free(bind_conf->file);
 		free(bind_conf->arg);
+		free(bind_conf->settings.interface);
 		LIST_DELETE(&bind_conf->by_fe);
 		free(bind_conf);
 	}
@@ -349,13 +363,15 @@ void free_proxy(struct proxy *p)
 
 	free(p->desc);
 	istfree(&p->fwdfor_hdr_name);
+	istfree(&p->orgto_hdr_name);
 
 	task_destroy(p->task);
 
 	pool_destroy(p->req_cap_pool);
 	pool_destroy(p->rsp_cap_pool);
-	if (p->table)
-		pool_destroy(p->table->pool);
+
+	stktable_deinit(p->table);
+	ha_free(&p->table);
 
 	HA_RWLOCK_DESTROY(&p->lbprm.lock);
 	HA_RWLOCK_DESTROY(&p->lock);
@@ -1345,6 +1361,7 @@ void init_new_proxy(struct proxy *p)
 	LIST_INIT(&p->switching_rules);
 	LIST_INIT(&p->server_rules);
 	LIST_INIT(&p->persist_rules);
+	LIST_INIT(&p->hash_rules);
 	LIST_INIT(&p->sticking_rules);
 	LIST_INIT(&p->storersp_rules);
 	LIST_INIT(&p->tcp_req.inspect_rules);
@@ -1383,6 +1400,9 @@ void init_new_proxy(struct proxy *p)
 	p->extra_counters_be = NULL;
 
 	HA_RWLOCK_INIT(&p->lock);
+
+	/* initialize the default settings */
+	proxy_preset_defaults(p);
 }
 
 /* Preset default settings onto proxy <defproxy>. */
@@ -1400,34 +1420,10 @@ void proxy_preset_defaults(struct proxy *defproxy)
 		defproxy->options2 |= PR_O2_INDEPSTR;
 	defproxy->max_out_conns = MAX_SRV_LIST;
 
-	defproxy->defsrv.check.inter = DEF_CHKINTR;
-	defproxy->defsrv.check.fastinter = 0;
-	defproxy->defsrv.check.downinter = 0;
-	defproxy->defsrv.agent.inter = DEF_CHKINTR;
-	defproxy->defsrv.agent.fastinter = 0;
-	defproxy->defsrv.agent.downinter = 0;
-	defproxy->defsrv.check.rise = DEF_RISETIME;
-	defproxy->defsrv.check.fall = DEF_FALLTIME;
-	defproxy->defsrv.agent.rise = DEF_AGENT_RISETIME;
-	defproxy->defsrv.agent.fall = DEF_AGENT_FALLTIME;
-	defproxy->defsrv.check.port = 0;
-	defproxy->defsrv.agent.port = 0;
-	defproxy->defsrv.maxqueue = 0;
-	defproxy->defsrv.minconn = 0;
-	defproxy->defsrv.maxconn = 0;
-	defproxy->defsrv.max_reuse = -1;
-	defproxy->defsrv.max_idle_conns = -1;
-	defproxy->defsrv.pool_purge_delay = 5000;
-	defproxy->defsrv.slowstart = 0;
-	defproxy->defsrv.onerror = DEF_HANA_ONERR;
-	defproxy->defsrv.consecutive_errors_limit = DEF_HANA_ERRLIMIT;
-	defproxy->defsrv.uweight = defproxy->defsrv.iweight = 1;
+	srv_settings_init(&defproxy->defsrv);
 
 	defproxy->email_alert.level = LOG_ALERT;
 	defproxy->load_server_state_from_file = PR_SRV_STATE_FILE_UNSPEC;
-#if defined(USE_QUIC)
-	quic_transport_params_init(&defproxy->defsrv.quic_params, 0);
-#endif
 
 	if (defproxy->cap & PR_CAP_INT)
 		defproxy->timeout.connect = 5000;
@@ -1447,6 +1443,7 @@ void proxy_free_defaults(struct proxy *defproxy)
 
 	ha_free(&defproxy->id);
 	ha_free(&defproxy->conf.file);
+	ha_free((char **)&defproxy->defsrv.conf.file);
 	ha_free(&defproxy->check_command);
 	ha_free(&defproxy->check_path);
 	ha_free(&defproxy->cookie_name);
@@ -1812,19 +1809,13 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 
 	/* copy default logsrvs to curproxy */
 	list_for_each_entry(tmplogsrv, &defproxy->logsrvs, list) {
-		struct logsrv *node = malloc(sizeof(*node));
+		struct logsrv *node = dup_logsrv(tmplogsrv);
 
 		if (!node) {
 			memprintf(errmsg, "proxy '%s': out of memory", curproxy->id);
 			return 1;
 		}
-		memcpy(node, tmplogsrv, sizeof(struct logsrv));
-		node->ref = tmplogsrv->ref;
-		LIST_INIT(&node->list);
 		LIST_APPEND(&curproxy->logsrvs, &node->list);
-		node->ring_name = tmplogsrv->ring_name ? strdup(tmplogsrv->ring_name) : NULL;
-		node->conf.file = strdup(tmplogsrv->conf.file);
-		node->conf.line = tmplogsrv->conf.line;
 	}
 
 	curproxy->conf.uniqueid_format_string = defproxy->conf.uniqueid_format_string;
@@ -1905,9 +1896,6 @@ struct proxy *parse_new_proxy(const char *name, unsigned int cap,
 			return NULL;
 		}
 	}
-	else {
-		proxy_preset_defaults(curproxy);
-	}
 
 	curproxy->conf.args.file = curproxy->conf.file = strdup(file);
 	curproxy->conf.args.line = curproxy->conf.line = linenum;
@@ -1958,11 +1946,11 @@ void proxy_cond_disable(struct proxy *p)
 	 */
 	if (p->mode == PR_MODE_TCP || p->mode == PR_MODE_HTTP || p->mode == PR_MODE_SYSLOG)
 		ha_warning("Proxy %s stopped (cumulated conns: FE: %lld, BE: %lld).\n",
-			   p->id, p->fe_counters.cum_conn, p->be_counters.cum_conn);
+			   p->id, p->fe_counters.cum_conn, p->be_counters.cum_sess);
 
 	if (p->mode == PR_MODE_TCP || p->mode == PR_MODE_HTTP)
 		send_log(p, LOG_WARNING, "Proxy %s stopped (cumulated conns: FE: %lld, BE: %lld).\n",
-			 p->id, p->fe_counters.cum_conn, p->be_counters.cum_conn);
+			 p->id, p->fe_counters.cum_conn, p->be_counters.cum_sess);
 
 	if (p->table && p->table->size && p->table->sync_task)
 		task_wakeup(p->table->sync_task, TASK_WOKEN_MSG);
@@ -2016,11 +2004,40 @@ struct task *manage_proxy(struct task *t, void *context, unsigned int state)
 			 * to push to a new process and
 			 * we are free to flush the table.
 			 */
-			stktable_trash_oldest(p->table, p->table->current);
-			pool_gc(NULL);
+			int budget;
+			int cleaned_up;
+
+			/* We purposely enforce a budget limitation since we don't want
+			 * to spend too much time purging old entries
+			 *
+			 * This is known to cause the watchdog to occasionnaly trigger if
+			 * the table is huge and all entries become available for purge
+			 * at the same time
+			 *
+			 * Moreover, we must also anticipate the pool_gc() call which
+			 * will also be much slower if there is too much work at once
+			 */
+			budget = MIN(p->table->current, (1 << 15)); /* max: 32K */
+			cleaned_up = stktable_trash_oldest(p->table, budget);
+			if (cleaned_up) {
+				/* immediately release freed memory since we are stopping */
+				pool_gc(NULL);
+				if (cleaned_up > (budget / 2)) {
+					/* most of the budget was used to purge entries,
+					 * it is very likely that there are still trashable
+					 * entries in the table, reschedule a new cleanup
+					 * attempt ASAP
+					 */
+					t->expire = TICK_ETERNITY;
+					task_wakeup(t, TASK_WOKEN_RES);
+					return t;
+				}
+			}
 		}
 		if (p->table->current) {
-			/* some entries still remain, let's recheck in one second */
+			/* some entries still remain but are not yet available
+			 * for cleanup, let's recheck in one second
+			 */
 			next = tick_first(next, tick_add(now_ms, 1000));
 		}
 	}
@@ -2045,7 +2062,7 @@ struct task *manage_proxy(struct task *t, void *context, unsigned int state)
 	}
 
 	/* The proxy is not limited so we can re-enable any waiting listener */
-	dequeue_proxy_listeners(p);
+	dequeue_proxy_listeners(p, 0);
  out:
 	t->expire = next;
 	task_queue(t);
@@ -2197,6 +2214,7 @@ struct task *hard_stop(struct task *t, void *context, unsigned int state)
 /* perform the soft-stop right now (i.e. unbind listeners) */
 static void do_soft_stop_now()
 {
+	struct proxy *p;
 	struct task *task;
 
 	/* disable busy polling to avoid cpu eating for the new process */
@@ -2220,6 +2238,15 @@ static void do_soft_stop_now()
 
 	/* stop all stoppable listeners */
 	protocol_stop_now();
+
+	/* Loop on proxies to stop backends */
+	p = proxies_list;
+	while (p) {
+		HA_RWLOCK_WRLOCK(PROXY_LOCK, &p->lock);
+		proxy_cond_disable(p);
+		HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &p->lock);
+		p = p->next;
+	}
 
 	/* signal zero is used to broadcast the "stopping" event */
 	signal_handler(0);
@@ -2280,7 +2307,7 @@ int pause_proxy(struct proxy *p)
 		goto end;
 
 	list_for_each_entry(l, &p->conf.listeners, by_fe)
-		pause_listener(l, 1);
+		suspend_listener(l, 1, 0);
 
 	if (p->li_ready) {
 		ha_warning("%s %s failed to enter pause mode.\n", proxy_cap_str(p->cap), p->id);
@@ -2309,7 +2336,7 @@ void stop_proxy(struct proxy *p)
 	HA_RWLOCK_WRLOCK(PROXY_LOCK, &p->lock);
 
 	list_for_each_entry(l, &p->conf.listeners, by_fe)
-		stop_listener(l, 1, 0);
+		stop_listener(l, 1, 0, 0);
 
 	if (!(p->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) && !p->li_ready) {
 		/* might be just a backend */
@@ -2338,7 +2365,7 @@ int resume_proxy(struct proxy *p)
 
 	fail = 0;
 	list_for_each_entry(l, &p->conf.listeners, by_fe) {
-		if (!resume_listener(l, 1)) {
+		if (!resume_listener(l, 1, 0)) {
 			int port;
 
 			port = get_host_port(&l->rx.addr);
@@ -3027,11 +3054,11 @@ static int cli_parse_set_maxconn_frontend(char **args, char *payload, struct app
 	px->maxconn = v;
 	list_for_each_entry(l, &px->conf.listeners, by_fe) {
 		if (l->state == LI_FULL)
-			resume_listener(l, 1);
+			relax_listener(l, 1, 0);
 	}
 
 	if (px->maxconn > px->feconn)
-		dequeue_proxy_listeners(px);
+		dequeue_proxy_listeners(px, 1);
 
 	HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &px->lock);
 

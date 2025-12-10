@@ -262,7 +262,9 @@ void ha_task_dump(struct buffer *buf, const struct task *task, const char *pfx)
 
 #ifdef USE_LUA
 	hlua = NULL;
-	if (s && (hlua = s->hlua)) {
+	if (s && ((s->hlua[0] && HLUA_IS_BUSY(s->hlua[0])) ||
+	    (s->hlua[1] && HLUA_IS_BUSY(s->hlua[1])))) {
+		hlua = (s->hlua[0] && HLUA_IS_BUSY(s->hlua[0])) ? s->hlua[0] : s->hlua[1];
 		chunk_appendf(buf, "%sCurrent executing Lua from a stream analyser -- ", pfx);
 	}
 	else if (task->process == hlua_process_task && (hlua = task->context)) {
@@ -280,9 +282,10 @@ void ha_task_dump(struct buffer *buf, const struct task *task, const char *pfx)
 	if (hlua && hlua->T) {
 		chunk_appendf(buf, "stack traceback:\n    ");
 		append_prefixed_str(buf, hlua_traceback(hlua->T, "\n    "), pfx, '\n', 0);
-		b_putchr(buf, '\n');
 	}
-	else
+
+	/* we may need to terminate the current line */
+	if (*b_peek(buf, b_data(buf)-1) != '\n')
 		b_putchr(buf, '\n');
 #endif
 }
@@ -941,7 +944,7 @@ static int debug_parse_cli_sched(char **args, char *payload, struct appctx *appc
 			*(uint8_t *)ptr = new;
 	}
 
-	tctx = calloc(sizeof(*tctx), count + 2);
+	tctx = calloc(count + 2, sizeof(*tctx));
 	if (!tctx)
 		goto fail;
 
@@ -1096,7 +1099,27 @@ static int debug_iohandler_fd(struct appctx *appctx)
 				      S_ISLNK(statbuf.st_mode)  ? "link":
 				      S_ISSOCK(statbuf.st_mode) ? "sock":
 #ifdef USE_EPOLL
-				      epoll_wait(fd, NULL, 0, 0) != -1 || errno != EBADF ? "epol":
+				      /* trick: epoll_ctl() will return -ENOENT when trying
+				       * to remove from a valid epoll FD an FD that was not
+				       * registered against it. But we don't want to risk
+				       * disabling a random FD. Instead we'll create a new
+				       * one by duplicating 0 (it should be valid since
+				       * pointing to a terminal or /dev/null), and try to
+				       * remove it.
+				       */
+				      ({
+					      int fd2 = dup(0);
+					      int ret = fd2;
+					      if (ret >= 0) {
+						      ret = epoll_ctl(fd, EPOLL_CTL_DEL, fd2, NULL);
+						      if (ret == -1 && errno == ENOENT)
+							      ret = 0; // that's a real epoll
+						      else
+							      ret = -1; // it's something else
+						      close(fd2);
+					      }
+					      ret;
+				      }) == 0 ? "epol" :
 #endif
 				      "????",
 				      (uint)statbuf.st_mode & 07777,

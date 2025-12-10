@@ -38,12 +38,13 @@
 __decl_thread(extern HA_SPINLOCK_T idle_conn_srv_lock);
 extern struct idle_conns idle_conns[MAX_THREADS];
 extern struct task *idle_conn_task;
-extern struct list servers_list;
+extern struct mt_list servers_list;
 extern struct dict server_key_dict;
 
 int srv_downtime(const struct server *s);
 int srv_lastsession(const struct server *s);
 int srv_getinter(const struct check *check);
+void srv_settings_init(struct server *srv);
 void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl);
 int parse_server(const char *file, int linenum, char **args, struct proxy *curproxy, const struct proxy *defproxy, int parse_flags);
 int srv_update_addr(struct server *s, void *ip, int ip_sin_family, const char *updater);
@@ -170,7 +171,7 @@ void srv_set_dyncookie(struct server *s);
 int srv_check_reuse_ws(struct server *srv);
 const struct mux_ops *srv_get_ws_proto(struct server *srv);
 
-/* increase the number of cumulated connections on the designated server */
+/* increase the number of cumulated streams on the designated server */
 static inline void srv_inc_sess_ctr(struct server *s)
 {
 	_HA_ATOMIC_INC(&s->counters.cum_sess);
@@ -279,6 +280,26 @@ static inline void srv_use_conn(struct server *srv, struct connection *conn)
 	prev = HA_ATOMIC_LOAD(&srv->est_need_conns);
 	if (prev < curr)
 		HA_ATOMIC_STORE(&srv->est_need_conns, curr);
+}
+
+/* checks if minconn and maxconn are consistent to each other
+ * and automatically adjust them if it is not the case
+ * This logic was historically implemented in check_config_validity()
+ * at boot time, but with the introduction of dynamic servers
+ * this may be used at multiple places in the code now
+ */
+static inline void srv_minmax_conn_apply(struct server *srv)
+{
+	if (srv->minconn > srv->maxconn) {
+		/* Only 'minconn' was specified, or it was higher than or equal
+		 * to 'maxconn'. Let's turn this into maxconn and clean it, as
+		 * this will avoid further useless expensive computations.
+		 */
+		srv->maxconn = srv->minconn;
+	} else if (srv->maxconn && !srv->minconn) {
+		/* minconn was not specified, so we set it to maxconn */
+		srv->minconn = srv->maxconn;
+	}
 }
 
 #endif /* _HAPROXY_SERVER_H */

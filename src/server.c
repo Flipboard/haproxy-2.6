@@ -70,7 +70,7 @@ struct srv_kw_list srv_keywords = {
 __decl_thread(HA_SPINLOCK_T idle_conn_srv_lock);
 struct eb_root idle_conn_srv = EB_ROOT;
 struct task *idle_conn_task __read_mostly = NULL;
-struct list servers_list = LIST_HEAD_INIT(servers_list);
+struct mt_list servers_list = MT_LIST_HEAD_INIT(servers_list);
 
 /* The server names dictionary */
 struct dict server_key_dict = {
@@ -478,6 +478,10 @@ static int srv_parse_disabled(char **args, int *cur_arg,
 static int srv_parse_enabled(char **args, int *cur_arg,
                              struct proxy *curproxy, struct server *newsrv, char **err)
 {
+	if (newsrv->flags & SRV_F_DYNAMIC) {
+		return 0;
+	}
+
 	newsrv->next_admin &= ~SRV_ADMF_CMAINT & ~SRV_ADMF_FMAINT;
 	newsrv->next_state = SRV_ST_RUNNING;
 	newsrv->check.state &= ~CHK_ST_PAUSED;
@@ -1393,6 +1397,20 @@ static int srv_parse_weight(char **args, int *cur_arg, struct proxy *px, struct 
 	return 0;
 }
 
+/* Returns 1 if the server has streams pointing to it, and 0 otherwise.
+ *
+ * Must be called with the server lock held.
+ */
+static int srv_has_streams(struct server *srv)
+{
+	int thr;
+
+	for (thr = 0; thr < global.nbthread; thr++)
+		if (!MT_LIST_ISEMPTY(&srv->per_thr[thr].streams))
+			return 1;
+	return 0;
+}
+
 /* Shutdown all connections of a server. The caller must pass a termination
  * code in <why>, which must be one of SF_ERR_* indicating the reason for the
  * shutdown.
@@ -1757,7 +1775,7 @@ void srv_compute_all_admin_states(struct proxy *px)
  */
 static struct srv_kw_list srv_kws = { "ALL", { }, {
 	{ "backup",              srv_parse_backup,              0,  1,  1 }, /* Flag as backup server */
-	{ "cookie",              srv_parse_cookie,              1,  1,  0 }, /* Assign a cookie to the server */
+	{ "cookie",              srv_parse_cookie,              1,  1,  1 }, /* Assign a cookie to the server */
 	{ "disabled",            srv_parse_disabled,            0,  1,  1 }, /* Start the server in 'disabled' state */
 	{ "enabled",             srv_parse_enabled,             0,  1,  1 }, /* Start the server in 'enabled' state */
 	{ "error-limit",         srv_parse_error_limit,         1,  1,  1 }, /* Configure the consecutive count of check failures to consider a server on error */
@@ -1817,15 +1835,17 @@ void server_recalc_eweight(struct server *sv, int must_update)
 	unsigned w;
 
 	if (now.tv_sec < sv->last_change || now.tv_sec >= sv->last_change + sv->slowstart) {
-		/* go to full throttle if the slowstart interval is reached */
-		if (sv->next_state == SRV_ST_STARTING)
+		/* go to full throttle if the slowstart interval is reached unless server is currently down */
+		if ((sv->cur_state != SRV_ST_STOPPED) && (sv->next_state == SRV_ST_STARTING))
 			sv->next_state = SRV_ST_RUNNING;
 	}
 
 	/* We must take care of not pushing the server to full throttle during slow starts.
 	 * It must also start immediately, at least at the minimal step when leaving maintenance.
 	 */
-	if ((sv->next_state == SRV_ST_STARTING) && (px->lbprm.algo & BE_LB_PROP_DYN))
+	if ((sv->cur_state == SRV_ST_STOPPED) && (sv->next_state == SRV_ST_STARTING) && (px->lbprm.algo & BE_LB_PROP_DYN))
+		w = 1;
+	else if ((sv->next_state == SRV_ST_STARTING) && (px->lbprm.algo & BE_LB_PROP_DYN))
 		w = (px->lbprm.wdiv * (now.tv_sec - sv->last_change) + sv->slowstart) / sv->slowstart;
 	else
 		w = px->lbprm.wdiv;
@@ -2038,8 +2058,10 @@ static void srv_conn_src_cpy(struct server *srv, const struct server *src)
 	srv->conn_src.bind_hdr_occ = src->conn_src.bind_hdr_occ;
 	srv->conn_src.tproxy_addr  = src->conn_src.tproxy_addr;
 #endif
-	if (src->conn_src.iface_name != NULL)
+	if (src->conn_src.iface_name != NULL) {
 		srv->conn_src.iface_name = strdup(src->conn_src.iface_name);
+		srv->conn_src.iface_len = src->conn_src.iface_len;
+	}
 }
 
 /*
@@ -2156,6 +2178,43 @@ int srv_prepare_for_resolution(struct server *srv, const char *hostname)
 	ha_free(&srv->hostname);
 	ha_free(&srv->hostname_dn);
 	return -1;
+}
+
+/* Initialize default values for <srv>. Used both for dynamic servers and
+ * default servers. The latter are not initialized via new_server(), hence this
+ * function purpose. For static servers, srv_settings_cpy() is used instead
+ * reusing their default server instance.
+ */
+void srv_settings_init(struct server *srv)
+{
+	srv->check.inter = DEF_CHKINTR;
+	srv->check.fastinter = 0;
+	srv->check.downinter = 0;
+	srv->check.rise = DEF_RISETIME;
+	srv->check.fall = DEF_FALLTIME;
+	srv->check.port = 0;
+
+	srv->agent.inter = DEF_CHKINTR;
+	srv->agent.fastinter = 0;
+	srv->agent.downinter = 0;
+	srv->agent.rise = DEF_AGENT_RISETIME;
+	srv->agent.fall = DEF_AGENT_FALLTIME;
+	srv->agent.port = 0;
+
+	srv->maxqueue = 0;
+	srv->minconn = 0;
+	srv->maxconn = 0;
+
+	srv->max_reuse = -1;
+	srv->max_idle_conns = -1;
+	srv->pool_purge_delay = 5000;
+
+	srv->slowstart = 0;
+
+	srv->onerror = DEF_HANA_ONERR;
+	srv->consecutive_errors_limit = DEF_HANA_ERRLIMIT;
+
+	srv->uweight = srv->iweight = 1;
 }
 
 /*
@@ -2280,6 +2339,7 @@ void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl
 	if (srv_tmpl)
 		srv->srvrq = src->srvrq;
 
+	srv->netns                    = src->netns;
 	srv->check.via_socks4         = src->check.via_socks4;
 	srv->socks4_addr              = src->socks4_addr;
 }
@@ -2300,9 +2360,10 @@ struct server *new_server(struct proxy *proxy)
 	srv->obj_type = OBJ_TYPE_SERVER;
 	srv->proxy = proxy;
 	queue_init(&srv->queue, proxy, srv);
-	LIST_APPEND(&servers_list, &srv->global_list);
+	MT_LIST_APPEND(&servers_list, &srv->global_list);
 	LIST_INIT(&srv->srv_rec_item);
 	LIST_INIT(&srv->ip_rec_item);
+	MT_LIST_INIT(&srv->prev_deleted);
 
 	srv->next_state = SRV_ST_RUNNING; /* early server setup */
 	srv->last_change = now.tv_sec;
@@ -2318,9 +2379,8 @@ struct server *new_server(struct proxy *proxy)
 	srv->agent.server = srv;
 	srv->agent.proxy = proxy;
 	srv->xprt  = srv->check.xprt = srv->agent.xprt = xprt_get(XPRT_RAW);
-#if defined(USE_QUIC)
-	srv->cids = EB_ROOT_UNIQUE;
-#endif
+
+	MT_LIST_INIT(&srv->sess_conns);
 
 	srv->extra_counters = NULL;
 #ifdef USE_OPENSSL
@@ -2363,11 +2423,19 @@ struct server *srv_drop(struct server *srv)
 			goto end;
 	}
 
+	/* make sure we are removed from our 'next->prev_deleted' list
+	 * This doesn't require full thread isolation as we're using mt lists
+	 * However this could easily be turned into regular list if required
+	 * (with the proper use of thread isolation)
+	 */
+	MT_LIST_DELETE(&srv->prev_deleted);
+
 	task_destroy(srv->warmup);
 	task_destroy(srv->srvrq_check);
 
 	free(srv->id);
 	free(srv->cookie);
+	free(srv->rdr_pfx);
 	free(srv->hostname);
 	free(srv->hostname_dn);
 	free((char*)srv->conf.file);
@@ -2376,6 +2444,7 @@ struct server *srv_drop(struct server *srv)
 	free(srv->resolvers_id);
 	free(srv->addr_node.key);
 	free(srv->lb_nodes);
+	free(srv->tmpl_info.prefix);
 
 	if (srv->use_ssl == 1 || srv->check.use_ssl == 1 || (srv->proxy->options & PR_O_TCPCHK_SSL)) {
 		if (xprt_get(XPRT_SSL) && xprt_get(XPRT_SSL)->destroy_srv)
@@ -2383,7 +2452,7 @@ struct server *srv_drop(struct server *srv)
 	}
 	HA_SPIN_DESTROY(&srv->lock);
 
-	LIST_DELETE(&srv->global_list);
+	MT_LIST_DELETE(&srv->global_list);
 
 	EXTRA_COUNTERS_FREE(srv->extra_counters);
 
@@ -2521,7 +2590,7 @@ static int _srv_parse_tmpl_init(struct server *srv, struct proxy *px)
 		release_sample_expr(newsrv->ssl_ctx.sni);
 		free_check(&newsrv->agent);
 		free_check(&newsrv->check);
-		LIST_DELETE(&newsrv->global_list);
+		MT_LIST_DELETE(&newsrv->global_list);
 	}
 	free(newsrv);
 	return i - srv->tmpl_info.nb_low;
@@ -2695,30 +2764,18 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 			/* Copy default server settings to new server */
 			srv_settings_cpy(newsrv, &curproxy->defsrv, 0);
 		} else {
-			/* Initialize dynamic server weight to 1 */
-			newsrv->uweight = newsrv->iweight = 1;
+			srv_settings_init(newsrv);
 
 			/* A dynamic server is disabled on startup */
 			newsrv->next_admin = SRV_ADMF_FMAINT;
 			newsrv->next_state = SRV_ST_STOPPED;
 			server_recalc_eweight(newsrv, 0);
-
-			/* Set default values for checks */
-			newsrv->check.inter = DEF_CHKINTR;
-			newsrv->check.rise = DEF_RISETIME;
-			newsrv->check.fall = DEF_FALLTIME;
-
-			newsrv->agent.inter = DEF_CHKINTR;
-			newsrv->agent.rise = DEF_AGENT_RISETIME;
-			newsrv->agent.fall = DEF_AGENT_FALLTIME;
 		}
 		HA_SPIN_INIT(&newsrv->lock);
 	}
 	else {
 		*srv = newsrv = &curproxy->defsrv;
 		*cur_arg = 1;
-		newsrv->resolv_opts.family_prio = AF_INET6;
-		newsrv->resolv_opts.accept_duplicate_ip = 0;
 	}
 
 	free(fqdn);
@@ -2888,7 +2945,7 @@ int parse_server(const char *file, int linenum, char **args,
 	if ((parse_flags & (SRV_PARSE_IN_PEER_SECTION|SRV_PARSE_PARSE_ADDR)) ==
 	    (SRV_PARSE_IN_PEER_SECTION|SRV_PARSE_PARSE_ADDR)) {
 		if (!*args[2])
-			return 0;
+			goto out;
 	}
 
 	err_code = _srv_parse_init(&newsrv, args, &cur_arg, curproxy,
@@ -2903,7 +2960,8 @@ int parse_server(const char *file, int linenum, char **args,
 	if (err_code & ERR_CODE)
 		goto out;
 
-	newsrv->conf.file = strdup(file);
+	if (!newsrv->conf.file) // note: do it only once for default-server
+		newsrv->conf.file = strdup(file);
 	newsrv->conf.line = linenum;
 
 	while (*args[cur_arg]) {
@@ -3952,8 +4010,8 @@ static int srv_iterate_initaddr(struct server *srv)
 		case SRV_IADDR_IP:
 			ipcpy(&srv->init_addr, &srv->addr);
 			if (return_code) {
-				ha_warning("could not resolve address '%s', falling back to configured address.\n",
-					   name);
+				ha_notice("could not resolve address '%s', falling back to configured address.\n",
+					  name);
 			}
 			goto out;
 
@@ -4041,8 +4099,8 @@ const char *srv_update_fqdn(struct server *server, const char *fqdn, const char 
 		goto out;
 	}
 
-	/* Flag as FQDN set from stats socket. */
-	server->next_admin |= SRV_ADMF_HMAINT;
+	/* Flag as FQDN changed (e.g.: set from stats socket or resolvers) */
+	server->next_admin |= SRV_ADMF_FQDN_CHANGED;
 
  out:
 	if (updater)
@@ -4587,7 +4645,7 @@ static struct task *server_warmup(struct task *t, void *context, unsigned int st
 	server_recalc_eweight(s, 1);
 
 	/* probably that we can refill this server with a bit more connections */
-	pendconn_grab_from_px(s);
+	process_srv_queue(s);
 
 	HA_SPIN_UNLOCK(SERVER_LOCK, &s->lock);
 
@@ -4727,7 +4785,12 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 	srv->init_addr_methods = SRV_IADDR_NONE;
 
 	if (srv->mux_proto) {
-		if (!conn_get_best_mux_entry(srv->mux_proto->token, PROTO_SIDE_BE, be->mode)) {
+		int proto_mode = conn_pr_mode_to_proto_mode(be->mode);
+		const struct mux_proto_list *mux_ent;
+
+		mux_ent = conn_get_best_mux_entry(srv->mux_proto->token, PROTO_SIDE_BE, proto_mode);
+
+		if (!mux_ent || !isteq(mux_ent->token, srv->mux_proto->token)) {
 			ha_alert("MUX protocol is not usable for server.\n");
 			goto out;
 		}
@@ -4757,6 +4820,9 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 		ha_alert("failed to allocate extra counters for server.\n");
 		goto out;
 	}
+
+	/* ensure minconn/maxconn consistency */
+	srv_minmax_conn_apply(srv);
 
 	if (srv->use_ssl == 1 || (srv->proxy->options & PR_O_TCPCHK_SSL) ||
 	    srv->check.use_ssl == 1) {
@@ -4859,6 +4925,9 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 			ha_alert("System might be unstable, consider to execute a reload");
 	}
 
+	if (srv->cklen && be->mode != PR_MODE_HTTP)
+		ha_warning("Ignoring cookie as HTTP mode is disabled.\n");
+
 	ha_notice("New server registered.\n");
 	cli_msg(appctx, LOG_INFO, usermsgs_str());
 
@@ -4869,10 +4938,14 @@ out:
 		if (srv->track)
 			release_server_track(srv);
 
-		if (srv->check.state & CHK_ST_CONFIGURED)
+		if (srv->check.state & CHK_ST_CONFIGURED) {
 			free_check(&srv->check);
-		if (srv->agent.state & CHK_ST_CONFIGURED)
+			srv_drop(srv);
+		}
+		if (srv->agent.state & CHK_ST_CONFIGURED) {
 			free_check(&srv->agent);
+			srv_drop(srv);
+		}
 
 		/* remove the server from the proxy linked list */
 		if (be->srv == srv) {
@@ -4907,6 +4980,7 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 	struct proxy *be;
 	struct server *srv;
 	char *be_name, *sv_name;
+	struct server *prev_del;
 
 	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
 		return 1;
@@ -4964,8 +5038,9 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 	 * TODO idle connections should not prevent server deletion. A proper
 	 * cleanup function should be implemented to be used here.
 	 */
-	if (srv->cur_sess || srv->curr_idle_conns ||
-	    !eb_is_empty(&srv->queue.head)) {
+	if (srv->curr_used_conns || srv->curr_idle_conns ||
+	    !MT_LIST_ISEMPTY(&srv->sess_conns) ||
+	    !eb_is_empty(&srv->queue.head) || srv_has_streams(srv)) {
 		cli_err(appctx, "Server still has connections attached to it, cannot remove it.");
 		goto out;
 	}
@@ -5002,6 +5077,25 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 		next->next = srv->next;
 	}
 
+	/* Some deleted servers could still point to us using their 'next',
+	 * update them as needed
+	 * Please note the small race between the POP and APPEND, although in
+	 * this situation this is not an issue as we are under full thread
+	 * isolation
+	 */
+	while ((prev_del = MT_LIST_POP(&srv->prev_deleted, struct server *, prev_deleted))) {
+		/* update its 'next' ptr */
+		prev_del->next = srv->next;
+		if (srv->next) {
+			/* now it is our 'next' responsibility */
+			MT_LIST_APPEND(&srv->next->prev_deleted, &prev_del->prev_deleted);
+		}
+	}
+
+	/* we ourselves need to inform our 'next' that we will still point it */
+	if (srv->next)
+		MT_LIST_APPEND(&srv->next->prev_deleted, &srv->prev_deleted);
+
 	/* remove srv from addr_node tree */
 	eb32_delete(&srv->conf.id);
 	ebpt_delete(&srv->conf.name);
@@ -5010,6 +5104,15 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 
 	/* remove srv from idle_node tree for idle conn cleanup */
 	eb32_delete(&srv->idle_node);
+
+	/* flag the server as deleted
+	 * (despite the server being removed from primary server list,
+	 * one could still access the server data from a valid ptr)
+	 * Deleted flag helps detecting when a server is in transient removal
+	 * state.
+	 * ie: removed from the list but not yet freed/purged from memory.
+	 */
+	srv->flags |= SRV_F_DELETED;
 
 	thread_release();
 
@@ -5152,6 +5255,7 @@ static void srv_update_status(struct server *s)
 	struct proxy *px = s->proxy;
 	int prev_srv_count = s->proxy->srv_bck + s->proxy->srv_act;
 	int srv_was_stopping = (s->cur_state == SRV_ST_STOPPING) || (s->cur_admin & SRV_ADMF_DRAIN);
+	enum srv_state srv_prev_state = s->cur_state;
 	int log_level;
 	struct buffer *tmptrash = NULL;
 
@@ -5166,7 +5270,6 @@ static void srv_update_status(struct server *s)
 		s->next_admin = s->cur_admin;
 
 		if ((s->cur_state != SRV_ST_STOPPED) && (s->next_state == SRV_ST_STOPPED)) {
-			s->last_change = now.tv_sec;
 			if (s->proxy->lbprm.set_server_status_down)
 				s->proxy->lbprm.set_server_status_down(s);
 
@@ -5197,13 +5300,9 @@ static void srv_update_status(struct server *s)
 				free_trash_chunk(tmptrash);
 				tmptrash = NULL;
 			}
-			if (prev_srv_count && s->proxy->srv_bck == 0 && s->proxy->srv_act == 0)
-				set_backend_down(s->proxy);
-
 			s->counters.down_trans++;
 		}
 		else if ((s->cur_state != SRV_ST_STOPPING) && (s->next_state == SRV_ST_STOPPING)) {
-			s->last_change = now.tv_sec;
 			if (s->proxy->lbprm.set_server_status_down)
 				s->proxy->lbprm.set_server_status_down(s);
 
@@ -5227,22 +5326,10 @@ static void srv_update_status(struct server *s)
 				free_trash_chunk(tmptrash);
 				tmptrash = NULL;
 			}
-
-			if (prev_srv_count && s->proxy->srv_bck == 0 && s->proxy->srv_act == 0)
-				set_backend_down(s->proxy);
 		}
 		else if (((s->cur_state != SRV_ST_RUNNING) && (s->next_state == SRV_ST_RUNNING))
 			 || ((s->cur_state != SRV_ST_STARTING) && (s->next_state == SRV_ST_STARTING))) {
-			if (s->proxy->srv_bck == 0 && s->proxy->srv_act == 0) {
-				if (s->proxy->last_change < now.tv_sec)		// ignore negative times
-					s->proxy->down_time += now.tv_sec - s->proxy->last_change;
-				s->proxy->last_change = now.tv_sec;
-			}
 
-			if (s->cur_state == SRV_ST_STOPPED && s->last_change < now.tv_sec)	// ignore negative times
-				s->down_time += now.tv_sec - s->last_change;
-
-			s->last_change = now.tv_sec;
 			if (s->next_state == SRV_ST_STARTING && s->warmup)
 				task_schedule(s->warmup, tick_add(now_ms, MS_TO_TICKS(MAX(1000, s->slowstart / 20))));
 
@@ -5268,10 +5355,10 @@ static void srv_update_status(struct server *s)
 			    !(s->flags & SRV_F_BACKUP) && s->next_eweight)
 				srv_shutdown_backup_streams(s->proxy, SF_ERR_UP);
 
-			/* check if we can handle some connections queued at the proxy. We
-			 * will take as many as we can handle.
+			/* check if we can handle some connections queued.
+			 * We will take as many as we can handle.
 			 */
-			xferred = pendconn_grab_from_px(s);
+			xferred = process_srv_queue(s);
 
 			tmptrash = alloc_trash_chunk();
 			if (tmptrash) {
@@ -5288,9 +5375,6 @@ static void srv_update_status(struct server *s)
 				free_trash_chunk(tmptrash);
 				tmptrash = NULL;
 			}
-
-			if (prev_srv_count && s->proxy->srv_bck == 0 && s->proxy->srv_act == 0)
-				set_backend_down(s->proxy);
 		}
 		else if (s->cur_eweight != s->next_eweight) {
 			/* now propagate the status change to any LB algorithms */
@@ -5304,9 +5388,6 @@ static void srv_update_status(struct server *s)
 				if (px->lbprm.set_server_status_down)
 					px->lbprm.set_server_status_down(s);
 			}
-
-			if (prev_srv_count && s->proxy->srv_bck == 0 && s->proxy->srv_act == 0)
-				set_backend_down(s->proxy);
 		}
 
 		s->next_admin = next_admin;
@@ -5344,13 +5425,9 @@ static void srv_update_status(struct server *s)
 				free_trash_chunk(tmptrash);
 				tmptrash = NULL;
 			}
-			/* commit new admin status */
-
-			s->cur_admin = s->next_admin;
 		}
 		else {	/* server was still running */
 			check->health = 0; /* failure */
-			s->last_change = now.tv_sec;
 
 			s->next_state = SRV_ST_STOPPED;
 			if (s->proxy->lbprm.set_server_status_down)
@@ -5385,9 +5462,6 @@ static void srv_update_status(struct server *s)
 				free_trash_chunk(tmptrash);
 				tmptrash = NULL;
 			}
-			if (prev_srv_count && s->proxy->srv_bck == 0 && s->proxy->srv_act == 0)
-				set_backend_down(s->proxy);
-
 			s->counters.down_trans++;
 		}
 	}
@@ -5407,7 +5481,6 @@ static void srv_update_status(struct server *s)
 		 * that the server might still be in drain mode, which is naturally dealt
 		 * with by the lower level functions.
 		 */
-
 		if (s->check.state & CHK_ST_ENABLED) {
 			s->check.state &= ~CHK_ST_PAUSED;
 			check->health = check->rise; /* start OK but check immediately */
@@ -5420,7 +5493,6 @@ static void srv_update_status(struct server *s)
 				s->next_state = SRV_ST_STOPPING;
 			}
 			else {
-				s->last_change = now.tv_sec;
 				s->next_state = SRV_ST_STARTING;
 				if (s->slowstart > 0) {
 					if (s->warmup)
@@ -5478,11 +5550,6 @@ static void srv_update_status(struct server *s)
 				px->lbprm.set_server_status_down(s);
 		}
 
-		if (prev_srv_count && s->proxy->srv_bck == 0 && s->proxy->srv_act == 0)
-			set_backend_down(s->proxy);
-		else if (!prev_srv_count && (s->proxy->srv_bck || s->proxy->srv_act))
-			s->proxy->last_change = now.tv_sec;
-
 		/* If the server is set with "on-marked-up shutdown-backup-sessions",
 		 * and it's not a backup server and its effective weight is > 0,
 		 * then it can accept new connections, so we shut down all streams
@@ -5492,10 +5559,10 @@ static void srv_update_status(struct server *s)
 		    !(s->flags & SRV_F_BACKUP) && s->next_eweight)
 			srv_shutdown_backup_streams(s->proxy, SF_ERR_UP);
 
-		/* check if we can handle some connections queued at the proxy. We
-		 * will take as many as we can handle.
+		/* check if we can handle some connections queued.
+		 * We will take as many as we can handle.
 		 */
-		xferred = pendconn_grab_from_px(s);
+		xferred = process_srv_queue(s);
 	}
 	else if (s->next_admin & SRV_ADMF_MAINT) {
 		/* remaining in maintenance mode, let's inform precisely about the
@@ -5552,15 +5619,12 @@ static void srv_update_status(struct server *s)
 			}
 		}
 		/* don't report anything when leaving drain mode and remaining in maintenance */
-
-		s->cur_admin = s->next_admin;
 	}
 
 	if (!(s->next_admin & SRV_ADMF_MAINT)) {
 		if (!(s->cur_admin & SRV_ADMF_DRAIN) && (s->next_admin & SRV_ADMF_DRAIN)) {
 			/* drain state is applied only if not yet in maint */
 
-			s->last_change = now.tv_sec;
 			if (px->lbprm.set_server_status_down)
 				px->lbprm.set_server_status_down(s);
 
@@ -5588,26 +5652,14 @@ static void srv_update_status(struct server *s)
 				free_trash_chunk(tmptrash);
 				tmptrash = NULL;
 			}
-
-			if (prev_srv_count && s->proxy->srv_bck == 0 && s->proxy->srv_act == 0)
-				set_backend_down(s->proxy);
 		}
 		else if ((s->cur_admin & SRV_ADMF_DRAIN) && !(s->next_admin & SRV_ADMF_DRAIN)) {
 			/* OK completely leaving drain mode */
-			if (s->proxy->srv_bck == 0 && s->proxy->srv_act == 0) {
-				if (s->proxy->last_change < now.tv_sec)         // ignore negative times
-					s->proxy->down_time += now.tv_sec - s->proxy->last_change;
-				s->proxy->last_change = now.tv_sec;
-			}
-
-			if (s->last_change < now.tv_sec)                        // ignore negative times
-				s->down_time += now.tv_sec - s->last_change;
-			s->last_change = now.tv_sec;
 			server_recalc_eweight(s, 0);
 
 			tmptrash = alloc_trash_chunk();
 			if (tmptrash) {
-				if (!(s->next_admin & SRV_ADMF_FDRAIN)) {
+				if (s->cur_admin & SRV_ADMF_FDRAIN) {
 					chunk_printf(tmptrash,
 						     "%sServer %s/%s is %s (leaving forced drain)",
 						     s->flags & SRV_F_BACKUP ? "Backup " : "",
@@ -5671,15 +5723,38 @@ static void srv_update_status(struct server *s)
 				free_trash_chunk(tmptrash);
 				tmptrash = NULL;
 			}
-
-			/* commit new admin status */
-
-			s->cur_admin = s->next_admin;
 		}
 	}
 
 	/* Re-set log strings to empty */
 	*s->adm_st_chg_cause = 0;
+
+	/* explicitly commit state changes (even if it was already applied implicitly
+	 * by some lb state change function), so we don't miss anything
+	 */
+	srv_lb_commit_status(s);
+
+	/* check if server stats must be updated due the the server state change */
+	if (srv_prev_state != s->cur_state) {
+		if (srv_prev_state == SRV_ST_STOPPED) {
+			/* server was down and no longer is */
+			if (s->last_change < now.tv_sec)                        // ignore negative times
+				s->down_time += now.tv_sec - s->last_change;
+		}
+		s->last_change = now.tv_sec;
+	}
+
+	/* check if backend stats must be updated due to the server state change */
+	if (prev_srv_count && s->proxy->srv_bck == 0 && s->proxy->srv_act == 0)
+		set_backend_down(s->proxy); /* backend going down */
+	else if (!prev_srv_count && (s->proxy->srv_bck || s->proxy->srv_act)) {
+		/* backend was down and is back up again:
+		 * no helper function, updating last_change and backend downtime stats
+		 */
+		if (s->proxy->last_change < now.tv_sec)         // ignore negative times
+			s->proxy->down_time += now.tv_sec - s->proxy->last_change;
+		s->proxy->last_change = now.tv_sec;
+	}
 }
 
 struct task *srv_cleanup_toremove_conns(struct task *task, void *context, unsigned int state)
@@ -5771,6 +5846,7 @@ void srv_release_conn(struct server *srv, struct connection *conn)
 	/* Remove the connection from any tree (safe, idle or available) */
 	HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	conn_delete_from_tree(&conn->hash_node->node);
+	conn->flags &= ~CO_FL_LIST_MASK;
 	HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 }
 

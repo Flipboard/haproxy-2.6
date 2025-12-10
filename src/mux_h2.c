@@ -20,6 +20,7 @@
 #include <haproxy/hpack-dec.h>
 #include <haproxy/hpack-enc.h>
 #include <haproxy/hpack-tbl.h>
+#include <haproxy/http.h>
 #include <haproxy/http_htx.h>
 #include <haproxy/htx.h>
 #include <haproxy/istbuf.h>
@@ -66,6 +67,7 @@ static const struct h2s *h2_idle_stream;
 #define H2_CF_DEM_IN_PROGRESS   0x00000400  // demux in progress (dsi,dfl,dft are valid)
 
 /* other flags */
+#define H2_CF_MBUF_HAS_DATA     0x00000800  // some stream data (data, headers) still in mbuf
 #define H2_CF_GOAWAY_SENT       0x00001000  // a GOAWAY frame was successfully sent
 #define H2_CF_GOAWAY_FAILED     0x00002000  // a GOAWAY frame failed to be sent
 #define H2_CF_WAIT_FOR_HS       0x00004000  // We did check that at least a stream was waiting for handshake
@@ -77,6 +79,9 @@ static const struct h2s *h2_idle_stream;
 #define H2_CF_RCVD_RFC8441      0x00100000  // settings from RFC8441 has been received indicating support for Extended CONNECT
 #define H2_CF_SHTS_UPDATED      0x00200000  // SETTINGS_HEADER_TABLE_SIZE updated
 #define H2_CF_DTSU_EMITTED      0x00400000  // HPACK Dynamic Table Size Update opcode emitted
+
+/* Note: changed value from 2.7 (0x00000010 there) */
+#define H2_CF_WAIT_INLIST       0x00800000  // there is at least one stream blocked by another stream in send_list/fctl_list
 
 /* H2 connection state, in h2c->st0 */
 enum h2_cs {
@@ -134,7 +139,7 @@ struct h2c {
 
 	int timeout;        /* idle timeout duration in ticks */
 	int shut_timeout;   /* idle timeout duration in ticks after GOAWAY was sent */
-	int idle_start;     /* date of the last time the connection went idle */
+	int idle_start;     /* date of the last time the connection went idle (no stream + empty mbuf), or the start of current http req */
 	/* 32-bit hole here */
 	unsigned int nb_streams;  /* number of streams in the tree */
 	unsigned int nb_sc;       /* number of attached stream connectors */
@@ -568,6 +573,7 @@ static const struct h2s *h2_idle_stream = &(const struct h2s){
 	.id        = 0,
 };
 
+
 struct task *h2_timeout_task(struct task *t, void *context, unsigned int state);
 static int h2_send(struct h2c *h2c);
 static int h2_recv(struct h2c *h2c);
@@ -580,6 +586,7 @@ static int h2_frt_transfer_data(struct h2s *h2s);
 struct task *h2_deferred_shut(struct task *t, void *ctx, unsigned int state);
 static struct h2s *h2c_bck_stream_new(struct h2c *h2c, struct stconn *sc, struct session *sess);
 static void h2s_alert(struct h2s *h2s);
+static inline void h2_remove_from_list(struct h2s *h2s);
 
 /* returns a h2c state as an abbreviated 3-letter string, or "???" if unknown */
 static inline const char *h2c_st_to_str(enum h2_cs st)
@@ -655,7 +662,12 @@ static void h2_trace(enum trace_level level, uint64_t mask, const struct trace_s
 		if (h2s) {
 			if (h2s->id <= 0)
 				chunk_appendf(&trace_buf, " dsi=%d", h2c->dsi);
-			chunk_appendf(&trace_buf, " h2s=%p(%d,%s)", h2s, h2s->id, h2s_st_to_str(h2s->st));
+			if (h2s == h2_idle_stream)
+				chunk_appendf(&trace_buf, " h2s=IDL");
+			else if (h2s != h2_closed_stream && h2s != h2_refused_stream && h2s != h2_error_stream)
+				chunk_appendf(&trace_buf, " h2s=%p(%d,%s)", h2s, h2s->id, h2s_st_to_str(h2s->st));
+			else if (h2c->dsi > 0) // don't show that before sid is known
+				chunk_appendf(&trace_buf, " h2s=CLO");
 			if (h2s->id && h2s->errcode)
 				chunk_appendf(&trace_buf, " err=%s/%02x", h2_err_str(h2s->errcode), h2s->errcode);
 		}
@@ -727,34 +739,41 @@ static void h2c_update_timeout(struct h2c *h2c)
 
 	if (h2c_may_expire(h2c)) {
 		/* no more streams attached */
-		if (h2c->last_sid >= 0) {
-			/* GOAWAY sent, closing in progress */
-			h2c->task->expire = tick_add_ifset(now_ms, h2c->shut_timeout);
-			is_idle_conn = 1;
-		} else if (br_data(h2c->mbuf)) {
+		if (br_data(h2c->mbuf)) {
 			/* pending output data: always the regular data timeout */
 			h2c->task->expire = tick_add_ifset(now_ms, h2c->timeout);
-		} else if (!(h2c->flags & H2_CF_IS_BACK) && h2c->max_id > 0 && !b_data(&h2c->dbuf)) {
-			/* idle after having seen one stream => keep-alive */
-			int to;
-
-			if (tick_isset(h2c->proxy->timeout.httpka))
-				to = h2c->proxy->timeout.httpka;
-			else
-				to = h2c->proxy->timeout.httpreq;
-
-			h2c->task->expire = tick_add_ifset(h2c->idle_start, to);
-			is_idle_conn = 1;
 		} else {
-			/* before first request, or started to deserialize a
-			 * new req => http-request, but only set, not refresh.
-			 */
-			int exp = (h2c->flags & H2_CF_IS_BACK) ? TICK_ETERNITY : h2c->proxy->timeout.httpreq;
-			h2c->task->expire = tick_add_ifset(h2c->idle_start, exp);
+			/* no stream, no output data */
+			if (!(h2c->flags & H2_CF_IS_BACK)) {
+				int to;
+
+				if (h2c->max_id > 0 && !b_data(&h2c->dbuf) &&
+				    tick_isset(h2c->proxy->timeout.httpka)) {
+					/* idle after having seen one stream => keep-alive */
+					to = h2c->proxy->timeout.httpka;
+				} else {
+					/* before first request, or started to deserialize a
+					 * new req => http-request.
+					 */
+					to = h2c->proxy->timeout.httpreq;
+				}
+
+				h2c->task->expire = tick_add_ifset(h2c->idle_start, to);
+				is_idle_conn = 1;
+			}
+
+			if (h2c->flags & (H2_CF_GOAWAY_SENT|H2_CF_GOAWAY_FAILED)) {
+				/* GOAWAY sent (or failed), closing in progress */
+				int exp = tick_add_ifset(now_ms, h2c->shut_timeout);
+
+				h2c->task->expire = tick_first(h2c->task->expire, exp);
+				is_idle_conn = 1;
+			}
+
+			/* if a timeout above was not set, fall back to the default one */
+			if (!tick_isset(h2c->task->expire))
+				h2c->task->expire = tick_add_ifset(now_ms, h2c->timeout);
 		}
-		/* if a timeout above was not set, fall back to the default one */
-		if (!tick_isset(h2c->task->expire))
-			h2c->task->expire = tick_add_ifset(now_ms, h2c->timeout);
 
 		if ((h2c->proxy->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) &&
 		    is_idle_conn && tick_isset(global.close_spread_end)) {
@@ -789,6 +808,16 @@ static void h2c_update_timeout(struct h2c *h2c)
 	} else {
 		h2c->task->expire = TICK_ETERNITY;
 	}
+
+	/* Timer may already be expired, in this case it must not be requeued.
+	 * Currently it may happen with idle conn calculation based on shut or
+	 * http-req/ka timeouts.
+	 */
+	if (unlikely(tick_is_expired(h2c->task->expire, now_ms))) {
+		task_wakeup(h2c->task, TASK_WOKEN_TIMER);
+		goto leave;
+	}
+
 	task_queue(h2c->task);
  leave:
 	TRACE_LEAVE(H2_EV_H2C_WAKE);
@@ -991,6 +1020,89 @@ static int h2_avail_streams(struct connection *conn)
 	return ret1;
 }
 
+/* inconditionally produce a trace of the header. Please do not call this one
+ * and use h2_trace_header() instead which first checks if traces are enabled.
+ */
+void _h2_trace_header(const struct ist hn, const struct ist hv,
+		      uint64_t mask, const struct ist trc_loc, const char *func,
+		      const struct h2c *h2c, const struct h2s *h2s)
+{
+	struct ist n_ist, v_ist;
+	const char *c_str, *s_str;
+
+	chunk_reset(&trash);
+	c_str = chunk_newstr(&trash);
+	if (h2c) {
+		chunk_appendf(&trash, "h2c=%p(%c,%s) ",
+			      h2c, (h2c->flags & H2_CF_IS_BACK) ? 'B' : 'F', h2c_st_to_str(h2c->st0));
+	}
+
+	s_str = chunk_newstr(&trash);
+	if (h2s) {
+		if (h2s->id <= 0)
+			chunk_appendf(&trash, "dsi=%d ", h2s->h2c->dsi);
+		chunk_appendf(&trash, "h2s=%p(%d,%s) ", h2s, h2s->id, h2s_st_to_str(h2s->st));
+	}
+	else if (h2c)
+		chunk_appendf(&trash, "dsi=%d ", h2c->dsi);
+
+	n_ist = ist2(chunk_newstr(&trash), 0);
+	istscpy(&n_ist, hn, 256);
+	trash.data += n_ist.len;
+	if (n_ist.len != hn.len)
+		chunk_appendf(&trash, " (... +%ld)", (long)(hn.len - n_ist.len));
+
+	v_ist = ist2(chunk_newstr(&trash), 0);
+	istscpy(&v_ist, hv, 1024);
+	trash.data += v_ist.len;
+	if (v_ist.len != hv.len)
+		chunk_appendf(&trash, " (... +%ld)", (long)(hv.len - v_ist.len));
+
+	TRACE_PRINTF_LOC(TRACE_LEVEL_USER, mask, trc_loc, func,
+	                 (h2c ? h2c->conn : 0), 0, 0, 0,
+	                 "%s%s%s %s: %s", c_str, s_str,
+	                 (mask & H2_EV_TX_HDR) ? "sndh" : "rcvh",
+	                 n_ist.ptr, v_ist.ptr);
+}
+
+/* produce a trace of the header after checking that tracing is enabled */
+static inline void h2_trace_header(const struct ist hn, const struct ist hv,
+				   uint64_t mask, const struct ist trc_loc, const char *func,
+				   const struct h2c *h2c, const struct h2s *h2s)
+{
+	if ((TRACE_SOURCE)->verbosity >= H2_VERB_ADVANCED &&
+	    TRACE_ENABLED(TRACE_LEVEL_USER, mask, h2c ? h2c->conn : 0, h2s, 0, 0))
+		_h2_trace_header(hn, hv, mask, trc_loc, func, h2c, h2s);
+}
+
+/* hpack-encode header name <hn> and value <hv>, possibly emitting a trace if
+ * currently enabled. This is done on behalf of function <func> at <trc_loc>
+ * passed as ist(TRC_LOC), h2c <h2c>, and h2s <h2s>, all of which may be NULL.
+ * The trace is only emitted if the header is emitted (in which case non-zero
+ * is returned). The trash is modified. In the traces, the header's name will
+ * be truncated to 256 chars and the header's value to 1024 chars.
+ */
+static inline int h2_encode_header(struct buffer *buf, const struct ist hn, const struct ist hv,
+				   uint64_t mask, const struct ist trc_loc, const char *func,
+				   const struct h2c *h2c, const struct h2s *h2s)
+{
+	struct ist v;
+	int ret;
+
+	/* trim leading/trailing LWS as per RC9113#8.2.1 */
+	for (v = hv; v.len; v.len--) {
+		if (unlikely(HTTP_IS_LWS(*v.ptr)))
+			v.ptr++;
+		else if (!unlikely(HTTP_IS_LWS(v.ptr[v.len - 1])))
+			break;
+	}
+
+	ret = hpack_encode_header(buf, hn, v);
+	if (ret)
+		h2_trace_header(hn, v, mask, trc_loc, func, h2c, h2s);
+
+	return ret;
+}
 
 /*****************************************************************/
 /* functions below are dedicated to the mux setup and management */
@@ -1035,6 +1147,7 @@ static int h2_init(struct connection *conn, struct proxy *prx, struct session *s
 
 	h2c->proxy = prx;
 	h2c->task = NULL;
+	h2c->wait_event.tasklet = NULL;
 	h2c->idle_start = now_ms;
 	if (tick_isset(h2c->timeout)) {
 		t = task_new_here();
@@ -1482,7 +1595,9 @@ static int h2_fragment_headers(struct buffer *b, uint32_t mfs)
 
 /* marks stream <h2s> as CLOSED and decrement the number of active streams for
  * its connection if the stream was not yet closed. Please use this exclusively
- * before closing a stream to ensure stream count is well maintained.
+ * before closing a stream to ensure stream count is well maintained. Note that
+ * it does explicitly support being called with a partially initialized h2s
+ * (e.g. sd==NULL).
  */
 static inline void h2s_close(struct h2s *h2s)
 {
@@ -1491,7 +1606,7 @@ static inline void h2s_close(struct h2s *h2s)
 		h2s->h2c->nb_streams--;
 		if (!h2s->id)
 			h2s->h2c->nb_reserved--;
-		if (h2s_sc(h2s)) {
+		if (h2s->sd && h2s_sc(h2s)) {
 			if (!se_fl_test(h2s->sd, SE_FL_EOS) && !b_data(&h2s->rxbuf))
 				h2s_notify_recv(h2s);
 		}
@@ -1527,7 +1642,7 @@ static void h2s_destroy(struct h2s *h2s)
 	 * reference left would be in the h2c send_list/fctl_list, and if
 	 * we're in it, we're getting out anyway
 	 */
-	LIST_DEL_INIT(&h2s->list);
+	h2_remove_from_list(h2s);
 
 	/* ditto, calling tasklet_free() here should be ok */
 	tasklet_free(h2s->shut_tl);
@@ -1609,6 +1724,8 @@ static struct h2s *h2c_frt_stream_new(struct h2c *h2c, int id, struct buffer *in
 
 	if (h2c->nb_streams >= h2_settings_max_concurrent_streams) {
 		TRACE_ERROR("HEADERS frame causing MAX_CONCURRENT_STREAMS to be exceeded", H2_EV_H2S_NEW|H2_EV_RX_FRAME|H2_EV_RX_HDR, h2c->conn);
+		session_inc_http_req_ctr(sess);
+		session_inc_http_err_ctr(sess);
 		goto out;
 	}
 
@@ -2015,8 +2132,10 @@ static int h2s_send_rst_stream(struct h2c *h2c, struct h2s *h2s)
 
 	/* RFC7540#5.4.2: To avoid looping, an endpoint MUST NOT send a
 	 * RST_STREAM in response to a RST_STREAM frame.
+	 *
+	 * if h2s is not assigned yet (id == 0), don't send a RST_STREAM frame.
 	 */
-	if (h2c->dsi == h2s->id && h2c->dft == H2_FT_RST_STREAM) {
+	if ((h2s->id == 0) || (h2c->dsi == h2s->id && h2c->dft == H2_FT_RST_STREAM)) {
 		ret = 1;
 		goto ignore;
 	}
@@ -2798,8 +2917,11 @@ static struct h2s *h2c_frt_handle_headers(struct h2c *h2c, struct h2s *h2s)
 		if (h2s->st != H2_SS_CLOSED) {
 			error = h2c_decode_headers(h2c, &h2s->rxbuf, &h2s->flags, &body_len, NULL);
 			/* unrecoverable error ? */
-			if (h2c->st0 >= H2_CS_ERROR)
+			if (h2c->st0 >= H2_CS_ERROR) {
+				TRACE_USER("Unrecoverable error decoding H2 trailers", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_STRM_NEW|H2_EV_STRM_END, h2c->conn, 0, &rxbuf);
+				sess_log(h2c->conn->owner);
 				goto out;
+			}
 
 			if (error == 0) {
 				/* Demux not blocked because of the stream, it is an incomplete frame */
@@ -2812,7 +2934,9 @@ static struct h2s *h2c_frt_handle_headers(struct h2c *h2c, struct h2s *h2s)
 				/* Failed to decode this frame (e.g. too large request)
 				 * but the HPACK decompressor is still synchronized.
 				 */
+				sess_log(h2c->conn->owner);
 				h2s_error(h2s, H2_ERR_INTERNAL_ERROR);
+				TRACE_USER("Stream error decoding H2 trailers", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_STRM_NEW|H2_EV_STRM_END, h2c->conn, 0, &rxbuf);
 				h2c->st0 = H2_CS_FRAME_E;
 				goto out;
 			}
@@ -2822,6 +2946,7 @@ static struct h2s *h2c_frt_handle_headers(struct h2c *h2c, struct h2s *h2s)
 		 * the data and send another RST.
 		 */
 		error = h2c_decode_headers(h2c, &rxbuf, &flags, &body_len, NULL);
+		sess_log(h2c->conn->owner);
 		h2s = (struct h2s*)h2_error_stream;
 		goto send_rst;
 	}
@@ -2831,6 +2956,8 @@ static struct h2s *h2c_frt_handle_headers(struct h2c *h2c, struct h2s *h2s)
 		TRACE_ERROR("HEADERS on invalid stream ID", H2_EV_RX_FRAME|H2_EV_RX_HDR, h2c->conn);
 		HA_ATOMIC_INC(&h2c->px_counters->conn_proto_err);
 		sess_log(h2c->conn->owner);
+		session_inc_http_req_ctr(h2c->conn->owner);
+		session_inc_http_err_ctr(h2c->conn->owner);
 		goto conn_err;
 	}
 	else if (h2c->flags & H2_CF_DEM_TOOMANY)
@@ -2839,8 +2966,13 @@ static struct h2s *h2c_frt_handle_headers(struct h2c *h2c, struct h2s *h2s)
 	error = h2c_decode_headers(h2c, &rxbuf, &flags, &body_len, NULL);
 
 	/* unrecoverable error ? */
-	if (h2c->st0 >= H2_CS_ERROR)
+	if (h2c->st0 >= H2_CS_ERROR) {
+		TRACE_USER("Unrecoverable error decoding H2 request", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_STRM_NEW|H2_EV_STRM_END, h2c->conn, 0, &rxbuf);
+		sess_log(h2c->conn->owner);
+		session_inc_http_req_ctr(h2c->conn->owner);
+		session_inc_http_err_ctr(h2c->conn->owner);
 		goto out;
+	}
 
 	if (error <= 0) {
 		if (error == 0) {
@@ -2853,7 +2985,18 @@ static struct h2s *h2c_frt_handle_headers(struct h2c *h2c, struct h2s *h2s)
 		/* Failed to decode this stream (e.g. too large request)
 		 * but the HPACK decompressor is still synchronized.
 		 */
+		sess_log(h2c->conn->owner);
+		session_inc_http_req_ctr(h2c->conn->owner);
+		session_inc_http_err_ctr(h2c->conn->owner);
+
 		h2s = (struct h2s*)h2_error_stream;
+
+		/* This stream ID is now opened anyway until we send the RST on
+		 * it, it must not be reused.
+		 */
+		if (h2c->dsi > h2c->max_id)
+			h2c->max_id = h2c->dsi;
+
 		goto send_rst;
 	}
 
@@ -2892,6 +3035,7 @@ static struct h2s *h2c_frt_handle_headers(struct h2c *h2c, struct h2s *h2s)
 		else
 			h2s_close(h2s);
 	}
+	TRACE_LEAVE(H2_EV_RX_FRAME|H2_EV_RX_HDR, h2c->conn, h2s);
 	return h2s;
 
  conn_err:
@@ -2911,7 +3055,7 @@ static struct h2s *h2c_frt_handle_headers(struct h2c *h2c, struct h2s *h2s)
 	h2_release_buf(h2c, &rxbuf);
 	h2c->st0 = H2_CS_FRAME_E;
 
-	TRACE_USER("rejected H2 request", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_STRM_NEW|H2_EV_STRM_END, h2c->conn, 0, &rxbuf);
+	TRACE_USER("rejected H2 request", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_STRM_NEW|H2_EV_STRM_END, h2c->conn, h2s, &rxbuf);
 	TRACE_DEVEL("leaving on error", H2_EV_RX_FRAME|H2_EV_RX_HDR, h2c->conn, h2s);
 	return h2s;
 }
@@ -2954,8 +3098,10 @@ static struct h2s *h2c_bck_handle_headers(struct h2c *h2c, struct h2s *h2s)
 	}
 
 	/* unrecoverable error ? */
-	if (h2c->st0 >= H2_CS_ERROR)
+	if (h2c->st0 >= H2_CS_ERROR) {
+		TRACE_USER("Unrecoverable error decoding H2 HEADERS", H2_EV_RX_FRAME|H2_EV_RX_HDR, h2c->conn, h2s);
 		goto fail;
+	}
 
 	if (h2s->st != H2_SS_OPEN && h2s->st != H2_SS_HLOC) {
 		/* RFC7540#5.1 */
@@ -3055,6 +3201,13 @@ static int h2c_handle_data(struct h2c *h2c, struct h2s *h2s)
 		goto strm_err;
 	}
 
+	if (!(h2s->flags & H2_SF_HEADERS_RCVD)) {
+		/* RFC9113#8.1: The header section must be received before the message content */
+		TRACE_ERROR("Unexpected DATA frame before the message headers", H2_EV_RX_FRAME|H2_EV_RX_DATA, h2c->conn, h2s);
+		error = H2_ERR_PROTOCOL_ERROR;
+		HA_ATOMIC_INC(&h2c->px_counters->strm_proto_err);
+		goto strm_err;
+	}
 	if ((h2s->flags & H2_SF_DATA_CLEN) && (h2c->dfl - h2c->dpl) > h2s->body_len) {
 		/* RFC7540#8.1.2 */
 		TRACE_ERROR("DATA frame larger than content-length", H2_EV_RX_FRAME|H2_EV_RX_DATA, h2c->conn, h2s);
@@ -3475,7 +3628,8 @@ static void h2_process_demux(struct h2c *h2c)
 			}
 
 			/* transition to HEADERS frame ends the keep-alive idle
-			 * timer and starts the http-request idle delay.
+			 * timer and starts the http-request idle delay. It uses
+			 * the idle_start timer as well.
 			 */
 			if (hdr.ft == H2_FT_HEADERS)
 				h2c->idle_start = now_ms;
@@ -3732,6 +3886,29 @@ static void h2_resume_each_sending_h2s(struct h2c *h2c, struct list *head)
 	TRACE_LEAVE(H2_EV_H2C_SEND|H2_EV_H2S_WAKE, h2c->conn);
 }
 
+/* removes a stream from the list it may be in. If a stream has recently been
+ * appended to the send_list, it might have been waiting on this one when
+ * entering h2_snd_buf() and expecting it to complete before starting to send
+ * in turn. For this reason we check (and clear) H2_CF_WAIT_INLIST to detect
+ * this condition, and we try to resume sending streams if it happens. Note
+ * that we don't need to do it for fctl_list as this list is relevant before
+ * (only consulted after) a window update on the connection, and not because
+ * of any competition with other streams.
+ */
+static inline void h2_remove_from_list(struct h2s *h2s)
+{
+	struct h2c *h2c = h2s->h2c;
+
+	if (!LIST_INLIST(&h2s->list))
+		return;
+
+	LIST_DEL_INIT(&h2s->list);
+	if (h2c->flags & H2_CF_WAIT_INLIST) {
+		h2c->flags &= ~H2_CF_WAIT_INLIST;
+		h2_resume_each_sending_h2s(h2c, &h2c->send_list);
+	}
+}
+
 /* process Tx frames from streams to be multiplexed. Returns > 0 if it reached
  * the end.
  */
@@ -3769,6 +3946,7 @@ static int h2_process_mux(struct h2c *h2c)
 	 * waiting there were already elected for immediate emission but were
 	 * blocked just on this.
 	 */
+	h2c->flags &= ~H2_CF_WAIT_INLIST;
 	h2_resume_each_sending_h2s(h2c, &h2c->fctl_list);
 	h2_resume_each_sending_h2s(h2c, &h2c->send_list);
 
@@ -3885,6 +4063,7 @@ static int h2_send(struct h2c *h2c)
 
 	if (conn->flags & CO_FL_ERROR) {
 		TRACE_DEVEL("leaving on error", H2_EV_H2C_SEND, h2c->conn);
+		h2c->idle_start = now_ms;
 		return 1;
 	}
 
@@ -3932,6 +4111,16 @@ static int h2_send(struct h2c *h2c)
 		if (h2c->flags & (H2_CF_MUX_MFULL | H2_CF_DEM_MBUSY | H2_CF_DEM_MROOM))
 			flags |= CO_SFL_MSG_MORE;
 
+		if (!br_single(h2c->mbuf)) {
+			/* usually we want to emit small TLS records to speed
+			 * up the decoding on the client. That's what is being
+			 * done by default. However if there is more than one
+			 * buffer being allocated, we're streaming large data
+			 * so we stich to large records.
+			 */
+			flags |= CO_SFL_STREAMER;
+		}
+
 		for (buf = br_head(h2c->mbuf); b_size(buf); buf = br_del_head(h2c->mbuf)) {
 			if (b_data(buf)) {
 				int ret = conn->xprt->snd_buf(conn, conn->xprt_ctx, buf, b_data(buf), flags);
@@ -3954,8 +4143,17 @@ static int h2_send(struct h2c *h2c)
 		if (released)
 			offer_buffers(NULL, released);
 
-		/* wrote at least one byte, the buffer is not full anymore */
-		if (sent)
+		/* Normally if wrote at least one byte, the buffer is not full
+		 * anymore. However, if it was marked full because all of its
+		 * buffers were used, we don't want to instantly wake up many
+		 * streams because we'd create a thundering herd effect, notably
+		 * when data are flushed in small chunks. Instead we wait for
+		 * the buffer to be decongested again before allowing to send
+		 * again. It also has the added benefit of not pumping more
+		 * data from the other side when it's known that this one is
+		 * still congested.
+		 */
+		if (sent && br_single(h2c->mbuf))
 			h2c->flags &= ~(H2_CF_MUX_MFULL | H2_CF_DEM_MROOM);
 	}
 
@@ -3966,12 +4164,18 @@ static int h2_send(struct h2c *h2c)
 	/* We're not full anymore, so we can wake any task that are waiting
 	 * for us.
 	 */
-	if (!(h2c->flags & (H2_CF_MUX_MFULL | H2_CF_DEM_MROOM)) && h2c->st0 >= H2_CS_FRAME_H)
+	if (!(h2c->flags & (H2_CF_MUX_MFULL | H2_CF_DEM_MROOM)) && h2c->st0 >= H2_CS_FRAME_H) {
+		h2c->flags &= ~H2_CF_WAIT_INLIST;
 		h2_resume_each_sending_h2s(h2c, &h2c->send_list);
+	}
 
 	/* We're done, no more to send */
 	if (!br_data(h2c->mbuf)) {
 		TRACE_DEVEL("leaving with everything sent", H2_EV_H2C_SEND, h2c->conn);
+		if (h2c->flags & H2_CF_MBUF_HAS_DATA && !h2c->nb_sc) {
+			h2c->flags &= ~H2_CF_MBUF_HAS_DATA;
+			h2c->idle_start = now_ms;
+		}
 		return sent;
 	}
 schedule:
@@ -4011,11 +4215,10 @@ struct task *h2_io_cb(struct task *t, void *ctx, unsigned int state)
 		conn = h2c->conn;
 		TRACE_ENTER(H2_EV_H2C_WAKE, conn);
 
-		conn_in_list = conn->flags & CO_FL_LIST_MASK;
-
 		/* Remove the connection from the list, to be sure nobody attempts
 		 * to use it while we handle the I/O events
 		 */
+		conn_in_list = conn_get_idle_flag(conn);
 		if (conn_in_list)
 			conn_delete_from_tree(&conn->hash_node->node);
 
@@ -4409,7 +4612,7 @@ static void h2_detach(struct sedesc *sd)
 	sess = h2s->sess;
 	h2c = h2s->h2c;
 	h2c->nb_sc--;
-	if (!h2c->nb_sc)
+	if (!h2c->nb_sc && !br_data(h2c->mbuf))
 		h2c->idle_start = now_ms;
 
 	if ((h2c->flags & (H2_CF_IS_BACK|H2_CF_DEM_TOOMANY)) == H2_CF_DEM_TOOMANY &&
@@ -4430,7 +4633,7 @@ static void h2_detach(struct sedesc *sd)
 		/* refresh the timeout if none was active, so that the last
 		 * leaving stream may arm it.
 		 */
-		if (!tick_isset(h2c->task->expire))
+		if (h2c->task && !tick_isset(h2c->task->expire))
 			h2c_update_timeout(h2c);
 		return;
 	}
@@ -4500,7 +4703,7 @@ static void h2_detach(struct sedesc *sd)
 				}
 				else if (!h2c->conn->hash_node->node.node.leaf_p &&
 					 h2_avail_streams(h2c->conn) > 0 && objt_server(h2c->conn->target) &&
-					 !LIST_INLIST(&h2c->conn->session_list)) {
+					 !LIST_INLIST(&h2c->conn->sess_el)) {
 					eb64_insert(&__objt_server(h2c->conn->target)->per_thr[tid].avail_conns,
 					            &h2c->conn->hash_node->node);
 				}
@@ -4536,6 +4739,9 @@ static void h2_do_shutr(struct h2s *h2s)
 
 	TRACE_ENTER(H2_EV_STRM_SHUT, h2c->conn, h2s);
 
+	if (h2s->flags & H2_SF_WANT_SHUTW)
+		goto add_to_list;
+
 	/* a connstream may require us to immediately kill the whole connection
 	 * for example because of a "tcp-request content reject" rule that is
 	 * normally used to limit abuse. In this case we schedule a goaway to
@@ -4560,8 +4766,11 @@ static void h2_do_shutr(struct h2s *h2s)
 		 * stream anymore. This may happen when the server responds
 		 * before the end of an upload and closes quickly (redirect,
 		 * deny, ...)
+		 *
+		 * RFC9113#8.1: Use NO_ERROR code after a complete response was
+		 *              sent (So frontend side and ES sent)
 		 */
-		h2s_error(h2s, H2_ERR_CANCEL);
+		h2s_error(h2s, (!(h2c->flags & H2_CF_IS_BACK) && (h2s->flags & H2_SF_ES_SENT)) ? H2_ERR_NO_ERROR : H2_ERR_CANCEL);
 	}
 
 	if (!(h2s->flags & H2_SF_RST_SENT) &&
@@ -4691,7 +4900,7 @@ struct task *h2_deferred_shut(struct task *t, void *ctx, unsigned int state)
 
 	if (!(h2s->flags & (H2_SF_WANT_SHUTR|H2_SF_WANT_SHUTW))) {
 		/* We're done trying to send, remove ourself from the send_list */
-		LIST_DEL_INIT(&h2s->list);
+		h2_remove_from_list(h2s);
 
 		if (!h2s_sc(h2s)) {
 			h2s_destroy(h2s);
@@ -4920,6 +5129,26 @@ next_frame:
 	/* past this point we cannot roll back in case of error */
 	outlen = hpack_decode_frame(h2c->ddht, hdrs, flen, list,
 	                            sizeof(list)/sizeof(list[0]), tmp);
+
+	if (outlen > 0 &&
+	    (TRACE_SOURCE)->verbosity >= H2_VERB_ADVANCED &&
+	    TRACE_ENABLED(TRACE_LEVEL_USER, H2_EV_RX_FRAME|H2_EV_RX_HDR, h2c->conn, 0, 0, 0)) {
+		struct ist n;
+		int i;
+
+		for (i = 0; list[i].n.len; i++) {
+			n = list[i].n;
+
+			if (!isttest(n)) {
+				/* this is in fact a pseudo header whose number is in n.len */
+				n = h2_phdr_to_ist(n.len);
+			}
+
+			h2_trace_header(n, list[i].v, H2_EV_RX_FRAME|H2_EV_RX_HDR,
+			                ist(TRC_LOC), __FUNCTION__, h2c, NULL);
+		}
+	}
+
 	if (outlen < 0) {
 		TRACE_STATE("failed to decompress HPACK", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_H2C_ERR|H2_EV_PROTO_ERR, h2c->conn);
 		h2c_error(h2c, H2_ERR_COMPRESSION_ERROR);
@@ -4948,7 +5177,8 @@ next_frame:
 	if (h2c->flags & H2_CF_IS_BACK)
 		outlen = h2_make_htx_response(list, htx, &msgf, body_len, upgrade_protocol);
 	else
-		outlen = h2_make_htx_request(list, htx, &msgf, body_len);
+		outlen = h2_make_htx_request(list, htx, &msgf, body_len,
+					     !!(((const struct session *)h2c->conn->owner)->fe->options2 & PR_O2_REQBUG_OK));
 
 	if (outlen < 0 || htx_free_space(htx) < global.tune.maxrewrite) {
 		/* too large headers? this is a stream error only */
@@ -4985,6 +5215,11 @@ next_frame:
 		*flags |= H2_SF_HEADERS_RCVD;
 
 	if (h2c->dff & H2_F_HEADERS_END_STREAM) {
+		if (msgf & H2_MSGF_RSP_1XX) {
+			/* RFC9113#8.1 : HEADERS frame with the ES flag set that carries an informational status code is malformed */
+			TRACE_STATE("invalid interim response with ES flag!", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_H2C_ERR|H2_EV_PROTO_ERR, h2c->conn);
+			goto fail;
+		}
 		/* no more data are expected for this message */
 		htx->flags |= HTX_FL_EOM;
 	}
@@ -5006,7 +5241,7 @@ next_frame:
 		b_sub(&h2c->dbuf, hole);
 	}
 
-	if (b_full(&h2c->dbuf) && h2c->dfl) {
+	if (b_full(&h2c->dbuf) && h2c->dfl && (!htx || htx_is_empty(htx))) {
 		/* too large frames */
 		h2c_error(h2c, H2_ERR_INTERNAL_ERROR);
 		ret = -1;
@@ -5035,6 +5270,7 @@ next_frame:
 	/* Trailers terminate a DATA sequence */
 	if (h2_make_htx_trailers(list, htx) <= 0) {
 		TRACE_STATE("failed to append HTX trailers into rxbuf", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_H2S_ERR, h2c->conn);
+		htx->flags |= HTX_FL_PARSING_ERROR;
 		goto fail;
 	}
 	goto done;
@@ -5128,18 +5364,9 @@ try_again:
 		 * EOM was already reported.
 		 */
 		if ((h2c->flags & H2_CF_IS_BACK) || !(h2s->flags & H2_SF_TUNNEL_ABRT)) {
-			/* If we receive an empty DATA frame with ES flag while the HTX
-			 * message is empty, we must be sure to push a block to be sure
-			 * the HTX EOM flag will be handled on the other side. It is a
-			 * workaround because for now it is not possible to push empty
-			 * HTX DATA block. And without this block, there is no way to
-			 * "commit" the end of the message.
-			 */
-			if (htx_is_empty(htx)) {
-				if (!htx_add_endof(htx, HTX_BLK_EOT))
-					goto fail;
-			}
-			htx->flags |= HTX_FL_EOM;
+			/* htx may be empty if receiving an empty DATA frame. */
+			if (!htx_set_eom(htx))
+				goto fail;
 		}
 	}
 
@@ -5168,7 +5395,7 @@ try_again:
  */
 static size_t h2s_frt_make_resp_headers(struct h2s *h2s, struct htx *htx)
 {
-	struct http_hdr list[global.tune.max_http_hdr];
+	struct http_hdr list[global.tune.max_http_hdr * 2];
 	struct h2c *h2c = h2s->h2c;
 	struct htx_blk *blk;
 	struct buffer outbuf;
@@ -5306,6 +5533,14 @@ static size_t h2s_frt_make_resp_headers(struct h2s *h2s, struct htx *htx)
 		goto full;
 	}
 
+	if ((TRACE_SOURCE)->verbosity >= H2_VERB_ADVANCED) {
+		char sts[4];
+
+		h2_trace_header(ist(":status"), ist(ultoa_r(h2s->status, sts, sizeof(sts))),
+				    H2_EV_TX_FRAME|H2_EV_TX_HDR, ist(TRC_LOC), __FUNCTION__,
+				    h2c, h2s);
+	}
+
 	/* encode all headers, stop at empty name */
 	for (hdr = 0; hdr < sizeof(list)/sizeof(list[0]); hdr++) {
 		/* these ones do not exist in H2 and must be dropped. */
@@ -5323,7 +5558,8 @@ static size_t h2s_frt_make_resp_headers(struct h2s *h2s, struct htx *htx)
 		if (isteq(list[hdr].n, ist("")))
 			break; // end
 
-		if (!hpack_encode_header(&outbuf, list[hdr].n, list[hdr].v)) {
+		if (!h2_encode_header(&outbuf, list[hdr].n, list[hdr].v, H2_EV_TX_FRAME|H2_EV_TX_HDR,
+		                      ist(TRC_LOC), __FUNCTION__, h2c, h2s)) {
 			/* output full */
 			if (b_space_wraps(mbuf))
 				goto realign_again;
@@ -5376,6 +5612,7 @@ static size_t h2s_frt_make_resp_headers(struct h2s *h2s, struct htx *htx)
 
 	/* commit the H2 response */
 	b_add(mbuf, outbuf.data);
+	h2c->flags |= H2_CF_MBUF_HAS_DATA;
 
 	/* indicates the HEADERS frame was sent, except for 1xx responses. For
 	 * 1xx responses, another HEADERS frame is expected.
@@ -5430,7 +5667,7 @@ static size_t h2s_frt_make_resp_headers(struct h2s *h2s, struct htx *htx)
  */
 static size_t h2s_bck_make_req_headers(struct h2s *h2s, struct htx *htx)
 {
-	struct http_hdr list[global.tune.max_http_hdr];
+	struct http_hdr list[global.tune.max_http_hdr * 2];
 	struct h2c *h2c = h2s->h2c;
 	struct htx_blk *blk;
 	struct buffer outbuf;
@@ -5484,6 +5721,12 @@ static size_t h2s_bck_make_req_headers(struct h2s *h2s, struct htx *htx)
 			if ((sl->flags & HTX_SL_F_CONN_UPG) && isteqi(list[hdr].n, ist("connection"))) {
 				/* rfc 7230 #6.1 Connection = list of tokens */
 				struct ist connection_ist = list[hdr].v;
+
+				if (!(sl->flags & HTX_SL_F_BODYLESS)) {
+					TRACE_STATE("cannot convert upgrade for request with payload", H2_EV_TX_FRAME|H2_EV_TX_HDR, h2c->conn, h2s);
+					goto fail;
+				}
+
 				do {
 					if (isteqi(iststop(connection_ist, ','),
 					           ist("upgrade"))) {
@@ -5590,6 +5833,8 @@ static size_t h2s_bck_make_req_headers(struct h2s *h2s, struct htx *htx)
 		goto full;
 	}
 
+	h2_trace_header(ist(":method"), meth, H2_EV_TX_FRAME|H2_EV_TX_HDR, ist(TRC_LOC), __FUNCTION__, h2c, h2s);
+
 	auth = ist(NULL);
 
 	/* RFC7540 #8.3: the CONNECT method must have :
@@ -5603,12 +5848,14 @@ static size_t h2s_bck_make_req_headers(struct h2s *h2s, struct htx *htx)
 	if (unlikely(sl->info.req.meth == HTTP_METH_CONNECT) && !extended_connect) {
 		auth = uri;
 
-		if (!hpack_encode_header(&outbuf, ist(":authority"), auth)) {
+		if (!h2_encode_header(&outbuf, ist(":authority"), auth, H2_EV_TX_FRAME|H2_EV_TX_HDR,
+		                      ist(TRC_LOC), __FUNCTION__, h2c, h2s)) {
 			/* output full */
 			if (b_space_wraps(mbuf))
 				goto realign_again;
 			goto full;
 		}
+
 		h2s->flags |= H2_SF_BODY_TUNNEL;
 	} else {
 		/* other methods need a :scheme. If an authority is known from
@@ -5668,7 +5915,9 @@ static size_t h2s_bck_make_req_headers(struct h2s *h2s, struct htx *htx)
 			goto full;
 		}
 
-		if (auth.len && !hpack_encode_header(&outbuf, ist(":authority"), auth)) {
+		if (auth.len &&
+		    !h2_encode_header(&outbuf, ist(":authority"), auth, H2_EV_TX_FRAME|H2_EV_TX_HDR,
+		                      ist(TRC_LOC), __FUNCTION__, h2c, h2s)) {
 			/* output full */
 			if (b_space_wraps(mbuf))
 				goto realign_again;
@@ -5692,15 +5941,16 @@ static size_t h2s_bck_make_req_headers(struct h2s *h2s, struct htx *htx)
 			goto full;
 		}
 
+		h2_trace_header(ist(":path"), uri, H2_EV_TX_FRAME|H2_EV_TX_HDR, ist(TRC_LOC), __FUNCTION__, h2c, h2s);
+
 		/* encode the pseudo-header protocol from rfc8441 if using
 		 * Extended CONNECT method.
 		 */
 		if (unlikely(extended_connect)) {
 			const struct ist protocol = ist(h2s->upgrade_protocol);
 			if (isttest(protocol)) {
-				if (!hpack_encode_header(&outbuf,
-				                         ist(":protocol"),
-				                         protocol)) {
+				if (!h2_encode_header(&outbuf, ist(":protocol"), protocol, H2_EV_TX_FRAME|H2_EV_TX_HDR,
+				                      ist(TRC_LOC), __FUNCTION__, h2c, h2s)) {
 					/* output full */
 					if (b_space_wraps(mbuf))
 						goto realign_again;
@@ -5743,7 +5993,7 @@ static size_t h2s_bck_make_req_headers(struct h2s *h2s, struct htx *htx)
 		if (isteq(n, ist("")))
 			break; // end
 
-		if (!hpack_encode_header(&outbuf, n, v)) {
+		if (!h2_encode_header(&outbuf, n, v, H2_EV_TX_FRAME|H2_EV_TX_HDR, ist(TRC_LOC), __FUNCTION__, h2c, h2s)) {
 			/* output full */
 			if (b_space_wraps(mbuf))
 				goto realign_again;
@@ -5796,6 +6046,7 @@ static size_t h2s_bck_make_req_headers(struct h2s *h2s, struct htx *htx)
 
 	/* commit the H2 response */
 	b_add(mbuf, outbuf.data);
+	h2c->flags |= H2_CF_MBUF_HAS_DATA;
 	h2s->flags |= H2_SF_HEADERS_SENT;
 	h2s->st = H2_SS_OPEN;
 
@@ -5980,6 +6231,7 @@ static size_t h2s_make_data(struct h2s *h2s, struct buffer *buf, size_t count)
 		buf->data = buf->head = 0;
 		total += fsize;
 		fsize = 0;
+		h2c->flags |= H2_CF_MBUF_HAS_DATA;
 
 		TRACE_PROTO("sent H2 DATA frame (zero-copy)", H2_EV_TX_FRAME|H2_EV_TX_DATA, h2c->conn, h2s);
 		goto out;
@@ -6025,7 +6277,7 @@ static size_t h2s_make_data(struct h2s *h2s, struct buffer *buf, size_t count)
 	if (h2s_mws(h2s) <= 0) {
 		h2s->flags |= H2_SF_BLK_SFCTL;
 		if (LIST_INLIST(&h2s->list))
-			LIST_DEL_INIT(&h2s->list);
+			h2_remove_from_list(h2s);
 		LIST_APPEND(&h2c->blocked_list, &h2s->list);
 		TRACE_STATE("stream window <=0, flow-controlled", H2_EV_TX_FRAME|H2_EV_TX_DATA|H2_EV_H2S_FCTL, h2c->conn, h2s);
 		goto end;
@@ -6104,6 +6356,7 @@ static size_t h2s_make_data(struct h2s *h2s, struct buffer *buf, size_t count)
 
 	/* commit the H2 response */
 	b_add(mbuf, fsize + 9);
+	h2c->flags |= H2_CF_MBUF_HAS_DATA;
 
  out:
 	if (es_now) {
@@ -6218,7 +6471,7 @@ static size_t h2s_skip_data(struct h2s *h2s, struct buffer *buf, size_t count)
  */
 static size_t h2s_make_trailers(struct h2s *h2s, struct htx *htx)
 {
-	struct http_hdr list[global.tune.max_http_hdr];
+	struct http_hdr list[global.tune.max_http_hdr * 2];
 	struct h2c *h2c = h2s->h2c;
 	struct htx_blk *blk;
 	struct buffer outbuf;
@@ -6312,7 +6565,8 @@ static size_t h2s_make_trailers(struct h2s *h2s, struct htx *htx)
 		if (*(list[idx].n.ptr) == ':')
 			continue;
 
-		if (!hpack_encode_header(&outbuf, list[idx].n, list[idx].v)) {
+		if (!h2_encode_header(&outbuf, list[idx].n, list[idx].v, H2_EV_TX_FRAME|H2_EV_TX_HDR,
+		                      ist(TRC_LOC), __FUNCTION__, h2c, h2s)) {
 			/* output full */
 			if (b_space_wraps(mbuf))
 				goto realign_again;
@@ -6346,6 +6600,7 @@ static size_t h2s_make_trailers(struct h2s *h2s, struct htx *htx)
 	/* commit the H2 response */
 	TRACE_PROTO("sent H2 trailers HEADERS frame", H2_EV_TX_FRAME|H2_EV_TX_HDR|H2_EV_TX_EOI, h2c->conn, h2s);
 	b_add(mbuf, outbuf.data);
+	h2c->flags |= H2_CF_MBUF_HAS_DATA;
 	h2s->flags |= H2_SF_ES_SENT;
 
 	if (h2s->st == H2_SS_OPEN)
@@ -6412,10 +6667,14 @@ static int h2_subscribe(struct stconn *sc, int event_type, struct wait_event *es
 		TRACE_DEVEL("subscribe(send)", H2_EV_STRM_SEND, h2c->conn, h2s);
 		if (!(h2s->flags & H2_SF_BLK_SFCTL) &&
 		    !LIST_INLIST(&h2s->list)) {
-			if (h2s->flags & H2_SF_BLK_MFCTL)
+			if (h2s->flags & H2_SF_BLK_MFCTL) {
+				TRACE_DEVEL("Adding to fctl list", H2_EV_STRM_SEND, h2c->conn, h2s);
 				LIST_APPEND(&h2c->fctl_list, &h2s->list);
-			else
+			}
+			else {
+				TRACE_DEVEL("Adding to send list", H2_EV_STRM_SEND, h2c->conn, h2s);
 				LIST_APPEND(&h2c->send_list, &h2s->list);
+			}
 		}
 	}
 	TRACE_LEAVE(H2_EV_STRM_SEND|H2_EV_STRM_RECV, h2c->conn, h2s);
@@ -6446,7 +6705,7 @@ static int h2_unsubscribe(struct stconn *sc, int event_type, struct wait_event *
 		TRACE_DEVEL("unsubscribe(send)", H2_EV_STRM_SEND, h2s->h2c->conn, h2s);
 		h2s->flags &= ~H2_SF_NOTIFIED;
 		if (!(h2s->flags & (H2_SF_WANT_SHUTR | H2_SF_WANT_SHUTW)))
-			LIST_DEL_INIT(&h2s->list);
+			h2_remove_from_list(h2s);
 	}
 
 	TRACE_LEAVE(H2_EV_STRM_SEND|H2_EV_STRM_RECV, h2s->h2c->conn, h2s);
@@ -6568,7 +6827,12 @@ static size_t h2_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, in
 	 */
 	if (!(h2s->flags & H2_SF_NOTIFIED) &&
 	    (!LIST_ISEMPTY(&h2s->h2c->send_list) || !LIST_ISEMPTY(&h2s->h2c->fctl_list))) {
-		TRACE_DEVEL("other streams already waiting, going to the queue and leaving", H2_EV_H2S_SEND|H2_EV_H2S_BLK, h2s->h2c->conn, h2s);
+		if (LIST_INLIST(&h2s->list))
+			TRACE_DEVEL("stream already waiting, leaving", H2_EV_H2S_SEND|H2_EV_H2S_BLK, h2s->h2c->conn, h2s);
+		else {
+			TRACE_DEVEL("other streams already waiting, going to the queue and leaving", H2_EV_H2S_SEND|H2_EV_H2S_BLK, h2s->h2c->conn, h2s);
+			h2s->h2c->flags |= H2_CF_WAIT_INLIST;
+		}
 		return 0;
 	}
 	h2s->flags &= ~H2_SF_NOTIFIED;
@@ -6714,7 +6978,8 @@ static size_t h2_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, in
 	if (total > 0 && !(h2s->flags & H2_SF_BLK_SFCTL) &&
 	    !(h2s->flags & (H2_SF_WANT_SHUTR|H2_SF_WANT_SHUTW))) {
 		/* Ok we managed to send something, leave the send_list if we were still there */
-		LIST_DEL_INIT(&h2s->list);
+		h2_remove_from_list(h2s);
+		TRACE_DEVEL("Removed from h2s list", H2_EV_H2S_SEND|H2_EV_H2C_SEND, h2s->h2c->conn, h2s);
 	}
 
 	TRACE_LEAVE(H2_EV_H2S_SEND|H2_EV_STRM_SEND, h2s->h2c->conn, h2s);
@@ -6814,9 +7079,19 @@ static int h2_takeover(struct connection *conn, int orig_tid)
 {
 	struct h2c *h2c = conn->ctx;
 	struct task *task;
+	struct task *new_task;
+	struct tasklet *new_tasklet;
+
+	/* Pre-allocate tasks so that we don't have to roll back after the xprt
+	 * has been migrated.
+	 */
+	new_task = task_new_here();
+	new_tasklet = tasklet_new();
+	if (!new_task || !new_tasklet)
+		goto fail;
 
 	if (fd_takeover(conn->handle.fd, conn) != 0)
-		return -1;
+		goto fail;
 
 	if (conn->xprt->takeover && conn->xprt->takeover(conn, conn->xprt_ctx, orig_tid) != 0) {
 		/* We failed to takeover the xprt, even if the connection may
@@ -6826,44 +7101,49 @@ static int h2_takeover(struct connection *conn, int orig_tid)
 		 */
 		conn->flags |= CO_FL_ERROR;
 		tasklet_wakeup_on(h2c->wait_event.tasklet, orig_tid);
-		return -1;
+		goto fail;
 	}
 
 	if (h2c->wait_event.events)
 		h2c->conn->xprt->unsubscribe(h2c->conn, h2c->conn->xprt_ctx,
 		    h2c->wait_event.events, &h2c->wait_event);
+
+	task = h2c->task;
+	if (task) {
+		/* only assign a task if there was already one, otherwise
+		 * the preallocated new task will be released.
+		 */
+		task->context = NULL;
+		h2c->task = NULL;
+		__ha_barrier_store();
+		task_kill(task);
+
+		h2c->task = new_task;
+		new_task = NULL;
+		h2c->task->process = h2_timeout_task;
+		h2c->task->context = h2c;
+	}
+
 	/* To let the tasklet know it should free itself, and do nothing else,
 	 * set its context to NULL.
 	 */
 	h2c->wait_event.tasklet->context = NULL;
 	tasklet_wakeup_on(h2c->wait_event.tasklet, orig_tid);
 
-	task = h2c->task;
-	if (task) {
-		task->context = NULL;
-		h2c->task = NULL;
-		__ha_barrier_store();
-		task_kill(task);
-
-		h2c->task = task_new_here();
-		if (!h2c->task) {
-			h2_release(h2c);
-			return -1;
-		}
-		h2c->task->process = h2_timeout_task;
-		h2c->task->context = h2c;
-	}
-	h2c->wait_event.tasklet = tasklet_new();
-	if (!h2c->wait_event.tasklet) {
-		h2_release(h2c);
-		return -1;
-	}
+	h2c->wait_event.tasklet = new_tasklet;
 	h2c->wait_event.tasklet->process = h2_io_cb;
 	h2c->wait_event.tasklet->context = h2c;
 	h2c->conn->xprt->subscribe(h2c->conn, h2c->conn->xprt_ctx,
 		                   SUB_RETRY_RECV, &h2c->wait_event);
 
+	if (new_task)
+		__task_free(new_task);
 	return 0;
+ fail:
+	if (new_task)
+		__task_free(new_task);
+	tasklet_free(new_tasklet);
+	return -1;
 }
 
 /*******************************************************/

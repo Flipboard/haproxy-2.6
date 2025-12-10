@@ -108,8 +108,8 @@ const char *log_levels[NB_LOG_LEVELS] = {
 	"warning", "notice", "info", "debug"
 };
 
-const char sess_term_cond[16] = "-LcCsSPRIDKUIIII"; /* normal, Local, CliTo, CliErr, SrvTo, SrvErr, PxErr, Resource, Internal, Down, Killed, Up, -- */
-const char sess_fin_state[8]  = "-RCHDLQT";	/* cliRequest, srvConnect, srvHeader, Data, Last, Queue, Tarpit */
+const char sess_term_cond[] = "-LcCsSPRIDKUIIII";   /* normal, Local, CliTo, CliErr, SrvTo, SrvErr, PxErr, Resource, Internal, Down, Killed, Up, -- */
+const char sess_fin_state[]  = "-RCHDLQT";	    /* cliRequest, srvConnect, srvHeader, Data, Last, Queue, Tarpit */
 
 
 /* log_format   */
@@ -733,6 +733,54 @@ int smp_log_range_cmp(const void *a, const void *b)
 	return 0;
 }
 
+/* tries to duplicate <def> logsrv
+ *
+ * Returns the newly allocated and duplicated logsrv or NULL
+ * in case of error.
+ */
+struct logsrv *dup_logsrv(struct logsrv *def)
+{
+	struct logsrv *cpy = malloc(sizeof(*cpy));
+
+	/* copy everything that can be easily copied */
+	memcpy(cpy, def, sizeof(*cpy));
+
+	/* default values */
+	cpy->ring_name = NULL;
+	cpy->conf.file = NULL;
+	cpy->lb.smp_rgs = NULL;
+	LIST_INIT(&cpy->list);
+	HA_SPIN_INIT(&cpy->lock);
+
+	/* special members */
+	if (def->ring_name) {
+		cpy->ring_name = strdup(def->ring_name);
+		if (!cpy->ring_name)
+			goto error;
+	}
+	if (def->conf.file) {
+		cpy->conf.file = strdup(def->conf.file);
+		if (!cpy->conf.file)
+			goto error;
+	}
+	if (def->lb.smp_rgs) {
+		cpy->lb.smp_rgs = malloc(sizeof(*cpy->lb.smp_rgs) * def->lb.smp_rgs_sz);
+		if (!cpy->lb.smp_rgs)
+			goto error;
+		memcpy(cpy->lb.smp_rgs, def->lb.smp_rgs,
+		       sizeof(*cpy->lb.smp_rgs) * def->lb.smp_rgs_sz);
+	}
+
+	/* inherit from original reference if set */
+	cpy->ref = (def->ref) ? def->ref : def;
+
+	return cpy;
+
+ error:
+	free_logsrv(cpy);
+	return NULL;
+}
+
 /* frees log server <logsrv> after freeing all of its allocated fields. The
  * server must not belong to a list anymore. Logsrv may be NULL, which is
  * silently ignored.
@@ -745,6 +793,7 @@ void free_logsrv(struct logsrv *logsrv)
 	BUG_ON(LIST_INLIST(&logsrv->list));
 	ha_free(&logsrv->conf.file);
 	ha_free(&logsrv->ring_name);
+	free(logsrv->lb.smp_rgs);
 	free(logsrv);
 }
 
@@ -807,14 +856,20 @@ int parse_logsrv(char **args, struct list *logsrvs, int do_del, const char *file
 					goto skip_logsrv;
 			}
 
-			node = malloc(sizeof(*node));
-			memcpy(node, logsrv, sizeof(struct logsrv));
-			node->ref = logsrv;
-			LIST_INIT(&node->list);
-			LIST_APPEND(logsrvs, &node->list);
-			node->ring_name = logsrv->ring_name ? strdup(logsrv->ring_name) : NULL;
+			/* duplicate logsrv from global */
+			node = dup_logsrv(logsrv);
+			if (!node) {
+				memprintf(err, "out of memory error");
+				goto error;
+			}
+
+			/* manually override some values */
+			ha_free(&node->conf.file);
 			node->conf.file = strdup(file);
 			node->conf.line = linenum;
+
+			/* add to list */
+			LIST_APPEND(logsrvs, &node->list);
 
 		  skip_logsrv:
 			continue;
@@ -1078,6 +1133,8 @@ int get_log_facility(const char *fac)
  * When using the +E log format option, it will try to escape '"\]'
  * characters with '\' as prefix. The same prefix should not be used as
  * <escape>.
+ *
+ * Return the address of the \0 character, or NULL on error
  */
 static char *lf_encode_string(char *start, char *stop,
                               const char escape, const long *map,
@@ -1108,13 +1165,14 @@ static char *lf_encode_string(char *start, char *stop,
 				string++;
 			}
 			*start = '\0';
+			return start;
 		}
 	}
 	else {
 		return encode_string(start, stop, escape, map, string);
 	}
 
-	return start;
+	return NULL;
 }
 
 /*
@@ -1123,6 +1181,8 @@ static char *lf_encode_string(char *start, char *stop,
  * When using the +E log format option, it will try to escape '"\]'
  * characters with '\' as prefix. The same prefix should not be used as
  * <escape>.
+ *
+ * Return the address of the \0 character, or NULL on error
  */
 static char *lf_encode_chunk(char *start, char *stop,
                              const char escape, const long *map,
@@ -1158,13 +1218,14 @@ static char *lf_encode_chunk(char *start, char *stop,
 				str++;
 			}
 			*start = '\0';
+			return start;
 		}
 	}
 	else {
 		return encode_chunk(start, stop, escape, map, chunk);
 	}
 
-	return start;
+	return NULL;
 }
 
 /*
@@ -1185,13 +1246,12 @@ char *lf_text_len(char *dst, const char *src, size_t len, size_t size, const str
 
 	if (src && len) {
 		/* escape_string and strlcpy2 will both try to add terminating NULL-byte
-		 * to dst, so we need to make sure that extra byte will fit into dst
-		 * before calling them
+		 * to dst
 		 */
 		if (node->options & LOG_OPT_ESC) {
 			char *ret;
 
-			ret = escape_string(dst, (dst + size - 1), '\\', rfc5424_escape_map, src, src + len);
+			ret = escape_string(dst, dst + size, '\\', rfc5424_escape_map, src, src + len);
 			if (ret == NULL || *ret != '\0')
 				return NULL;
 			len = ret - dst;
@@ -1253,7 +1313,7 @@ char *lf_ip(char *dst, const struct sockaddr *sockaddr, size_t size, const struc
 		default:
 			return NULL;
 		}
-		if (iret < 0 || iret > size)
+		if (iret < 0 || iret >= size)
 			return NULL;
 		ret += iret;
 	} else {
@@ -1277,7 +1337,7 @@ char *lf_port(char *dst, const struct sockaddr *sockaddr, size_t size, const str
 	if (node->options & LOG_OPT_HEXA) {
 		const unsigned char *port = (const unsigned char *)&((struct sockaddr_in *)sockaddr)->sin_port;
 		iret = snprintf(dst, size, "%02X%02X", port[0], port[1]);
-		if (iret < 0 || iret > size)
+		if (iret < 0 || iret >= size)
 			return NULL;
 		ret += iret;
 	} else {
@@ -1680,11 +1740,17 @@ static inline void __do_send_log(struct logsrv *logsrv, int nblogger, int level,
  send:
 	if (logsrv->type == LOG_TARGET_BUFFER) {
 		struct ist msg;
+		size_t maxlen = logsrv->maxlen;
 
 		msg = ist2(message, size);
 		msg = isttrim(msg, logsrv->maxlen);
 
-		sent = sink_write(logsrv->sink, &msg, 1, level, facility, metadata);
+		/* make room for the final '\n' which may be forcefully inserted
+		 * by tcp forwarder applet (sink_forward_io_handler)
+		 */
+		maxlen -= 1;
+
+		sent = sink_write(logsrv->sink, maxlen, &msg, 1, level, facility, metadata);
 	}
 	else if (logsrv->addr.ss_family == AF_CUST_EXISTING_FD) {
 		struct ist msg;
@@ -1696,7 +1762,7 @@ static inline void __do_send_log(struct logsrv *logsrv, int nblogger, int level,
 	}
 	else {
 		int i = 0;
-		int totlen = logsrv->maxlen;
+		int totlen = logsrv->maxlen - 1; /* save space for the final '\n' */
 
 		for (i = 0 ; i < nbelem ; i++ ) {
 			iovec[i].iov_base = msg_header[i].ptr;
@@ -1835,8 +1901,8 @@ void __send_log(struct list *logsrvs, struct buffer *tagb, int level,
 	return process_send_log(logsrvs, level, -1, metadata, message, size);
 }
 
-const char sess_cookie[8]     = "NIDVEOU7";	/* No cookie, Invalid cookie, cookie for a Down server, Valid cookie, Expired cookie, Old cookie, Unused, unknown */
-const char sess_set_cookie[8] = "NPDIRU67";	/* No set-cookie, Set-cookie found and left unchanged (passive),
+const char sess_cookie[]     = "NIDVEOU7";	/* No cookie, Invalid cookie, cookie for a Down server, Valid cookie, Expired cookie, Old cookie, Unused, unknown */
+const char sess_set_cookie[] = "NPDIRU67";	/* No set-cookie, Set-cookie found and left unchanged (passive),
 						   Set-cookie Deleted, Set-Cookie Inserted, Set-cookie Rewritten,
 						   Set-cookie Updated, unknown, unknown */
 
@@ -2112,7 +2178,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 							  key ? key->data.u.str.data : 0,
 							  dst + maxsize - tmplog,
 							  tmp);
-				if (ret == 0)
+				if (ret == NULL)
 					goto out;
 				tmplog = ret;
 				last_isspace = 0;
@@ -2289,7 +2355,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 			case LOG_FMT_TS: // %Ts
 				if (tmp->options & LOG_OPT_HEXA) {
 					iret = snprintf(tmplog, dst + maxsize - tmplog, "%04X", (unsigned int)logs->accept_date.tv_sec);
-					if (iret < 0 || iret > dst + maxsize - tmplog)
+					if (iret < 0 || iret >= dst + maxsize - tmplog)
 						goto out;
 					last_isspace = 0;
 					tmplog += iret;
@@ -2305,7 +2371,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 			case LOG_FMT_MS: // %ms
 			if (tmp->options & LOG_OPT_HEXA) {
 					iret = snprintf(tmplog, dst + maxsize - tmplog, "%02X",(unsigned int)logs->accept_date.tv_usec/1000);
-					if (iret < 0 || iret > dst + maxsize - tmplog)
+					if (iret < 0 || iret >= dst + maxsize - tmplog)
 						goto out;
 					last_isspace = 0;
 					tmplog += iret;
@@ -2990,7 +3056,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 			case LOG_FMT_COUNTER: // %rt
 				if (tmp->options & LOG_OPT_HEXA) {
 					iret = snprintf(tmplog, dst + maxsize - tmplog, "%04X", uniq_id);
-					if (iret < 0 || iret > dst + maxsize - tmplog)
+					if (iret < 0 || iret >= dst + maxsize - tmplog)
 						goto out;
 					last_isspace = 0;
 					tmplog += iret;
@@ -3006,7 +3072,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 			case LOG_FMT_LOGCNT: // %lc
 				if (tmp->options & LOG_OPT_HEXA) {
 					iret = snprintf(tmplog, dst + maxsize - tmplog, "%04X", fe->log_count);
-					if (iret < 0 || iret > dst + maxsize - tmplog)
+					if (iret < 0 || iret >= dst + maxsize - tmplog)
 						goto out;
 					last_isspace = 0;
 					tmplog += iret;
@@ -3031,7 +3097,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 			case LOG_FMT_PID: // %pid
 				if (tmp->options & LOG_OPT_HEXA) {
 					iret = snprintf(tmplog, dst + maxsize - tmplog, "%04X", pid);
-					if (iret < 0 || iret > dst + maxsize - tmplog)
+					if (iret < 0 || iret >= dst + maxsize - tmplog)
 						goto out;
 					last_isspace = 0;
 					tmplog += iret;
@@ -3577,7 +3643,7 @@ static void syslog_io_handler(struct appctx *appctx)
 	size_t size;
 
 	max_accept = l->maxaccept ? l->maxaccept : 1;
-	while (co_data(sc_oc(sc))) {
+	while (1) {
 		char c;
 
 		if (max_accept <= 0)
@@ -3708,14 +3774,14 @@ static struct applet syslog_applet = {
  */
 int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 {
-	int err_code = 0;
+	int err_code = ERR_NONE;
 	struct proxy *px;
 	char *errmsg = NULL;
 	const char *err = NULL;
 
 	if (strcmp(args[0], "log-forward") == 0) {
 		if (!*args[1]) {
-			ha_alert("parsing [%s:%d] : missing name for ip-forward section.\n", file, linenum);
+			ha_alert("parsing [%s:%d] : missing name for log-forward section.\n", file, linenum);
 			err_code |= ERR_ALERT | ERR_ABORT;
 			goto out;
 		}
@@ -3736,6 +3802,7 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 			ha_alert("Parsing [%s:%d]: log-forward section '%s' has the same name as another log-forward section declared at %s:%d.\n",
 				 file, linenum, args[1], px->conf.file, px->conf.line);
 			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
 		}
 
 		px = proxy_find_by_name(args[1], 0, 0);
@@ -3744,6 +3811,7 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 			         file, linenum, args[1], proxy_type_str(px),
 			         px->id, px->conf.file, px->conf.line);
 			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
 		}
 
 		px = calloc(1, sizeof *px);
@@ -3765,7 +3833,6 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 		px->accept = frontend_accept;
 		px->default_target = &syslog_applet.obj_type;
 		px->id = strdup(args[1]);
-
 	}
 	else if (strcmp(args[0], "maxconn") == 0) {  /* maxconn */
 		if (warnifnotcap(cfg_log_forward, PR_CAP_FE, file, linenum, args[0], " Maybe you want 'fullconn' instead ?"))
@@ -3817,9 +3884,9 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 			else {
 				ha_alert("parsing [%s:%d] : '%s %s' : error encountered while parsing listening address %s.\n",
 				         file, linenum, args[0], args[1], args[2]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
 			}
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
 		}
 		list_for_each_entry(l, &bind_conf->listeners, by_bind) {
 			l->maxaccept = global.tune.maxaccept ? global.tune.maxaccept : MAX_ACCEPT;
@@ -3934,7 +4001,6 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 		}
 		else if (res) {
 			memprintf(&errmsg, "unexpected character '%c' in 'timeout client'", *res);
-			return -1;
 		}
 
 		if (res) {
@@ -3950,6 +4016,7 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 		goto out;
 	}
 out:
+	ha_free(&errmsg);
 	return err_code;
 }
 
