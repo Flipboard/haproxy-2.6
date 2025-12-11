@@ -1,0 +1,33 @@
+# Build artifacts
+builds/
+dev/flags/
+haproxy-build/
+*.deb
+
+# HAProxy compiled binary
+haproxy
+
+# Object files and build artifacts
+*.o
+*.a
+*.so
+*.dylib
+
+# Dependency files
+*.d
+
+# Core dumps
+core
+core.*
+
+# Editor files
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Python virtual environment (if you have one)
+_env/
+venv/
+*.pyc
+__pycache__/
